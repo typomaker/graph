@@ -1,6 +1,9 @@
 package graph
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 type actor struct{}
 type health struct{ Current, Max int }
@@ -76,4 +79,69 @@ func TestCyclePanics(t *testing.T) {
 		}
 	}()
 	Link(b, a)
+}
+
+func TestQueryStructuralUpdatesPreserveMultipleParentReachability(t *testing.T) {
+	root := New(name("query-root"))
+	left := New(name("left"))
+	right := New(name("right"))
+	target := New(actor{})
+	Link(root, left, right)
+	Link(left, target)
+	Link(right, target)
+	result, closeResult := Query(root, Type[actor]())
+	defer closeResult()
+	if Len(result) != 1 {
+		t.Fatalf("bootstrap length=%d", Len(result))
+	}
+	Unlink(left, target)
+	if Len(result) != 1 {
+		t.Fatal("node disappeared while still reachable through second parent")
+	}
+	Unlink(right, target)
+	if !Empty(result) {
+		t.Fatal("unreachable node remains in query")
+	}
+	Link(left, target)
+	if Len(result) != 1 {
+		t.Fatal("relinked subtree was not added incrementally")
+	}
+}
+
+func TestQueryIndexLifecycleIsDemandDrivenAndShared(t *testing.T) {
+	root := New(name("index-root"))
+	first := New(actor{}, name("first"))
+	second := New(actor{}, name("second"))
+	Link(root, first, second)
+
+	state.RLock()
+	before := len(state.index)
+	state.RUnlock()
+	typeResult, closeType := Query(root, Type[actor]())
+	otherTypeResult, closeOtherType := Query(root, Type[actor]())
+	exactResult, closeExact := Query(root, Type[actor](), name("first"))
+	if Len(typeResult) != 2 || Len(otherTypeResult) != 2 || Len(exactResult) != 1 {
+		t.Fatal("indexed query bootstrap mismatch")
+	}
+	typeKey := indexKey{typ: reflect.TypeOf(actor{}), any: true}
+	exactKey := indexKey{typ: reflect.TypeOf(name("")), value: name("first")}
+	state.RLock()
+	if state.index[typeKey] == nil || state.index[typeKey].users != 3 || state.index[exactKey] == nil || state.index[exactKey].users != 1 || len(state.index) != before+2 {
+		t.Fatalf("indexes=%+v", state.index)
+	}
+	state.RUnlock()
+	closeType()
+	closeType()
+	closeOtherType()
+	state.RLock()
+	if state.index[typeKey] == nil || state.index[typeKey].users != 1 {
+		t.Fatal("shared type bucket was released early")
+	}
+	state.RUnlock()
+	closeExact()
+	state.RLock()
+	if len(state.index) != before {
+		t.Fatal("unused query buckets were retained")
+	}
+	state.RUnlock()
 }

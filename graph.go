@@ -41,6 +41,8 @@ var state struct {
 	nextID   uint64
 	revision uint64
 	queries  map[*query]struct{}
+	nodes    map[*node]struct{}
+	index    map[indexKey]*indexBucket
 }
 
 type matcher struct {
@@ -53,10 +55,27 @@ type query struct {
 	roots    []*node
 	matchers []matcher
 	result   *selection
-	scope    map[*node]struct{}
+	scope    map[*node]uint32
+	root     map[*node]struct{}
+	buckets  []indexKey
 }
 
-func init() { state.queries = make(map[*query]struct{}) }
+type indexKey struct {
+	typ   reflect.Type
+	value any
+	any   bool
+}
+
+type indexBucket struct {
+	nodes map[*node]struct{}
+	users uint64
+}
+
+func init() {
+	state.queries = make(map[*query]struct{})
+	state.nodes = make(map[*node]struct{})
+	state.index = make(map[indexKey]*indexBucket)
+}
 
 // Type returns a matcher meaning "an attribute of type T, with any value".
 func Type[T any]() any {
@@ -73,6 +92,8 @@ func New(value any, values ...any) Graph {
 	state.nextID++
 	rev := nextRevisionLocked()
 	n := &node{id: state.nextID, attrs: attrs, children: make(map[*node]uint64), parents: make(map[*node]struct{}), selfRev: rev, treeRev: rev}
+	state.nodes[n] = struct{}{}
+	updateIndexesLocked(n, nil)
 	return Graph{nodes: []*node{n}}
 }
 
@@ -135,6 +156,7 @@ func Set(g Graph, values ...any) Graph {
 	rev := nextRevisionLocked()
 	n.selfRev = rev
 	propagateLocked(n, rev)
+	updateIndexesLocked(n, changedTypes)
 	updateAttributeQueriesLocked(n, changedTypes)
 	return singleton(n, g.view)
 }
@@ -167,6 +189,7 @@ func Unset(g Graph, values ...any) Graph {
 	rev := nextRevisionLocked()
 	n.selfRev = rev
 	propagateLocked(n, rev)
+	updateIndexesLocked(n, changed)
 	updateAttributeQueriesLocked(n, changed)
 	return singleton(n, g.view)
 }
@@ -245,10 +268,8 @@ func Link(g Graph, graphs ...Graph) Graph {
 		child.parents[parent] = struct{}{}
 		parent.selfRev = rev
 		propagateLocked(parent, rev)
+		updateStructuralQueriesLocked(parent, child, true)
 		out = append(out, child)
-	}
-	if len(out) != 0 {
-		updateStructuralQueriesLocked(parent)
 	}
 	return Graph{nodes: out}
 }
@@ -271,10 +292,8 @@ func Unlink(g Graph, graphs ...Graph) Graph {
 		rev := nextRevisionLocked()
 		parent.selfRev = rev
 		propagateLocked(parent, rev)
+		updateStructuralQueriesLocked(parent, child, false)
 		out = append(out, child)
-	}
-	if len(out) != 0 {
-		updateStructuralQueriesLocked(parent)
 	}
 	return Graph{nodes: out}
 }
@@ -380,13 +399,26 @@ func Exclude(graphs ...Graph) Graph {
 func Query(g Graph, values ...any) (Graph, func()) {
 	ms := queryMatchers(values)
 	state.Lock()
-	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, result: &selection{}}
+	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, result: &selection{}, root: make(map[*node]struct{})}
+	for _, m := range ms {
+		key := indexKey{typ: m.typ, value: m.value, any: m.any}
+		acquireIndexLocked(key)
+		q.buckets = append(q.buckets, key)
+	}
 	recomputeQueryLocked(q)
 	state.queries[q] = struct{}{}
 	state.Unlock()
 	var once sync.Once
 	closeFn := func() {
-		once.Do(func() { state.Lock(); delete(state.queries, q); q.result.closed = true; state.Unlock() })
+		once.Do(func() {
+			state.Lock()
+			delete(state.queries, q)
+			q.result.closed = true
+			for _, key := range q.buckets {
+				releaseIndexLocked(key)
+			}
+			state.Unlock()
+		})
 	}
 	return Graph{live: q.result}, closeFn
 }
@@ -636,11 +668,46 @@ func matchesLocked(n *node, ms []matcher) bool {
 	return true
 }
 func recomputeQueryLocked(q *query) {
-	reachable := reachableLocked(q.roots)
-	q.scope = nodeSet(reachable)
-	out := make([]*node, 0)
-	for _, n := range reachable {
-		if matchesLocked(n, q.matchers) {
+	q.scope = make(map[*node]uint32)
+	q.root = make(map[*node]struct{})
+	queue := make([]*node, 0, len(q.roots))
+	for _, root := range q.roots {
+		if _, duplicate := q.root[root]; duplicate {
+			continue
+		}
+		q.root[root] = struct{}{}
+		if q.scope[root] == 0 {
+			queue = append(queue, root)
+		}
+		q.scope[root]++
+	}
+	reachable := make([]*node, 0)
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		reachable = append(reachable, n)
+		for _, child := range orderedChildren(n) {
+			if q.scope[child] == 0 {
+				queue = append(queue, child)
+			}
+			q.scope[child]++
+		}
+	}
+	candidates := reachable
+	for _, key := range q.buckets {
+		bucket := state.index[key]
+		if bucket == nil || len(bucket.nodes) >= len(candidates) {
+			continue
+		}
+		candidates = candidates[:0]
+		for n := range bucket.nodes {
+			candidates = append(candidates, n)
+		}
+		sortNodes(candidates)
+	}
+	out := make([]*node, 0, len(candidates))
+	for _, n := range candidates {
+		if q.scope[n] != 0 && matchesLocked(n, q.matchers) {
 			out = append(out, n)
 		}
 	}
@@ -658,7 +725,7 @@ func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 		if !relevant {
 			continue
 		}
-		if _, inScope := q.scope[n]; inScope {
+		if q.scope[n] != 0 {
 			updateQueryNodeLocked(q, n)
 		}
 	}
@@ -681,18 +748,102 @@ func updateQueryNodeLocked(q *query, n *node) {
 		q.result.nodes = q.result.nodes[:len(q.result.nodes)-1]
 	}
 }
-func reachesFromRootsLocked(roots []*node, target *node) bool {
-	for _, r := range roots {
-		if reachesLocked(r, target) {
-			return true
-		}
-	}
-	return false
-}
-func updateStructuralQueriesLocked(parent *node) {
+func updateStructuralQueriesLocked(parent, child *node, linked bool) {
 	for q := range state.queries {
-		if reachesFromRootsLocked(q.roots, parent) {
-			recomputeQueryLocked(q)
+		if q.scope[parent] == 0 {
+			continue
+		}
+		if linked {
+			wasUnreachable := q.scope[child] == 0
+			q.scope[child]++
+			if wasUnreachable {
+				addQuerySubtreeLocked(q, child)
+			}
+		} else {
+			removeQueryReferenceLocked(q, child)
 		}
 	}
+}
+
+func addQuerySubtreeLocked(q *query, n *node) {
+	updateQueryNodeLocked(q, n)
+	for _, child := range orderedChildren(n) {
+		wasUnreachable := q.scope[child] == 0
+		q.scope[child]++
+		if wasUnreachable {
+			addQuerySubtreeLocked(q, child)
+		}
+	}
+}
+
+func removeQueryReferenceLocked(q *query, n *node) {
+	if q.scope[n] == 0 {
+		return
+	}
+	q.scope[n]--
+	if q.scope[n] != 0 {
+		return
+	}
+	delete(q.scope, n)
+	removeQueryResultNodeLocked(q, n)
+	for _, child := range orderedChildren(n) {
+		removeQueryReferenceLocked(q, child)
+	}
+}
+
+func removeQueryResultNodeLocked(q *query, n *node) {
+	for index, current := range q.result.nodes {
+		if current != n {
+			continue
+		}
+		copy(q.result.nodes[index:], q.result.nodes[index+1:])
+		q.result.nodes[len(q.result.nodes)-1] = nil
+		q.result.nodes = q.result.nodes[:len(q.result.nodes)-1]
+		return
+	}
+}
+
+func acquireIndexLocked(key indexKey) {
+	if bucket := state.index[key]; bucket != nil {
+		bucket.users++
+		return
+	}
+	bucket := &indexBucket{nodes: make(map[*node]struct{}), users: 1}
+	for n := range state.nodes {
+		if indexMatchesLocked(n, key) {
+			bucket.nodes[n] = struct{}{}
+		}
+	}
+	state.index[key] = bucket
+}
+
+func releaseIndexLocked(key indexKey) {
+	bucket := state.index[key]
+	if bucket == nil {
+		return
+	}
+	bucket.users--
+	if bucket.users == 0 {
+		delete(state.index, key)
+	}
+}
+
+func updateIndexesLocked(n *node, changed map[reflect.Type]struct{}) {
+	for key, bucket := range state.index {
+		if changed != nil {
+			if _, relevant := changed[key.typ]; !relevant {
+				continue
+			}
+		}
+		if indexMatchesLocked(n, key) {
+			bucket.nodes[n] = struct{}{}
+		} else {
+			delete(bucket.nodes, n)
+		}
+	}
+}
+
+func indexMatchesLocked(n *node, key indexKey) bool {
+	value, exists := n.attrs[key.typ]
+	return exists && (key.any || value == key.value)
 }
