@@ -1,12 +1,13 @@
-# Правила завершения изменений
+# Repository completion rules
 
-Перед завершением любой задачи в этом репозитории необходимо:
+Before completing any task in this repository:
 
-1. Отформатировать изменённый Go-код с помощью `gofmt`.
-2. Запустить `golangci-lint run ./...` и исправить все найденные проблемы.
-3. Запустить тесты, включая проверку на гонки: `go test -race ./...`.
-4. Проверить покрытие тестами. Покрытие строк изменённого Go-кода должно быть не ниже 90%. Новые и изменённые ветви поведения должны иметь тесты; отчёты покрытия не добавляются в Git.
-5. Проверить, что в коммит не попали временные файлы и посторонние пользовательские изменения.
-6. Сделать коммит с осмысленным сообщением и отправить текущую ветку в настроенный upstream (`git push`).
+1. Write all repository documentation in English. This includes README files, guides, public API documentation, documentation comments, and documentation-oriented examples.
+2. Format changed Go code with `gofmt`.
+3. Run `golangci-lint run ./...` and fix every reported issue.
+4. Run tests with race detection: `go test -race ./...`.
+5. Verify test coverage. Changed Go code must have at least 90% line coverage. New and changed behavior must have tests. Do not commit coverage reports.
+6. Check that temporary files and unrelated user changes are not included in the commit.
+7. Create a commit with a meaningful message and push the current branch to its configured upstream with `git push`.
 
-Задача не считается завершённой, пока все применимые проверки не прошли, а коммит не отправлен в удалённый репозиторий.
+A task is not complete until every applicable check passes and the commit has been pushed.
