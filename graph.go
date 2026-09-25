@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
+	"sort"
 	"sync"
 )
 
@@ -52,6 +53,7 @@ type query struct {
 	roots    []*node
 	matchers []matcher
 	result   *selection
+	scope    map[*node]struct{}
 }
 
 func init() { state.queries = make(map[*query]struct{}) }
@@ -597,15 +599,13 @@ func orderedChildren(n *node) []*node {
 	for c := range n.children {
 		out = append(out, c)
 	}
-	sortNodes(out)
+	if len(out) > 1 {
+		sortNodes(out)
+	}
 	return out
 }
 func sortNodes(ns []*node) {
-	for i := 1; i < len(ns); i++ {
-		for j := i; j > 0 && ns[j].id < ns[j-1].id; j-- {
-			ns[j], ns[j-1] = ns[j-1], ns[j]
-		}
-	}
+	sort.Slice(ns, func(i, j int) bool { return ns[i].id < ns[j].id })
 }
 func reachableLocked(roots []*node) []*node {
 	seen := map[*node]struct{}{}
@@ -636,8 +636,10 @@ func matchesLocked(n *node, ms []matcher) bool {
 	return true
 }
 func recomputeQueryLocked(q *query) {
-	out := []*node{}
-	for _, n := range reachableLocked(q.roots) {
+	reachable := reachableLocked(q.roots)
+	q.scope = nodeSet(reachable)
+	out := make([]*node, 0)
+	for _, n := range reachable {
 		if matchesLocked(n, q.matchers) {
 			out = append(out, n)
 		}
@@ -656,9 +658,27 @@ func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 		if !relevant {
 			continue
 		}
-		if reachesFromRootsLocked(q.roots, n) {
-			recomputeQueryLocked(q)
+		if _, inScope := q.scope[n]; inScope {
+			updateQueryNodeLocked(q, n)
 		}
+	}
+}
+
+func updateQueryNodeLocked(q *query, n *node) {
+	index := -1
+	for i, current := range q.result.nodes {
+		if current == n {
+			index = i
+			break
+		}
+	}
+	matches := matchesLocked(n, q.matchers)
+	if matches && index < 0 {
+		q.result.nodes = append(q.result.nodes, n)
+	} else if !matches && index >= 0 {
+		copy(q.result.nodes[index:], q.result.nodes[index+1:])
+		q.result.nodes[len(q.result.nodes)-1] = nil
+		q.result.nodes = q.result.nodes[:len(q.result.nodes)-1]
 	}
 }
 func reachesFromRootsLocked(roots []*node, target *node) bool {

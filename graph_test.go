@@ -46,9 +46,13 @@ func TestDAGQueryAndCommit(t *testing.T) {
 	if Len(q) != 1 {
 		t.Fatal("attribute update")
 	}
-	close()
 	Set(b, actor{})
-	if Len(q) != 1 {
+	if Len(q) != 2 {
+		t.Fatal("attribute insertion update")
+	}
+	close()
+	Unset(b, Type[actor]())
+	if Len(q) != 2 {
 		t.Fatal("closed query changed")
 	}
 	_ = Commit(root)
