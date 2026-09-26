@@ -214,6 +214,12 @@ graph.Set(jack, Alive(false))
 
 Call the returned close function when the live result is no longer needed. It is idempotent. After closing, the returned `Graph` remains available as a snapshot but no longer updates.
 
+Each active query indexes only the attribute types and exact values present in
+its own matchers, within the nodes reachable from its roots. Identical queries
+over the same ordered roots share this index while retaining independent live
+selections. Closing one selection freezes only that snapshot; the index is
+released after the last identical query closes.
+
 Search by a user-defined identifier in the same way:
 
 ```go
@@ -423,10 +429,11 @@ Indicative results for a 10,000-node graph on an Apple M1 Max:
 
 | Operation | Time | Allocations |
 |---|---:|---:|
-| Exact-query bootstrap | ~2.1 ms | 144 |
+| Exact-query bootstrap | ~2.6 ms | 224 |
+| Reuse active exact query | ~0.30 us | 8 |
 | Reactive result `Len` | ~14 ns | 0 |
-| Relevant attribute update | ~0.41 us | 4 |
-| Unrelated attribute update | ~0.39 us | 3 |
+| Relevant attribute update | ~0.54 us | 4 |
+| Unrelated attribute update | ~0.40 us | 3 |
 
 For a three-step path over 10,000 independent branches, indicative results on
 the same machine are:

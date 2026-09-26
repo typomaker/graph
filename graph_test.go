@@ -239,6 +239,46 @@ func TestMatchCanGroupAWholeQuery(t *testing.T) {
 	}
 }
 
+func TestIdenticalQueriesShareIndexAndCloseIndependently(t *testing.T) {
+	root := New(name("root"))
+	target := New(actor{}, entityID("actor-1"))
+	Link(root, target)
+
+	state.RLock()
+	queriesBefore := len(state.queries)
+	state.RUnlock()
+	firstResult, closeFirst := Query(root, Type[actor](), entityID("actor-1"))
+	secondResult, closeSecond := Query(root, Type[actor](), entityID("actor-1"))
+
+	state.RLock()
+	queriesWithListeners := len(state.queries)
+	state.RUnlock()
+	if queriesWithListeners != queriesBefore+1 {
+		t.Fatal("identical queries did not share one index")
+	}
+
+	Set(target, entityID("other"))
+	if !Empty(firstResult) || !Empty(secondResult) {
+		t.Fatal("shared query listeners did not update")
+	}
+	closeFirst()
+	Set(target, entityID("actor-1"))
+	if !Empty(firstResult) {
+		t.Fatal("closed listener did not remain a snapshot")
+	}
+	if Len(secondResult) != 1 {
+		t.Fatal("closing one listener stopped the shared index")
+	}
+
+	closeSecond()
+	state.RLock()
+	queriesAfter := len(state.queries)
+	state.RUnlock()
+	if queriesAfter != queriesBefore {
+		t.Fatal("last close did not release the shared index")
+	}
+}
+
 func TestPathQueryCountsMultipleSupportingChildren(t *testing.T) {
 	world := New(name("world"))
 	place := New(location{})

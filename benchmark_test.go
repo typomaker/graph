@@ -80,6 +80,21 @@ func BenchmarkQueryUnrelatedUpdate10K(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryReuseActiveIndex10K(b *testing.B) {
+	root, _ := benchmarkWorld(10_000)
+	_, closeKeeper := Query(root, Type[benchmarkKind](), benchmarkID(5_000))
+	defer closeKeeper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		result, closeQuery := Query(root, Type[benchmarkKind](), benchmarkID(5_000))
+		if Len(result) != 1 {
+			b.Fatal("unexpected shared query result")
+		}
+		closeQuery()
+	}
+}
+
 func benchmarkPathWorld(size int) (Graph, []Graph, []Graph, []Graph) {
 	root := New(name(fmt.Sprintf("path-benchmark-%d", size)))
 	locations := make([]Graph, size)

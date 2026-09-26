@@ -64,9 +64,10 @@ type typeMatcher struct{ typ reflect.Type }
 
 var state struct {
 	sync.RWMutex
-	nextID   uint64
-	revision uint64
-	queries  map[*query]struct{}
+	nextID        uint64
+	revision      uint64
+	queries       map[*query]struct{}
+	queriesByType map[reflect.Type]map[*query]struct{}
 }
 
 type matcher struct {
@@ -89,17 +90,26 @@ type pathLevel struct {
 	support  map[*node]uint32
 }
 
+type attributeLevel struct {
+	matcher matcher
+	active  map[*node]struct{}
+}
+
 type query struct {
-	roots    []*node
-	matchers []matcher
-	path     []pathLevel
-	result   *selection
-	scope    map[*node]uint32
-	root     map[*node]struct{}
+	roots     []*node
+	matchers  []matcher
+	attrs     []attributeLevel
+	path      []pathLevel
+	result    *selection
+	listeners map[*selection]struct{}
+	scope     map[*node]uint32
+	root      map[*node]struct{}
+	notified  uint64
 }
 
 func init() {
 	state.queries = make(map[*query]struct{})
+	state.queriesByType = make(map[reflect.Type]map[*query]struct{})
 }
 
 // Type returns a matcher meaning "an attribute of type T, with any value".
@@ -541,29 +551,31 @@ func Exclude(graphs ...Graph) Graph {
 //	defer closePlayers()
 func Query(g Graph, values ...any) (Graph, func()) {
 	ms, pathMatchers := queryCriteria(values)
-	path := make([]pathLevel, len(pathMatchers))
-	for i, matchers := range pathMatchers {
-		path[i] = pathLevel{
-			matchers: matchers,
-			active:   make(map[*node]struct{}),
-			support:  make(map[*node]uint32),
-		}
-	}
 	state.Lock()
-	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, path: path, result: &selection{}, root: make(map[*node]struct{})}
-	recomputeQueryLocked(q)
-	state.queries[q] = struct{}{}
+	roots := append([]*node(nil), selected(g)...)
+	q := findQueryLocked(roots, ms, pathMatchers)
+	if q == nil {
+		q = newQueryLocked(roots, ms, pathMatchers)
+	}
+	listener := &selection{nodes: append([]*node(nil), q.result.nodes...)}
+	q.listeners[listener] = struct{}{}
 	state.Unlock()
 	var once sync.Once
 	closeFn := func() {
 		once.Do(func() {
 			state.Lock()
-			delete(state.queries, q)
-			q.result.closed = true
+			current := q
+			delete(current.listeners, listener)
+			listener.closed = true
+			if len(current.listeners) == 0 {
+				unregisterQueryLocked(current)
+				releaseQueryIndexLocked(current)
+			}
+			q = nil
 			state.Unlock()
 		})
 	}
-	return Graph{live: q.result}, closeFn
+	return Graph{live: listener}, closeFn
 }
 
 // Commit advances the baseline of every node reachable from the selection to
@@ -1213,6 +1225,119 @@ func queryCriteria(values []any) ([]matcher, [][]matcher) {
 	return queryMatchers(values), nil
 }
 
+func findQueryLocked(roots []*node, matchers []matcher, path [][]matcher) *query {
+	for q := range state.queries {
+		if sameNodes(q.roots, roots) && sameMatchers(q.matchers, matchers) && samePath(q.path, path) {
+			return q
+		}
+	}
+	return nil
+}
+
+func newQueryLocked(roots []*node, matchers []matcher, pathMatchers [][]matcher) *query {
+	q := &query{
+		roots:     roots,
+		matchers:  matchers,
+		result:    &selection{},
+		listeners: make(map[*selection]struct{}),
+		root:      make(map[*node]struct{}),
+	}
+	q.attrs = make([]attributeLevel, len(matchers))
+	for i, matcher := range matchers {
+		q.attrs[i] = attributeLevel{matcher: matcher, active: make(map[*node]struct{})}
+	}
+	q.path = make([]pathLevel, len(pathMatchers))
+	for i, pathMatchers := range pathMatchers {
+		q.path[i] = pathLevel{
+			matchers: pathMatchers,
+			active:   make(map[*node]struct{}),
+			support:  make(map[*node]uint32),
+		}
+	}
+	recomputeQueryLocked(q)
+	state.queries[q] = struct{}{}
+	for typ := range queryTypes(q) {
+		queries := state.queriesByType[typ]
+		if queries == nil {
+			queries = make(map[*query]struct{})
+			state.queriesByType[typ] = queries
+		}
+		queries[q] = struct{}{}
+	}
+	return q
+}
+
+func unregisterQueryLocked(q *query) {
+	delete(state.queries, q)
+	for typ := range queryTypes(q) {
+		queries := state.queriesByType[typ]
+		delete(queries, q)
+		if len(queries) == 0 {
+			delete(state.queriesByType, typ)
+		}
+	}
+}
+
+func releaseQueryIndexLocked(q *query) {
+	q.roots = nil
+	q.matchers = nil
+	q.attrs = nil
+	q.path = nil
+	q.result = nil
+	q.listeners = nil
+	q.scope = nil
+	q.root = nil
+}
+
+func queryTypes(q *query) map[reflect.Type]struct{} {
+	types := make(map[reflect.Type]struct{})
+	for _, matcher := range q.matchers {
+		types[matcher.typ] = struct{}{}
+	}
+	for _, level := range q.path {
+		for _, matcher := range level.matchers {
+			types[matcher.typ] = struct{}{}
+		}
+	}
+	return types
+}
+
+func sameNodes(left, right []*node) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameMatchers(left, right []matcher) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].typ != right[i].typ || left[i].any != right[i].any || left[i].value != right[i].value {
+			return false
+		}
+	}
+	return true
+}
+
+func samePath(left []pathLevel, right [][]matcher) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !sameMatchers(left[i].matchers, right[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func nextRevisionLocked() uint64 { state.revision++; return state.revision }
 func propagateLocked(n *node, rev uint64) {
 	seen := map[*node]struct{}{}
@@ -1304,12 +1429,16 @@ func reachableLocked(roots []*node) []*node {
 }
 func matchesLocked(n *node, ms []matcher) bool {
 	for _, m := range ms {
-		v, ok := n.attrs[m.typ]
-		if !ok || (!m.any && v != m.value) {
+		if !matchesMatcherLocked(n, m) {
 			return false
 		}
 	}
 	return true
+}
+
+func matchesMatcherLocked(n *node, m matcher) bool {
+	v, ok := n.attrs[m.typ]
+	return ok && (m.any || v == m.value)
 }
 
 func queryMatchesLocked(q *query, n *node) bool {
@@ -1317,7 +1446,12 @@ func queryMatchesLocked(q *query, n *node) bool {
 		_, ok := q.path[0].active[n]
 		return ok
 	}
-	return matchesLocked(n, q.matchers)
+	for _, level := range q.attrs {
+		if _, ok := level.active[n]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func recomputeQueryLocked(q *query) {
@@ -1346,6 +1480,7 @@ func recomputeQueryLocked(q *query) {
 			q.scope[child]++
 		}
 	}
+	buildAttributeIndexLocked(q, reachable)
 	buildPathIndexLocked(q, reachable)
 	out := make([]*node, 0, len(reachable))
 	for _, n := range reachable {
@@ -1353,7 +1488,19 @@ func recomputeQueryLocked(q *query) {
 			out = append(out, n)
 		}
 	}
-	q.result.nodes = out
+	setQueryResultLocked(q, out)
+}
+
+func buildAttributeIndexLocked(q *query, nodes []*node) {
+	for i := range q.attrs {
+		level := &q.attrs[i]
+		level.active = make(map[*node]struct{})
+		for _, n := range nodes {
+			if matchesMatcherLocked(n, level.matcher) {
+				level.active[n] = struct{}{}
+			}
+		}
+	}
 }
 
 func buildPathIndexLocked(q *query, nodes []*node) {
@@ -1382,31 +1529,42 @@ func buildPathIndexLocked(q *query, nodes []*node) {
 }
 
 func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
-	for q := range state.queries {
-		if len(q.path) != 0 {
-			if q.scope[n] != 0 {
-				for step := len(q.path) - 1; step >= 0; step-- {
-					if matchersUseTypes(q.path[step].matchers, changed) {
-						refreshPathNodeLocked(q, n, step)
+	for typ := range changed {
+		for q := range state.queriesByType[typ] {
+			if q.notified == state.revision {
+				continue
+			}
+			q.notified = state.revision
+			if len(q.path) != 0 {
+				if q.scope[n] != 0 {
+					for step := len(q.path) - 1; step >= 0; step-- {
+						if matchersUseTypes(q.path[step].matchers, changed) {
+							refreshPathNodeLocked(q, n, step)
+						}
 					}
 				}
+				continue
 			}
-			continue
-		}
-		relevant := false
-		for _, m := range q.matchers {
-			if _, ok := changed[m.typ]; ok {
-				relevant = true
-				break
+			if q.scope[n] != 0 {
+				updateAttributeQueryNodeLocked(q, n, changed)
 			}
-		}
-		if !relevant {
-			continue
-		}
-		if q.scope[n] != 0 {
-			updateQueryNodeLocked(q, n)
 		}
 	}
+}
+
+func updateAttributeQueryNodeLocked(q *query, n *node, changed map[reflect.Type]struct{}) {
+	for i := range q.attrs {
+		level := &q.attrs[i]
+		if _, relevant := changed[level.matcher.typ]; !relevant {
+			continue
+		}
+		if matchesMatcherLocked(n, level.matcher) {
+			level.active[n] = struct{}{}
+		} else {
+			delete(level.active, n)
+		}
+	}
+	updateQueryResultMembershipLocked(q, n, queryMatchesLocked(q, n))
 }
 
 func matchersUseTypes(matchers []matcher, changed map[reflect.Type]struct{}) bool {
@@ -1449,37 +1607,58 @@ func refreshPathNodeLocked(q *query, n *node, step int) {
 }
 
 func updatePathResultNodeLocked(q *query, n *node, active bool) {
-	index := -1
-	for i, current := range q.result.nodes {
-		if current == n {
-			index = i
-			break
-		}
-	}
-	if active && index < 0 {
-		q.result.nodes = append(q.result.nodes, n)
-	} else if !active && index >= 0 {
-		removeQueryResultNodeLocked(q, n)
-	}
+	updateQueryResultMembershipLocked(q, n, active)
 }
 
 func updateQueryNodeLocked(q *query, n *node) {
-	index := -1
-	for i, current := range q.result.nodes {
-		if current == n {
-			index = i
-			break
+	for i := range q.attrs {
+		level := &q.attrs[i]
+		if matchesMatcherLocked(n, level.matcher) {
+			level.active[n] = struct{}{}
+		} else {
+			delete(level.active, n)
 		}
 	}
-	matches := queryMatchesLocked(q, n)
-	if matches && index < 0 {
-		q.result.nodes = append(q.result.nodes, n)
-	} else if !matches && index >= 0 {
-		copy(q.result.nodes[index:], q.result.nodes[index+1:])
-		q.result.nodes[len(q.result.nodes)-1] = nil
-		q.result.nodes = q.result.nodes[:len(q.result.nodes)-1]
+	updateQueryResultMembershipLocked(q, n, queryMatchesLocked(q, n))
+}
+
+func setQueryResultLocked(q *query, nodes []*node) {
+	q.result.nodes = nodes
+	for listener := range q.listeners {
+		listener.nodes = append(listener.nodes[:0], nodes...)
 	}
 }
+
+func updateQueryResultMembershipLocked(q *query, n *node, active bool) {
+	changed := updateSelectionMembership(q.result, n, active)
+	if !changed {
+		return
+	}
+	for listener := range q.listeners {
+		updateSelectionMembership(listener, n, active)
+	}
+}
+
+func updateSelectionMembership(result *selection, n *node, active bool) bool {
+	for index, current := range result.nodes {
+		if current != n {
+			continue
+		}
+		if active {
+			return false
+		}
+		copy(result.nodes[index:], result.nodes[index+1:])
+		result.nodes[len(result.nodes)-1] = nil
+		result.nodes = result.nodes[:len(result.nodes)-1]
+		return true
+	}
+	if active {
+		result.nodes = append(result.nodes, n)
+		return true
+	}
+	return false
+}
+
 func updateStructuralQueriesLocked(parent, child *node, linked bool) {
 	for q := range state.queries {
 		if q.scope[parent] == 0 {
@@ -1627,6 +1806,9 @@ func removeQueryReferenceLocked(q *query, n *node) {
 		return
 	}
 	delete(q.scope, n)
+	for i := range q.attrs {
+		delete(q.attrs[i].active, n)
+	}
 	removeQueryResultNodeLocked(q, n)
 	for _, child := range orderedChildren(n) {
 		removeQueryReferenceLocked(q, child)
@@ -1634,13 +1816,5 @@ func removeQueryReferenceLocked(q *query, n *node) {
 }
 
 func removeQueryResultNodeLocked(q *query, n *node) {
-	for index, current := range q.result.nodes {
-		if current != n {
-			continue
-		}
-		copy(q.result.nodes[index:], q.result.nodes[index+1:])
-		q.result.nodes[len(q.result.nodes)-1] = nil
-		q.result.nodes = q.result.nodes[:len(q.result.nodes)-1]
-		return
-	}
+	updateQueryResultMembershipLocked(q, n, false)
 }
