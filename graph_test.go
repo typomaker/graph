@@ -424,3 +424,30 @@ func TestApplyRejectsDeltaIdentityMismatch(t *testing.T) {
 	}()
 	Apply(New(entityID("root")), delta)
 }
+
+func TestCommitRecursivelyAdvancesNodeBaselines(t *testing.T) {
+	root := New(name("root"))
+	branch := New(name("branch"))
+	shared := New(name("shared"), health{10, 10})
+	otherRoot := New(name("other root"))
+	Link(root, branch)
+	Link(branch, shared)
+	Link(otherRoot, shared)
+	Commit(Merge(root, otherRoot))
+
+	Set(shared, health{9, 10})
+	if Empty(Delta(root)) || Empty(Delta(branch)) || Empty(Delta(otherRoot)) {
+		t.Fatal("changed shared node was not visible through every owner")
+	}
+
+	Commit(branch)
+	if !Empty(Delta(branch)) || !Empty(Delta(root)) || !Empty(Delta(otherRoot)) {
+		t.Fatal("subgraph commit did not globally commit its reachable nodes")
+	}
+
+	Set(shared, health{8, 10})
+	Commit(root)
+	if !Empty(Delta(otherRoot)) {
+		t.Fatal("root commit did not commit a node shared with another graph")
+	}
+}

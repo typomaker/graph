@@ -535,8 +535,9 @@ func Query(g Graph, values ...any) (Graph, func()) {
 	return Graph{live: q.result}, closeFn
 }
 
-// Commit advances the baseline of each selected root to the current revision.
-// Changes at or before that revision are omitted from subsequent Delta calls.
+// Commit advances the baseline of every node reachable from the selection to
+// the current revision. Changes at or before that revision are omitted from
+// subsequent Delta calls through any root that reaches those nodes.
 //
 // For example, commit after synchronizing a replica so that the next delta
 // contains only later changes:
@@ -546,8 +547,8 @@ func Query(g Graph, values ...any) (Graph, func()) {
 func Commit(g Graph) {
 	state.Lock()
 	defer state.Unlock()
-	for _, root := range selected(g) {
-		root.baseline = state.revision
+	for _, n := range reachableLocked(selected(g)) {
+		n.baseline = state.revision
 	}
 }
 
@@ -566,11 +567,10 @@ func Delta(g Graph, matchBy ...any) Graph {
 	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange), matchTypes: keyTypes}
 	roots := []*node{}
 	for _, root := range selected(g) {
-		base := root.baseline
-		if root.treeRev <= base {
+		if root.treeRev <= root.baseline {
 			continue
 		}
-		if buildDeltaLocked(root, base, view, map[*node]bool{}) {
+		if buildDeltaLocked(root, view, map[*node]bool{}, false) {
 			roots = append(roots, root)
 		}
 	}
@@ -951,12 +951,16 @@ func equalMatchKey(a, b []any) bool {
 	return true
 }
 
-func buildDeltaLocked(n *node, base uint64, view *subgraph, visiting map[*node]bool) bool {
+func buildDeltaLocked(n *node, view *subgraph, visiting map[*node]bool, full bool) bool {
 	if visiting[n] {
 		return false
 	}
 	visiting[n] = true
 	defer delete(visiting, n)
+	base := n.baseline
+	if full {
+		base = 0
+	}
 	include := n.selfRev > base
 	change := nodeChange{
 		attrs:         make(map[reflect.Type]any),
@@ -984,11 +988,11 @@ func buildDeltaLocked(n *node, base uint64, view *subgraph, visiting map[*node]b
 		if edgeRev > base {
 			view.edges[n] = append(view.edges[n], c)
 			change.addedChildren[c.key] = struct{}{}
-			buildDeltaLocked(c, 0, view, visiting)
+			buildDeltaLocked(c, view, visiting, true)
 			include = true
 			continue
 		}
-		if c.treeRev > base && buildDeltaLocked(c, base, view, visiting) {
+		if c.treeRev > c.baseline && buildDeltaLocked(c, view, visiting, false) {
 			view.edges[n] = append(view.edges[n], c)
 			include = true
 		}

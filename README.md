@@ -222,7 +222,8 @@ defer closePlayer()
 
 `Delta` returns the smallest current subgraph connecting the supplied roots to
 nodes changed since the baseline. Reading a delta does not modify the baseline.
-`Commit` explicitly advances the baseline to the current revision.
+`Commit` explicitly advances the baseline of every reachable node to the
+current revision.
 
 ```go
 world := graph.New(World{})
@@ -253,6 +254,13 @@ fmt.Println(graph.Empty(graph.Delta(world))) // true
 ```
 
 Real attribute or relation changes update revisions and propagate dirty information through every parent. No-op operations do not change revisions.
+
+A commit is global for the selected subgraph. `Commit(world)` commits every
+node reachable from `world`, while `Commit(player)` commits only `player` and
+its descendants. If a node is shared by multiple roots, committing it through
+one root also removes its changes from deltas read through the other roots.
+Callers are responsible for committing only after every intended consumer has
+processed the changes.
 
 ## Synchronize replicas
 
