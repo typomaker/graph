@@ -214,11 +214,11 @@ graph.Set(jack, Alive(false))
 
 Call the returned close function when the live result is no longer needed. It is idempotent. After closing, the returned `Graph` remains available as a snapshot but no longer updates.
 
-Each active query indexes only the attribute types and exact values present in
-its own matchers, within the nodes reachable from its roots. Identical queries
-over the same ordered roots share this index while retaining independent live
-selections. Closing one selection freezes only that snapshot; the index is
-released after the last identical query closes.
+Each active query materializes only its result and reachable scope. Attribute
+changes are dispatched only to queries whose matchers use the changed types.
+Identical queries over the same ordered roots share this state while retaining
+independent live selections. Closing one selection freezes only that snapshot;
+the shared state is released after the last identical query closes.
 
 Search by a user-defined identifier in the same way:
 
@@ -429,11 +429,11 @@ Indicative results for a 10,000-node graph on an Apple M1 Max:
 
 | Operation | Time | Allocations |
 |---|---:|---:|
-| Exact-query bootstrap | ~2.6 ms | 224 |
-| Reuse active exact query | ~0.30 us | 8 |
+| Exact-query bootstrap | ~2.0 ms | 139 |
+| Reuse active exact query | ~0.31 us | 9 |
 | Reactive result `Len` | ~14 ns | 0 |
-| Relevant attribute update | ~0.54 us | 4 |
-| Unrelated attribute update | ~0.40 us | 3 |
+| Relevant attribute update | ~0.53 us | 4 |
+| Unrelated attribute update | ~0.41 us | 3 |
 
 For a three-step path over 10,000 independent branches, indicative results on
 the same machine are:
@@ -441,7 +441,7 @@ the same machine are:
 | Operation | Time | Allocations |
 |---|---:|---:|
 | Path-query bootstrap | ~14.4 ms | ~20,356 |
-| Relevant endpoint update | ~0.75 us | 3-4 |
-| Path `Unlink` and `Link` pair | ~1.39 us | 6 |
+| Relevant endpoint update | ~0.83 us | 3-4 |
+| Path `Unlink` and `Link` pair | ~1.47 us | 6 |
 
 Actual results depend on the processor, graph shape, number of active queries, and result size.
