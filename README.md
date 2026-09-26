@@ -12,8 +12,9 @@ There are no public `Node`, `Edge`, or internal identifier types. The entire pub
 - Directed relations, multiple parents, and cycle prevention
 - Selection and set operations
 - Reactive queries updated by `Set`, `Unset`, `Link`, and `Unlink`
-- Revision propagation and pruned change graphs through `Commit`
-- Replica synchronization by applying commit deltas
+- Revision propagation and pruned change graphs through `Delta`
+- Explicit delta baselines through `Commit`
+- Replica synchronization through `Delta` and `Apply`
 - Thread-safe operations and a small package-level API
 
 ## Installation
@@ -217,9 +218,11 @@ player, closePlayer := graph.Query(
 defer closePlayer()
 ```
 
-## Track changed branches with Commit
+## Track changed branches with Delta and Commit
 
-`Commit` records a baseline and returns the smallest current subgraph connecting the supplied roots to changed nodes. This is useful for synchronization, change serialization, and incremental processing of large graphs.
+`Delta` returns the smallest current subgraph connecting the supplied roots to
+nodes changed since the baseline. Reading a delta does not modify the baseline.
+`Commit` explicitly advances the baseline to the current revision.
 
 ```go
 world := graph.New(World{})
@@ -234,7 +237,7 @@ graph.Link(inventory, rifle)
 graph.Commit(world) // Record the initial baseline.
 
 graph.Set(rifle, Damage(25))
-changed := graph.Commit(world)
+changed := graph.Delta(world)
 
 // changed contains only world -> player -> inventory -> rifle.
 for root := range graph.Each(changed) {
@@ -244,7 +247,9 @@ for root := range graph.Each(changed) {
 	}
 }
 
-fmt.Println(graph.Empty(graph.Commit(world))) // true
+fmt.Println(graph.Empty(graph.Delta(world))) // false: reading is repeatable
+graph.Commit(world)
+fmt.Println(graph.Empty(graph.Delta(world))) // true
 ```
 
 Real attribute or relation changes update revisions and propagate dirty information through every parent. No-op operations do not change revisions.
@@ -252,27 +257,30 @@ Real attribute or relation changes update revisions and propagate dirty informat
 ## Synchronize replicas
 
 `Apply` merges a delta into another in-memory replica. Bootstrap the replica by
-applying the source's first commit to an empty graph, then apply later commits
-in order:
+applying the source's first delta to an empty graph. Commit the source after the
+delta has been accepted, then repeat the same sequence for later changes:
 
 ```go
 source := graph.New(World{})
 player := graph.New(Actor{}, Health{Current: 100, Max: 100})
 graph.Link(source, player)
 
-replica := graph.Apply(graph.Graph{}, graph.Commit(source))
+initial := graph.Delta(source)
+replica := graph.Apply(graph.Graph{}, initial)
+graph.Commit(source)
 
 graph.Set(player, Health{Current: 90, Max: 100})
-delta := graph.Commit(source)
+delta := graph.Delta(source)
 graph.Apply(replica, delta)
+graph.Commit(source)
 ```
 
 Applying a delta reproduces attribute additions, replacements, and removals,
 as well as linked, unlinked, and newly created branches. Live queries on the
 replica are updated.
 
-The initial commit establishes the internal node identities shared by the two
-replicas. Deltas are stateful and must be applied in commit order. `Graph` and
+The initial delta establishes the internal node identities shared by the two
+replicas. Deltas must be applied and committed in order. `Graph` and
 its deltas are in-memory values; encoding and transport across processes are
 outside this package's current API.
 
@@ -281,7 +289,7 @@ application attributes as a composite identity. Pass the attributes to both
 operations in the same order:
 
 ```go
-delta := graph.Commit(
+delta := graph.Delta(
 	source,
 	graph.Type[EntityKind](),
 	graph.Type[ID](),
@@ -297,9 +305,9 @@ graph.Apply(
 
 Every node in this mode must contain every identity attribute. Their values
 must remain stable and uniquely identify a node within the replica. `Apply`
-panics if its identity attributes differ from those used by `Commit`.
+panics if its identity attributes differ from those used by `Delta`.
 
-When no identity attributes are supplied, `Commit` and `Apply` use an
+When no identity attributes are supplied, `Delta` and `Apply` use an
 immutable internal node ID. This is suitable for a replica bootstrapped from
 the source's initial delta because that operation transfers the identity. It
 cannot match independently constructed graphs. A creation timestamp is not
@@ -331,7 +339,7 @@ Patch roots correspond to target roots by selection order. Descendants match
 only when all supplied attributes are equal. Matching nodes receive every
 attribute present in the patch, and missing branches are copied recursively.
 Attributes and branches absent from an ordinary patch remain unchanged; use a
-`Commit` delta when removals must be represented. Match keys must be present on
+`Delta` when removals must be represented. Match keys must be present on
 every patch descendant and unique among siblings.
 
 ## Programmer errors

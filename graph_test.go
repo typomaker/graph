@@ -60,14 +60,18 @@ func TestDAGQueryAndCommit(t *testing.T) {
 	if Len(q) != 2 {
 		t.Fatal("closed query changed")
 	}
-	_ = Commit(root)
+	Commit(root)
 	Set(child, health{1, 2})
-	delta := Commit(root)
+	delta := Delta(root)
 	if Len(delta) != 1 || Len(At(delta)) != 1 || Len(At(At(delta))) != 1 {
-		t.Fatal("pruned commit path")
+		t.Fatal("pruned delta path")
 	}
-	if !Empty(Commit(root)) {
-		t.Fatal("second commit not empty")
+	if Empty(Delta(root)) {
+		t.Fatal("delta advanced the baseline")
+	}
+	Commit(root)
+	if !Empty(Delta(root)) {
+		t.Fatal("delta after commit not empty")
 	}
 }
 
@@ -155,7 +159,8 @@ func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
 	Link(source, actorNode)
 	Link(actorNode, item)
 
-	replica := Apply(Graph{}, Commit(source))
+	replica := Apply(Graph{}, Delta(source))
+	Commit(source)
 	if Len(replica) != 1 || Len(At(replica)) != 1 || Len(At(At(replica))) != 1 {
 		t.Fatal("initial delta did not reproduce the graph")
 	}
@@ -178,7 +183,8 @@ func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
 	Link(source, newBranch)
 	Unlink(actorNode, item)
 
-	updated := Apply(replica, Commit(source))
+	updated := Apply(replica, Delta(source))
+	Commit(source)
 	if Len(updated) != 1 {
 		t.Fatal("updated roots")
 	}
@@ -375,7 +381,7 @@ func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.
 	sourceActor := New(entityKind("actor"), entityID("one"), health{10, 10})
 	sourceRemoved := New(entityKind("item"), entityID("old"), name("old item"))
 	Link(source, sourceActor, sourceRemoved)
-	Commit(source, keys...)
+	Commit(source)
 
 	target := New(entityKind("world"), entityID("main"), name("target"))
 	targetActor := New(entityKind("actor"), entityID("one"), health{1, 10})
@@ -386,7 +392,7 @@ func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.
 	Unlink(source, sourceRemoved)
 	sourceAdded := New(entityKind("item"), entityID("new"), name("new item"))
 	Link(source, sourceAdded)
-	delta := Commit(source, keys...)
+	delta := Delta(source, keys...)
 	Apply(target, delta, keys...)
 
 	var got health
@@ -408,9 +414,9 @@ func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.
 	}
 }
 
-func TestApplyRejectsCommitIdentityMismatch(t *testing.T) {
+func TestApplyRejectsDeltaIdentityMismatch(t *testing.T) {
 	source := New(entityID("root"))
-	delta := Commit(source, Type[entityID]())
+	delta := Delta(source, Type[entityID]())
 	defer func() {
 		if recover() == nil {
 			t.Fatal("expected panic")

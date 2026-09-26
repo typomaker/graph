@@ -460,23 +460,32 @@ func Query(g Graph, values ...any) (Graph, func()) {
 	return Graph{live: q.result}, closeFn
 }
 
-// Commit returns the current paths from each selected root to changes since its
-// preceding commit. The returned Graph is a pruned structural view. Optional
-// matchBy attributes define the stable composite identity Apply must use.
-func Commit(g Graph, matchBy ...any) Graph {
+// Commit advances the baseline of each selected root to the current revision.
+// Changes at or before that revision are omitted from subsequent Delta calls.
+func Commit(g Graph) {
+	state.Lock()
+	defer state.Unlock()
+	for _, root := range selected(g) {
+		root.baseline = state.revision
+	}
+}
+
+// Delta returns the current paths from each selected root to changes since its
+// preceding Commit. It does not advance the baseline, so repeated calls return
+// the same changes. Optional matchBy attributes define the stable composite
+// identity Apply must use.
+func Delta(g Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
 	keyTypes := identityTypes(matchBy)
 	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange), matchTypes: keyTypes}
 	roots := []*node{}
-	dirtyRoots := []*node{}
 	for _, root := range selected(g) {
 		base := root.baseline
 		if root.treeRev <= base {
 			continue
 		}
-		dirtyRoots = append(dirtyRoots, root)
-		if buildCommitLocked(root, base, view, map[*node]bool{}) {
+		if buildDeltaLocked(root, base, view, map[*node]bool{}) {
 			roots = append(roots, root)
 		}
 	}
@@ -488,19 +497,17 @@ func Commit(g Graph, matchBy ...any) Graph {
 			}
 		}
 	}
-	for _, root := range dirtyRoots {
-		root.baseline = state.revision
-	}
 	if len(roots) == 0 {
 		return Graph{}
 	}
 	return Graph{nodes: roots, view: view}
 }
 
-// Apply merges changes into g and returns the corresponding roots. Commit
-// deltas use their internal node identity. An ordinary graph is deeply merged
-// by the composite attribute key described by matchBy; its roots correspond by
-// selection order, while descendants match when every key attribute is equal.
+// Apply merges changes into g and returns the corresponding roots. Deltas use
+// their internal node identity unless matchBy attributes were supplied to
+// Delta. An ordinary graph is deeply merged by the composite attribute key;
+// its roots correspond by selection order, while descendants match when every
+// key attribute is equal.
 func Apply(g, delta Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
@@ -512,7 +519,7 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 	}
 	keyTypes := identityTypes(matchBy)
 	if !sameTypes(keyTypes, delta.view.matchTypes) {
-		panic("graph: apply match attributes differ from commit")
+		panic("graph: apply match attributes differ from delta")
 	}
 
 	targets := make(map[uint64]*node)
@@ -854,7 +861,7 @@ func equalMatchKey(a, b []any) bool {
 	return true
 }
 
-func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]bool) bool {
+func buildDeltaLocked(n *node, base uint64, view *subgraph, visiting map[*node]bool) bool {
 	if visiting[n] {
 		return false
 	}
@@ -887,11 +894,11 @@ func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]
 		if edgeRev > base {
 			view.edges[n] = append(view.edges[n], c)
 			change.addedChildren[c.key] = struct{}{}
-			buildCommitLocked(c, 0, view, visiting)
+			buildDeltaLocked(c, 0, view, visiting)
 			include = true
 			continue
 		}
-		if c.treeRev > base && buildCommitLocked(c, base, view, visiting) {
+		if c.treeRev > base && buildDeltaLocked(c, base, view, visiting) {
 			view.edges[n] = append(view.edges[n], c)
 			include = true
 		}
