@@ -83,10 +83,16 @@ type pathExpression struct {
 	steps [][]matcher
 }
 
+type pathLevel struct {
+	matchers []matcher
+	active   map[*node]struct{}
+	support  map[*node]uint32
+}
+
 type query struct {
 	roots    []*node
 	matchers []matcher
-	path     [][]matcher
+	path     []pathLevel
 	result   *selection
 	scope    map[*node]uint32
 	root     map[*node]struct{}
@@ -534,7 +540,15 @@ func Exclude(graphs ...Graph) Graph {
 //	players, closePlayers := Query(root, Type[Player](), Type[Position]())
 //	defer closePlayers()
 func Query(g Graph, values ...any) (Graph, func()) {
-	ms, path := queryCriteria(values)
+	ms, pathMatchers := queryCriteria(values)
+	path := make([]pathLevel, len(pathMatchers))
+	for i, matchers := range pathMatchers {
+		path[i] = pathLevel{
+			matchers: matchers,
+			active:   make(map[*node]struct{}),
+			support:  make(map[*node]uint32),
+		}
+	}
 	state.Lock()
 	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, path: path, result: &selection{}, root: make(map[*node]struct{})}
 	recomputeQueryLocked(q)
@@ -1298,24 +1312,10 @@ func matchesLocked(n *node, ms []matcher) bool {
 	return true
 }
 
-func pathMatchesLocked(n *node, path [][]matcher, step int) bool {
-	if !matchesLocked(n, path[step]) {
-		return false
-	}
-	if step == len(path)-1 {
-		return true
-	}
-	for child := range n.children {
-		if pathMatchesLocked(child, path, step+1) {
-			return true
-		}
-	}
-	return false
-}
-
 func queryMatchesLocked(q *query, n *node) bool {
 	if len(q.path) != 0 {
-		return pathMatchesLocked(n, q.path, 0)
+		_, ok := q.path[0].active[n]
+		return ok
 	}
 	return matchesLocked(n, q.matchers)
 }
@@ -1346,6 +1346,7 @@ func recomputeQueryLocked(q *query) {
 			q.scope[child]++
 		}
 	}
+	buildPathIndexLocked(q, reachable)
 	out := make([]*node, 0, len(reachable))
 	for _, n := range reachable {
 		if queryMatchesLocked(q, n) {
@@ -1354,11 +1355,41 @@ func recomputeQueryLocked(q *query) {
 	}
 	q.result.nodes = out
 }
+
+func buildPathIndexLocked(q *query, nodes []*node) {
+	if len(q.path) == 0 {
+		return
+	}
+	for i := range q.path {
+		q.path[i].active = make(map[*node]struct{})
+		q.path[i].support = make(map[*node]uint32)
+	}
+	for step := len(q.path) - 1; step >= 0; step-- {
+		level := &q.path[step]
+		for _, n := range nodes {
+			if step < len(q.path)-1 {
+				for child := range n.children {
+					if _, ok := q.path[step+1].active[child]; ok {
+						level.support[n]++
+					}
+				}
+			}
+			if matchesLocked(n, level.matchers) && (step == len(q.path)-1 || level.support[n] != 0) {
+				level.active[n] = struct{}{}
+			}
+		}
+	}
+}
+
 func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 	for q := range state.queries {
 		if len(q.path) != 0 {
-			if q.scope[n] != 0 && pathUsesTypes(q.path, changed) {
-				recomputeQueryLocked(q)
+			if q.scope[n] != 0 {
+				for step := len(q.path) - 1; step >= 0; step-- {
+					if matchersUseTypes(q.path[step].matchers, changed) {
+						refreshPathNodeLocked(q, n, step)
+					}
+				}
 			}
 			continue
 		}
@@ -1378,15 +1409,58 @@ func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 	}
 }
 
-func pathUsesTypes(path [][]matcher, changed map[reflect.Type]struct{}) bool {
-	for _, step := range path {
-		for _, matcher := range step {
-			if _, ok := changed[matcher.typ]; ok {
-				return true
-			}
+func matchersUseTypes(matchers []matcher, changed map[reflect.Type]struct{}) bool {
+	for _, matcher := range matchers {
+		if _, ok := changed[matcher.typ]; ok {
+			return true
 		}
 	}
 	return false
+}
+
+func refreshPathNodeLocked(q *query, n *node, step int) {
+	level := &q.path[step]
+	_, wasActive := level.active[n]
+	isActive := matchesLocked(n, level.matchers) && (step == len(q.path)-1 || level.support[n] != 0)
+	if wasActive == isActive {
+		return
+	}
+	if isActive {
+		level.active[n] = struct{}{}
+	} else {
+		delete(level.active, n)
+	}
+	if step == 0 {
+		updatePathResultNodeLocked(q, n, isActive)
+		return
+	}
+	for parent := range n.parents {
+		if q.scope[parent] == 0 {
+			continue
+		}
+		parentLevel := &q.path[step-1]
+		if isActive {
+			parentLevel.support[parent]++
+		} else {
+			parentLevel.support[parent]--
+		}
+		refreshPathNodeLocked(q, parent, step-1)
+	}
+}
+
+func updatePathResultNodeLocked(q *query, n *node, active bool) {
+	index := -1
+	for i, current := range q.result.nodes {
+		if current == n {
+			index = i
+			break
+		}
+	}
+	if active && index < 0 {
+		q.result.nodes = append(q.result.nodes, n)
+	} else if !active && index >= 0 {
+		removeQueryResultNodeLocked(q, n)
+	}
 }
 
 func updateQueryNodeLocked(q *query, n *node) {
@@ -1412,7 +1486,7 @@ func updateStructuralQueriesLocked(parent, child *node, linked bool) {
 			continue
 		}
 		if len(q.path) != 0 {
-			recomputeQueryLocked(q)
+			updatePathStructureLocked(q, parent, child, linked)
 			continue
 		}
 		if linked {
@@ -1424,6 +1498,112 @@ func updateStructuralQueriesLocked(parent, child *node, linked bool) {
 		} else {
 			removeQueryReferenceLocked(q, child)
 		}
+	}
+}
+
+func updatePathStructureLocked(q *query, parent, child *node, linked bool) {
+	if linked {
+		if q.scope[child] != 0 {
+			q.scope[child]++
+			updatePathEdgeLocked(q, parent, child, true)
+			return
+		}
+		added := make(map[*node]struct{})
+		addPathScopeLocked(q, child, added)
+		initializeAddedPathNodesLocked(q, added)
+		return
+	}
+
+	updatePathEdgeLocked(q, parent, child, false)
+	removed := make(map[*node]struct{})
+	removePathScopeLocked(q, child, removed)
+	for n := range removed {
+		for i := range q.path {
+			delete(q.path[i].active, n)
+			delete(q.path[i].support, n)
+		}
+		removeQueryResultNodeLocked(q, n)
+	}
+}
+
+func updatePathEdgeLocked(q *query, parent, child *node, linked bool) {
+	for step := 0; step < len(q.path)-1; step++ {
+		if _, active := q.path[step+1].active[child]; !active {
+			continue
+		}
+		if linked {
+			q.path[step].support[parent]++
+		} else {
+			q.path[step].support[parent]--
+		}
+		refreshPathNodeLocked(q, parent, step)
+	}
+}
+
+func addPathScopeLocked(q *query, n *node, added map[*node]struct{}) {
+	wasUnreachable := q.scope[n] == 0
+	q.scope[n]++
+	if !wasUnreachable {
+		return
+	}
+	added[n] = struct{}{}
+	for _, child := range orderedChildren(n) {
+		addPathScopeLocked(q, child, added)
+	}
+}
+
+func initializeAddedPathNodesLocked(q *query, added map[*node]struct{}) {
+	for step := len(q.path) - 1; step >= 0; step-- {
+		level := &q.path[step]
+		for n := range added {
+			if step < len(q.path)-1 {
+				for child := range n.children {
+					if _, active := q.path[step+1].active[child]; active {
+						level.support[n]++
+					}
+				}
+			}
+			if matchesLocked(n, level.matchers) && (step == len(q.path)-1 || level.support[n] != 0) {
+				level.active[n] = struct{}{}
+			}
+		}
+	}
+	for step := len(q.path) - 1; step > 0; step-- {
+		for n := range added {
+			if _, active := q.path[step].active[n]; !active {
+				continue
+			}
+			for parent := range n.parents {
+				if q.scope[parent] == 0 {
+					continue
+				}
+				if _, parentAdded := added[parent]; parentAdded {
+					continue
+				}
+				q.path[step-1].support[parent]++
+				refreshPathNodeLocked(q, parent, step-1)
+			}
+		}
+	}
+	for n := range added {
+		if _, active := q.path[0].active[n]; active {
+			updatePathResultNodeLocked(q, n, true)
+		}
+	}
+}
+
+func removePathScopeLocked(q *query, n *node, removed map[*node]struct{}) {
+	if q.scope[n] == 0 {
+		return
+	}
+	q.scope[n]--
+	if q.scope[n] != 0 {
+		return
+	}
+	delete(q.scope, n)
+	removed[n] = struct{}{}
+	for _, child := range orderedChildren(n) {
+		removePathScopeLocked(q, child, removed)
 	}
 }
 

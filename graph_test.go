@@ -239,6 +239,87 @@ func TestMatchCanGroupAWholeQuery(t *testing.T) {
 	}
 }
 
+func TestPathQueryCountsMultipleSupportingChildren(t *testing.T) {
+	world := New(name("world"))
+	place := New(location{})
+	firstRelation := New(contains{})
+	secondRelation := New(contains{})
+	target := New(actor{}, entityID("actor-1"))
+	Link(world, place)
+	Link(place, firstRelation, secondRelation)
+	Link(firstRelation, target)
+	Link(secondRelation, target)
+
+	locations, closeLocations := Query(
+		world,
+		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+	)
+	defer closeLocations()
+	if Len(locations) != 1 {
+		t.Fatal("multiple supporting paths did not produce one result")
+	}
+
+	Unlink(firstRelation, target)
+	if Len(locations) != 1 {
+		t.Fatal("removing one supporting path removed the result")
+	}
+	Unlink(secondRelation, target)
+	if !Empty(locations) {
+		t.Fatal("result remained after removing every supporting path")
+	}
+}
+
+func TestPathQueryIndexesNewlyReachableSubtree(t *testing.T) {
+	world := New(name("world"))
+	place := New(location{})
+	relation := New(contains{})
+	target := New(actor{}, entityID("actor-1"))
+	Link(place, relation)
+	Link(relation, target)
+
+	locations, closeLocations := Query(
+		world,
+		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+	)
+	defer closeLocations()
+	if !Empty(locations) {
+		t.Fatal("detached subtree unexpectedly matched")
+	}
+
+	Link(world, place)
+	if Len(locations) != 1 {
+		t.Fatal("newly reachable subtree was not indexed")
+	}
+	Unlink(world, place)
+	if !Empty(locations) {
+		t.Fatal("detached subtree remained in the path index")
+	}
+}
+
+func TestPathQueryLinksAlreadyReachableNodes(t *testing.T) {
+	world := New(name("world"))
+	place := New(location{})
+	relation := New(contains{})
+	target := New(actor{}, entityID("actor-1"))
+	Link(world, place, relation, target)
+
+	locations, closeLocations := Query(
+		world,
+		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+	)
+	defer closeLocations()
+
+	Link(place, relation)
+	Link(relation, target)
+	if Len(locations) != 1 {
+		t.Fatal("links between reachable nodes did not update the path index")
+	}
+	Unlink(place, relation)
+	if !Empty(locations) {
+		t.Fatal("unlink between reachable nodes did not update the path index")
+	}
+}
+
 func TestDetachedNodeRemainsUsableAndCanBeRelinked(t *testing.T) {
 	root := New(name("root"))
 	child := New(actor{}, name("child"))

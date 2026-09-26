@@ -8,6 +8,8 @@ import (
 type benchmarkKind struct{}
 type benchmarkID int
 type benchmarkHealth int
+type benchmarkLocation struct{}
+type benchmarkContains struct{}
 
 func benchmarkWorld(size int) (Graph, []Graph) {
 	root := New(name(fmt.Sprintf("benchmark-%d", size)))
@@ -75,6 +77,76 @@ func BenchmarkQueryUnrelatedUpdate10K(b *testing.B) {
 	}
 	if Len(result) != 1 {
 		b.Fatal("unexpected query result")
+	}
+}
+
+func benchmarkPathWorld(size int) (Graph, []Graph, []Graph, []Graph) {
+	root := New(name(fmt.Sprintf("path-benchmark-%d", size)))
+	locations := make([]Graph, size)
+	contains := make([]Graph, size)
+	actors := make([]Graph, size)
+	for i := range size {
+		locations[i] = New(benchmarkLocation{}, benchmarkID(i))
+		contains[i] = New(benchmarkContains{})
+		actors[i] = New(benchmarkKind{}, benchmarkID(i))
+		Link(root, locations[i])
+		Link(locations[i], contains[i])
+		Link(contains[i], actors[i])
+	}
+	return root, locations, contains, actors
+}
+
+func BenchmarkPathQueryBootstrap10K(b *testing.B) {
+	root, _, _, _ := benchmarkPathWorld(10_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		result, closeQuery := Query(
+			root,
+			Path(Type[benchmarkLocation](), Type[benchmarkContains](), Match(Type[benchmarkKind](), benchmarkID(5_000))),
+		)
+		if Len(result) != 1 {
+			b.Fatal("unexpected path query result")
+		}
+		closeQuery()
+	}
+}
+
+func BenchmarkPathQueryAttributeUpdate10K(b *testing.B) {
+	root, _, _, actors := benchmarkPathWorld(10_000)
+	result, closeQuery := Query(
+		root,
+		Path(Type[benchmarkLocation](), Type[benchmarkContains](), Match(Type[benchmarkKind](), benchmarkID(5_000))),
+	)
+	defer closeQuery()
+	target := actors[5_000]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		Set(target, benchmarkID(5_000+i%2))
+	}
+	if Len(result) > 1 {
+		b.Fatal("unexpected path query result")
+	}
+}
+
+func BenchmarkPathQueryLinkUpdate10K(b *testing.B) {
+	root, _, contains, actors := benchmarkPathWorld(10_000)
+	result, closeQuery := Query(
+		root,
+		Path(Type[benchmarkLocation](), Type[benchmarkContains](), Match(Type[benchmarkKind](), benchmarkID(5_000))),
+	)
+	defer closeQuery()
+	parent := contains[5_000]
+	target := actors[5_000]
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		Unlink(parent, target)
+		Link(parent, target)
+	}
+	if Len(result) != 1 {
+		b.Fatal("unexpected path query result")
 	}
 }
 

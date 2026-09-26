@@ -255,6 +255,13 @@ Every path step must match exactly one node; `Path` does not skip intermediate
 nodes. The live result reacts to attribute changes and to links or unlinks
 anywhere in the matching chain.
 
+Each live path query builds its own level index during bootstrap. Every level
+tracks matching nodes and the number of immediate children that support the
+next step. Attribute and relation changes therefore propagate only through
+the affected nodes and their parents, up to the length of the path. Closing
+the query releases this query-specific index; no global relation index is
+retained.
+
 ## Track changed branches with Delta and Commit
 
 `Delta` returns the smallest current subgraph connecting the supplied roots to
@@ -420,5 +427,14 @@ Indicative results for a 10,000-node graph on an Apple M1 Max:
 | Reactive result `Len` | ~14 ns | 0 |
 | Relevant attribute update | ~0.41 us | 4 |
 | Unrelated attribute update | ~0.39 us | 3 |
+
+For a three-step path over 10,000 independent branches, indicative results on
+the same machine are:
+
+| Operation | Time | Allocations |
+|---|---:|---:|
+| Path-query bootstrap | ~14.4 ms | ~20,356 |
+| Relevant endpoint update | ~0.75 us | 3-4 |
+| Path `Unlink` and `Link` pair | ~1.39 us | 6 |
 
 Actual results depend on the processor, graph shape, number of active queries, and result size.
