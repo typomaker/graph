@@ -8,6 +8,8 @@ import (
 type actor struct{}
 type health struct{ Current, Max int }
 type name string
+type entityID string
+type entityKind string
 
 func TestAttributesAndSelections(t *testing.T) {
 	a := New(actor{}, health{10, 10})
@@ -280,5 +282,89 @@ func TestApplyEmptyDeltaIsNoOp(t *testing.T) {
 	target := New(name("target"))
 	if Empty(Apply(target, Graph{})) {
 		t.Fatal("empty delta discarded target")
+	}
+}
+
+func TestApplyDeepMergesOrdinaryGraphByCompositeKey(t *testing.T) {
+	world := New(name("world"), health{100, 100})
+	actorOne := New(entityKind("actor"), entityID("one"), name("old"), health{10, 10})
+	itemOne := New(entityKind("item"), entityID("one"), name("sword"))
+	Link(world, actorOne, itemOne)
+	oldNames, closeOldNames := Query(world, name("old"))
+	defer closeOldNames()
+
+	patch := New(name("patched world"))
+	actorPatch := New(entityKind("actor"), entityID("one"), name("new"))
+	newActorPatch := New(entityKind("actor"), entityID("two"), health{5, 5})
+	nestedItemPatch := New(entityKind("item"), entityID("nested"), name("shield"))
+	Link(newActorPatch, nestedItemPatch)
+	Link(patch, actorPatch, newActorPatch)
+
+	result := Apply(world, patch, Type[entityKind](), Type[entityID]())
+	if Len(result) != 1 || Len(At(world)) != 3 {
+		t.Fatal("ordinary patch structure was not merged")
+	}
+	var worldName name
+	var actorName name
+	var retainedHealth health
+	Get(world, &worldName)
+	Get(actorOne, &actorName, &retainedHealth)
+	if worldName != "patched world" || actorName != "new" || retainedHealth != (health{10, 10}) {
+		t.Fatal("attributes were not deeply merged")
+	}
+	if !Empty(oldNames) {
+		t.Fatal("live query index was not updated")
+	}
+	if Len(At(actorOne)) != 0 {
+		t.Fatal("composite key matched the item with the same ID")
+	}
+	var added Graph
+	for child := range Each(At(world)) {
+		var kind entityKind
+		var id entityID
+		Get(child, &kind, &id)
+		if kind == "actor" && id == "two" {
+			added = child
+		}
+	}
+	if Empty(added) || Len(At(added)) != 1 {
+		t.Fatal("new nested branch was not cloned")
+	}
+}
+
+func TestApplyOrdinaryGraphValidatesMatchKeys(t *testing.T) {
+	tests := []struct {
+		name  string
+		world Graph
+		patch Graph
+	}{
+		{
+			name:  "missing key",
+			world: New(name("world")),
+			patch: func() Graph {
+				root := New(name("patch"))
+				Link(root, New(name("child")))
+				return root
+			}(),
+		},
+		{
+			name:  "duplicate patch key",
+			world: New(name("world")),
+			patch: func() Graph {
+				root := New(name("patch"))
+				Link(root, New(entityID("same")), New(entityID("same")))
+				return root
+			}(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			Apply(tt.world, tt.patch, Type[entityID]())
+		})
 	}
 }

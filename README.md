@@ -269,13 +269,40 @@ graph.Apply(replica, delta)
 
 Applying a delta reproduces attribute additions, replacements, and removals,
 as well as linked, unlinked, and newly created branches. Live queries on the
-replica are updated. A delta must come from `Commit`; passing an ordinary graph
-to `Apply` is a programmer error and panics.
+replica are updated.
 
 The initial commit establishes the internal node identities shared by the two
 replicas. Deltas are stateful and must be applied in commit order. `Graph` and
 its deltas are in-memory values; encoding and transport across processes are
 outside this package's current API.
+
+### Merge a programmatic patch
+
+`Apply` can also deeply merge an ordinary graph that was built without
+revision metadata. Supply one or more attribute types that form the composite
+identity of every non-root node:
+
+```go
+patch := graph.New(WorldName("changed"))
+changedPlayer := graph.New(EntityKind("actor"), ID("player-1"), Health{Current: 80, Max: 100})
+newItem := graph.New(EntityKind("item"), ID("shield"), Armor(20))
+graph.Link(changedPlayer, newItem)
+graph.Link(patch, changedPlayer)
+
+graph.Apply(
+	world,
+	patch,
+	graph.Type[EntityKind](),
+	graph.Type[ID](),
+)
+```
+
+Patch roots correspond to target roots by selection order. Descendants match
+only when all supplied attributes are equal. Matching nodes receive every
+attribute present in the patch, and missing branches are copied recursively.
+Attributes and branches absent from an ordinary patch remain unchanged; use a
+`Commit` delta when removals must be represented. Match keys must be present on
+every patch descendant and unique among siblings.
 
 ## Programmer errors
 

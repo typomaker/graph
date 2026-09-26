@@ -472,17 +472,21 @@ func Commit(g Graph) Graph {
 	return Graph{nodes: roots, view: view}
 }
 
-// Apply merges a delta produced by Commit into a replica and returns the
-// corresponding roots. An empty target bootstraps a new replica from an
-// initial commit. Later deltas must be applied to that replica in order.
-func Apply(g, delta Graph) Graph {
+// Apply merges changes into g and returns the corresponding roots. Commit
+// deltas use their internal node identity. An ordinary graph is deeply merged
+// by the composite attribute key described by matchBy; its roots correspond by
+// selection order, while descendants match when every key attribute is equal.
+func Apply(g, delta Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
 	if len(selected(delta)) == 0 {
 		return g
 	}
 	if delta.view == nil {
-		panic("graph: apply requires a commit delta")
+		return mergeGraphLocked(g, delta, matchTypes(matchBy))
+	}
+	if len(matchBy) != 0 {
+		panic("graph: commit delta does not use match attributes")
 	}
 
 	targets := make(map[uint64]*node)
@@ -581,6 +585,178 @@ func Apply(g, delta Graph) Graph {
 		roots = append(roots, targets[source.key])
 	}
 	return Graph{nodes: roots}
+}
+
+type mergePair struct {
+	source *node
+	target *node
+}
+
+func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
+	if len(keyTypes) == 0 {
+		panic("graph: ordinary patch requires match attributes")
+	}
+	targetRoots := selected(g)
+	pairs := make([]mergePair, 0)
+	mapped := make(map[*node]*node)
+	for i, source := range selected(patch) {
+		var target *node
+		if i < len(targetRoots) {
+			target = targetRoots[i]
+		}
+		planMergeLocked(source, target, keyTypes, mapped, &pairs)
+	}
+
+	rev := nextRevisionLocked()
+	created := make(map[*node]struct{})
+	for i := range pairs {
+		if pairs[i].target != nil {
+			continue
+		}
+		state.nextID++
+		target := newNodeLocked(state.nextID, cloneAttrs(pairs[i].source.attrs), rev)
+		state.nodes[target] = struct{}{}
+		pairs[i].target = target
+		mapped[pairs[i].source] = target
+		created[target] = struct{}{}
+	}
+
+	changed := make(map[*node]struct{})
+	for _, pair := range pairs {
+		if _, isNew := created[pair.target]; isNew {
+			changed[pair.target] = struct{}{}
+			continue
+		}
+		for typ, value := range pair.source.attrs {
+			if old, ok := pair.target.attrs[typ]; ok && old == value {
+				continue
+			}
+			pair.target.attrs[typ] = value
+			pair.target.attrRev[typ] = rev
+			delete(pair.target.removedAttrs, typ)
+			changed[pair.target] = struct{}{}
+		}
+	}
+	for _, pair := range pairs {
+		for sourceChild := range pair.source.children {
+			targetChild := mapped[sourceChild]
+			if _, exists := pair.target.children[targetChild]; exists {
+				continue
+			}
+			if targetChild == pair.target || reachesLocked(targetChild, pair.target) {
+				panic("graph: patch would create a cycle")
+			}
+			pair.target.children[targetChild] = rev
+			delete(pair.target.removedChildren, targetChild.key)
+			targetChild.parents[pair.target] = struct{}{}
+			changed[pair.target] = struct{}{}
+		}
+	}
+	for target := range changed {
+		target.selfRev = rev
+		propagateLocked(target, rev)
+		updateIndexesLocked(target, nil)
+	}
+	if len(changed) != 0 {
+		for q := range state.queries {
+			recomputeQueryLocked(q)
+		}
+	}
+
+	roots := make([]*node, 0, len(selected(patch)))
+	for _, source := range selected(patch) {
+		roots = append(roots, mapped[source])
+	}
+	return Graph{nodes: roots}
+}
+
+func planMergeLocked(source, target *node, keyTypes []reflect.Type, mapped map[*node]*node, pairs *[]mergePair) {
+	if existing, seen := mapped[source]; seen {
+		if target != nil {
+			if existing != nil && existing != target {
+				panic("graph: patch identity matches multiple target nodes")
+			}
+			if existing == nil {
+				mapped[source] = target
+				for i := range *pairs {
+					if (*pairs)[i].source == source {
+						(*pairs)[i].target = target
+						break
+					}
+				}
+				planMergeChildrenLocked(source, target, keyTypes, mapped, pairs)
+			}
+		}
+		return
+	}
+	mapped[source] = target
+	*pairs = append(*pairs, mergePair{source: source, target: target})
+	planMergeChildrenLocked(source, target, keyTypes, mapped, pairs)
+}
+
+func planMergeChildrenLocked(source, target *node, keyTypes []reflect.Type, mapped map[*node]*node, pairs *[]mergePair) {
+	seenKeys := make([][]any, 0, len(source.children))
+	for _, sourceChild := range orderedChildren(source) {
+		key := nodeMatchKey(sourceChild, keyTypes)
+		for _, seen := range seenKeys {
+			if equalMatchKey(key, seen) {
+				panic("graph: duplicate patch child match key")
+			}
+		}
+		seenKeys = append(seenKeys, key)
+		var match *node
+		if target != nil {
+			for _, candidate := range orderedChildren(target) {
+				candidateKey, ok := optionalNodeMatchKey(candidate, keyTypes)
+				if !ok || !equalMatchKey(key, candidateKey) {
+					continue
+				}
+				if match != nil {
+					panic("graph: multiple target children match patch key")
+				}
+				match = candidate
+			}
+		}
+		planMergeLocked(sourceChild, match, keyTypes, mapped, pairs)
+	}
+}
+
+func matchTypes(values []any) []reflect.Type {
+	requests := inspectRequests(values, false)
+	types := make([]reflect.Type, len(requests))
+	for i, request := range requests {
+		types[i] = request.typ
+	}
+	return types
+}
+
+func nodeMatchKey(n *node, types []reflect.Type) []any {
+	key, ok := optionalNodeMatchKey(n, types)
+	if !ok {
+		panic("graph: patch child lacks a match attribute")
+	}
+	return key
+}
+
+func optionalNodeMatchKey(n *node, types []reflect.Type) ([]any, bool) {
+	key := make([]any, len(types))
+	for i, typ := range types {
+		value, ok := n.attrs[typ]
+		if !ok {
+			return nil, false
+		}
+		key[i] = value
+	}
+	return key, true
+}
+
+func equalMatchKey(a, b []any) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]bool) bool {
