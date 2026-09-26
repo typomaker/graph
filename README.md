@@ -143,6 +143,12 @@ graph.Unlink(inventory, rifle)
 
 Linking an existing pair and unlinking a missing pair are safe no-ops. Creating a cycle panics because it violates the DAG invariant.
 
+`Unlink` removes only the relation. A detached node remains usable while a
+user-held `Graph`, an active query, a delta, or another edge references it, and
+it can be linked again later. The package does not keep a global registry of
+all nodes, so a detached component with no remaining references can be
+reclaimed by Go's garbage collector.
+
 A child may have multiple parents:
 
 ```go

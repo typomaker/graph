@@ -1,9 +1,6 @@
 package graph
 
-import (
-	"reflect"
-	"testing"
-)
+import "testing"
 
 type actor struct{}
 type health struct{ Current, Max int }
@@ -114,42 +111,30 @@ func TestQueryStructuralUpdatesPreserveMultipleParentReachability(t *testing.T) 
 	}
 }
 
-func TestQueryIndexLifecycleIsDemandDrivenAndShared(t *testing.T) {
-	root := New(name("index-root"))
-	first := New(actor{}, name("first"))
-	second := New(actor{}, name("second"))
-	Link(root, first, second)
+func TestDetachedNodeRemainsUsableAndCanBeRelinked(t *testing.T) {
+	root := New(name("root"))
+	child := New(actor{}, name("child"))
+	Link(root, child)
+	result, closeResult := Query(root, Type[actor]())
+	defer closeResult()
 
-	state.RLock()
-	before := len(state.index)
-	state.RUnlock()
-	typeResult, closeType := Query(root, Type[actor]())
-	otherTypeResult, closeOtherType := Query(root, Type[actor]())
-	exactResult, closeExact := Query(root, Type[actor](), name("first"))
-	if Len(typeResult) != 2 || Len(otherTypeResult) != 2 || Len(exactResult) != 1 {
-		t.Fatal("indexed query bootstrap mismatch")
+	Unlink(root, child)
+	if !Empty(result) {
+		t.Fatal("detached node remained in parent query")
 	}
-	typeKey := indexKey{typ: reflect.TypeOf(actor{}), any: true}
-	exactKey := indexKey{typ: reflect.TypeOf(name("")), value: name("first")}
-	state.RLock()
-	if state.index[typeKey] == nil || state.index[typeKey].users != 3 || state.index[exactKey] == nil || state.index[exactKey].users != 1 || len(state.index) != before+2 {
-		t.Fatalf("indexes=%+v", state.index)
+	if Empty(Get(child, Type[actor]())) {
+		t.Fatal("user-held detached node became invalid")
 	}
-	state.RUnlock()
-	closeType()
-	closeType()
-	closeOtherType()
-	state.RLock()
-	if state.index[typeKey] == nil || state.index[typeKey].users != 1 {
-		t.Fatal("shared type bucket was released early")
+	detachedResult, closeDetached := Query(child, Type[actor]())
+	if Len(detachedResult) != 1 {
+		t.Fatal("detached node cannot be queried")
 	}
-	state.RUnlock()
-	closeExact()
-	state.RLock()
-	if len(state.index) != before {
-		t.Fatal("unused query buckets were retained")
+	closeDetached()
+
+	Link(root, child)
+	if Len(result) != 1 {
+		t.Fatal("relinked node did not return to parent query")
 	}
-	state.RUnlock()
 }
 
 func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
