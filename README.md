@@ -12,6 +12,7 @@ There are no public `Node`, `Edge`, or internal identifier types. The entire pub
 - Directed relations, multiple parents, and cycle prevention
 - Selection and set operations
 - Reactive queries updated by `Set`, `Unset`, `Link`, and `Unlink`
+- Structural path queries over immediate relations
 - Revision propagation and pruned change graphs through `Delta`
 - Explicit delta baselines through `Commit`
 - Replica synchronization through `Delta` and `Apply`
@@ -223,6 +224,36 @@ player, closePlayer := graph.Query(
 )
 defer closePlayer()
 ```
+
+### Structural path queries
+
+`Path` matches a chain of nodes connected by immediate outgoing relations and
+returns the node matching its first step. Use `Match` to require multiple
+attributes on one step:
+
+```go
+type Location struct{}
+type Contains struct{}
+
+locations, closeLocations := graph.Query(
+	world,
+	graph.Path(
+		graph.Type[Location](),
+		graph.Type[Contains](),
+		graph.Match(
+			graph.Type[Actor](),
+			ID("actor-1"),
+		),
+	),
+)
+defer closeLocations()
+```
+
+This query selects each reachable `Location` with an immediate `Contains`
+child that itself has an immediate `Actor` child whose `ID` is `"actor-1"`.
+Every path step must match exactly one node; `Path` does not skip intermediate
+nodes. The live result reacts to attribute changes and to links or unlinks
+anywhere in the matching chain.
 
 ## Track changed branches with Delta and Commit
 

@@ -8,6 +8,9 @@ type name string
 type entityID string
 type entityKind string
 
+type location struct{}
+type contains struct{}
+
 func TestAttributesAndSelections(t *testing.T) {
 	a := New(actor{}, health{10, 10})
 	b := New(actor{}, health{5, 10})
@@ -108,6 +111,131 @@ func TestQueryStructuralUpdatesPreserveMultipleParentReachability(t *testing.T) 
 	Link(left, target)
 	if Len(result) != 1 {
 		t.Fatal("relinked subtree was not added incrementally")
+	}
+}
+
+func TestPathQueryMatchesImmediateStructuralChain(t *testing.T) {
+	world := New(name("world"))
+	firstLocation := New(location{}, name("first"))
+	secondLocation := New(location{}, name("second"))
+	firstContains := New(contains{})
+	secondContains := New(contains{})
+	target := New(actor{}, entityID("actor-1"))
+	other := New(actor{}, entityID("actor-2"))
+	Link(world, firstLocation, secondLocation)
+	Link(firstLocation, firstContains)
+	Link(secondLocation, secondContains)
+	Link(firstContains, target)
+	Link(secondContains, other)
+
+	locations, closeLocations := Query(
+		world,
+		Path(
+			Type[location](),
+			Type[contains](),
+			Match(Type[actor](), entityID("actor-1")),
+		),
+	)
+	defer closeLocations()
+
+	if Len(locations) != 1 || first(locations) != first(firstLocation) {
+		t.Fatal("path query did not return the matching path start")
+	}
+
+	intermediate := New(name("intermediate"))
+	Unlink(firstContains, target)
+	Link(firstContains, intermediate)
+	Link(intermediate, target)
+	if !Empty(locations) {
+		t.Fatal("path query skipped a non-matching intermediate node")
+	}
+}
+
+func TestPathQueryTracksAttributeAndRelationChanges(t *testing.T) {
+	world := New(name("world"))
+	place := New(location{})
+	relation := New(contains{})
+	target := New(actor{}, entityID("other"))
+	Link(world, place)
+	Link(place, relation)
+	Link(relation, target)
+
+	locations, closeLocations := Query(
+		world,
+		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+	)
+	if !Empty(locations) {
+		t.Fatal("path query matched the wrong endpoint")
+	}
+
+	Set(target, entityID("actor-1"))
+	if Len(locations) != 1 {
+		t.Fatal("endpoint attribute update did not add the path start")
+	}
+	Set(target, health{Current: 1, Max: 1})
+	if Len(locations) != 1 {
+		t.Fatal("unrelated attribute update changed the path result")
+	}
+	Unset(relation, Type[contains]())
+	if !Empty(locations) {
+		t.Fatal("intermediate attribute removal did not remove the path start")
+	}
+	Set(relation, contains{})
+	if Len(locations) != 1 {
+		t.Fatal("intermediate attribute insertion did not restore the path start")
+	}
+	Unlink(place, relation)
+	if !Empty(locations) {
+		t.Fatal("relation removal did not remove the path start")
+	}
+	Link(place, relation)
+	if Len(locations) != 1 {
+		t.Fatal("relation insertion did not restore the path start")
+	}
+
+	closeLocations()
+	Unset(target, Type[actor]())
+	if Len(locations) != 1 {
+		t.Fatal("closed path query changed")
+	}
+}
+
+func TestPathAndMatchValidationPanics(t *testing.T) {
+	tests := []struct {
+		name string
+		fn   func()
+	}{
+		{"empty match", func() { Match() }},
+		{"empty path", func() { Path() }},
+		{"nested path", func() { Path(Path(Type[actor]())) }},
+		{"mixed query expression", func() { Query(New(actor{}), Path(Type[actor]()), Type[actor]()) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tt.fn()
+		})
+	}
+}
+
+func TestMatchCanGroupAWholeQuery(t *testing.T) {
+	root := New(name("root"))
+	target := New(actor{}, entityID("actor-1"))
+	Link(root, target)
+
+	result, closeResult := Query(root, Match(Type[actor](), entityID("actor-1")))
+	defer closeResult()
+	if Len(result) != 1 || first(result) != first(target) {
+		t.Fatal("top-level match did not preserve query semantics")
+	}
+
+	Set(target, health{Current: 1, Max: 1})
+	if Len(result) != 1 {
+		t.Fatal("unrelated attribute update changed a grouped query")
 	}
 }
 

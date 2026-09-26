@@ -75,9 +75,18 @@ type matcher struct {
 	any   bool
 }
 
+type matchExpression struct {
+	matchers []matcher
+}
+
+type pathExpression struct {
+	steps [][]matcher
+}
+
 type query struct {
 	roots    []*node
 	matchers []matcher
+	path     [][]matcher
 	result   *selection
 	scope    map[*node]uint32
 	root     map[*node]struct{}
@@ -97,6 +106,42 @@ func init() {
 func Type[T any]() any {
 	t := reflect.TypeOf((*T)(nil)).Elem()
 	return typeMatcher{typ: normalizeType(t)}
+}
+
+// Match groups attribute matchers that must all match the same node in a Path.
+//
+// For example, this path step matches an Actor having a specific ID:
+//
+//	Match(Type[Actor](), ID("actor-1"))
+func Match(values ...any) any {
+	return matchExpression{matchers: queryMatchers(values)}
+}
+
+// Path creates a structural matcher whose steps must be connected by
+// immediate outgoing relations. A query returns the nodes matching the first
+// step when the entire path matches.
+//
+// For example, this matches Location nodes connected through Contains nodes
+// to a particular Actor:
+//
+//	Path(
+//		Type[Location](),
+//		Type[Contains](),
+//		Match(Type[Actor](), ID("actor-1")),
+//	)
+func Path(values ...any) any {
+	if len(values) == 0 {
+		panic("graph: path requires at least one step")
+	}
+	steps := make([][]matcher, len(values))
+	for i, value := range values {
+		if group, ok := value.(matchExpression); ok {
+			steps[i] = append([]matcher(nil), group.matchers...)
+			continue
+		}
+		steps[i] = queryMatchers([]any{value})
+	}
+	return pathExpression{steps: steps}
 }
 
 // New creates one independent node containing the supplied attributes.
@@ -489,9 +534,9 @@ func Exclude(graphs ...Graph) Graph {
 //	players, closePlayers := Query(root, Type[Player](), Type[Position]())
 //	defer closePlayers()
 func Query(g Graph, values ...any) (Graph, func()) {
-	ms := queryMatchers(values)
+	ms, path := queryCriteria(values)
 	state.Lock()
-	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, result: &selection{}, root: make(map[*node]struct{})}
+	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, path: path, result: &selection{}, root: make(map[*node]struct{})}
 	recomputeQueryLocked(q)
 	state.queries[q] = struct{}{}
 	state.Unlock()
@@ -1131,6 +1176,29 @@ func queryMatchers(values []any) []matcher {
 	}
 	return out
 }
+
+func queryCriteria(values []any) ([]matcher, [][]matcher) {
+	if len(values) == 1 {
+		switch expression := values[0].(type) {
+		case matchExpression:
+			return append([]matcher(nil), expression.matchers...), nil
+		case pathExpression:
+			path := make([][]matcher, len(expression.steps))
+			for i, step := range expression.steps {
+				path[i] = append([]matcher(nil), step...)
+			}
+			return nil, path
+		}
+	}
+	for _, value := range values {
+		switch value.(type) {
+		case matchExpression, pathExpression:
+			panic("graph: Match and Path must be a single query expression")
+		}
+	}
+	return queryMatchers(values), nil
+}
+
 func nextRevisionLocked() uint64 { state.revision++; return state.revision }
 func propagateLocked(n *node, rev uint64) {
 	seen := map[*node]struct{}{}
@@ -1229,6 +1297,29 @@ func matchesLocked(n *node, ms []matcher) bool {
 	}
 	return true
 }
+
+func pathMatchesLocked(n *node, path [][]matcher, step int) bool {
+	if !matchesLocked(n, path[step]) {
+		return false
+	}
+	if step == len(path)-1 {
+		return true
+	}
+	for child := range n.children {
+		if pathMatchesLocked(child, path, step+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func queryMatchesLocked(q *query, n *node) bool {
+	if len(q.path) != 0 {
+		return pathMatchesLocked(n, q.path, 0)
+	}
+	return matchesLocked(n, q.matchers)
+}
+
 func recomputeQueryLocked(q *query) {
 	q.scope = make(map[*node]uint32)
 	q.root = make(map[*node]struct{})
@@ -1257,7 +1348,7 @@ func recomputeQueryLocked(q *query) {
 	}
 	out := make([]*node, 0, len(reachable))
 	for _, n := range reachable {
-		if matchesLocked(n, q.matchers) {
+		if queryMatchesLocked(q, n) {
 			out = append(out, n)
 		}
 	}
@@ -1265,6 +1356,12 @@ func recomputeQueryLocked(q *query) {
 }
 func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 	for q := range state.queries {
+		if len(q.path) != 0 {
+			if q.scope[n] != 0 && pathUsesTypes(q.path, changed) {
+				recomputeQueryLocked(q)
+			}
+			continue
+		}
 		relevant := false
 		for _, m := range q.matchers {
 			if _, ok := changed[m.typ]; ok {
@@ -1281,6 +1378,17 @@ func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 	}
 }
 
+func pathUsesTypes(path [][]matcher, changed map[reflect.Type]struct{}) bool {
+	for _, step := range path {
+		for _, matcher := range step {
+			if _, ok := changed[matcher.typ]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func updateQueryNodeLocked(q *query, n *node) {
 	index := -1
 	for i, current := range q.result.nodes {
@@ -1289,7 +1397,7 @@ func updateQueryNodeLocked(q *query, n *node) {
 			break
 		}
 	}
-	matches := matchesLocked(n, q.matchers)
+	matches := queryMatchesLocked(q, n)
 	if matches && index < 0 {
 		q.result.nodes = append(q.result.nodes, n)
 	} else if !matches && index >= 0 {
@@ -1301,6 +1409,10 @@ func updateQueryNodeLocked(q *query, n *node) {
 func updateStructuralQueriesLocked(parent, child *node, linked bool) {
 	for q := range state.queries {
 		if q.scope[parent] == 0 {
+			continue
+		}
+		if len(q.path) != 0 {
+			recomputeQueryLocked(q)
 			continue
 		}
 		if linked {
