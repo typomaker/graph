@@ -13,6 +13,7 @@ There are no public `Node`, `Edge`, or internal identifier types. The entire pub
 - Selection and set operations
 - Reactive queries updated by `Set`, `Unset`, `Link`, and `Unlink`
 - Revision propagation and pruned change graphs through `Commit`
+- Replica synchronization by applying commit deltas
 - Thread-safe operations and a small package-level API
 
 ## Installation
@@ -247,6 +248,34 @@ fmt.Println(graph.Empty(graph.Commit(world))) // true
 ```
 
 Real attribute or relation changes update revisions and propagate dirty information through every parent. No-op operations do not change revisions.
+
+## Synchronize replicas
+
+`Apply` merges a delta into another in-memory replica. Bootstrap the replica by
+applying the source's first commit to an empty graph, then apply later commits
+in order:
+
+```go
+source := graph.New(World{})
+player := graph.New(Actor{}, Health{Current: 100, Max: 100})
+graph.Link(source, player)
+
+replica := graph.Apply(graph.Graph{}, graph.Commit(source))
+
+graph.Set(player, Health{Current: 90, Max: 100})
+delta := graph.Commit(source)
+graph.Apply(replica, delta)
+```
+
+Applying a delta reproduces attribute additions, replacements, and removals,
+as well as linked, unlinked, and newly created branches. Live queries on the
+replica are updated. A delta must come from `Commit`; passing an ordinary graph
+to `Apply` is a programmer error and panics.
+
+The initial commit establishes the internal node identities shared by the two
+replicas. Deltas are stateful and must be applied in commit order. `Graph` and
+its deltas are in-memory values; encoding and transport across processes are
+outside this package's current API.
 
 ## Programmer errors
 

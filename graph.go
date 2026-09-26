@@ -18,13 +18,17 @@ type Graph struct {
 }
 
 type node struct {
-	id       uint64
-	attrs    map[reflect.Type]any
-	children map[*node]uint64 // edge creation revision
-	parents  map[*node]struct{}
-	selfRev  uint64
-	treeRev  uint64
-	baseline uint64
+	id              uint64
+	key             uint64
+	attrs           map[reflect.Type]any
+	attrRev         map[reflect.Type]uint64
+	removedAttrs    map[reflect.Type]uint64
+	children        map[*node]uint64 // edge creation revision
+	removedChildren map[uint64]uint64
+	parents         map[*node]struct{}
+	selfRev         uint64
+	treeRev         uint64
+	baseline        uint64
 }
 
 type selection struct {
@@ -32,7 +36,18 @@ type selection struct {
 	closed bool
 }
 
-type subgraph struct{ edges map[*node][]*node }
+type subgraph struct {
+	edges   map[*node][]*node
+	changes map[*node]nodeChange
+}
+
+type nodeChange struct {
+	attrs           map[reflect.Type]any
+	removedAttrs    []reflect.Type
+	addedChildren   map[uint64]struct{}
+	removedChildren []uint64
+	snapshot        map[reflect.Type]any
+}
 
 type typeMatcher struct{ typ reflect.Type }
 
@@ -91,7 +106,7 @@ func New(value any, values ...any) Graph {
 	defer state.Unlock()
 	state.nextID++
 	rev := nextRevisionLocked()
-	n := &node{id: state.nextID, attrs: attrs, children: make(map[*node]uint64), parents: make(map[*node]struct{}), selfRev: rev, treeRev: rev}
+	n := newNodeLocked(state.nextID, attrs, rev)
 	state.nodes[n] = struct{}{}
 	updateIndexesLocked(n, nil)
 	return Graph{nodes: []*node{n}}
@@ -147,6 +162,8 @@ func Set(g Graph, values ...any) Graph {
 		old, ok := n.attrs[t]
 		if !ok || old != v {
 			n.attrs[t] = v
+			n.attrRev[t] = 0
+			delete(n.removedAttrs, t)
 			changedTypes[t] = struct{}{}
 		}
 	}
@@ -155,6 +172,9 @@ func Set(g Graph, values ...any) Graph {
 	}
 	rev := nextRevisionLocked()
 	n.selfRev = rev
+	for t := range changedTypes {
+		n.attrRev[t] = rev
+	}
 	propagateLocked(n, rev)
 	updateIndexesLocked(n, changedTypes)
 	updateAttributeQueriesLocked(n, changedTypes)
@@ -181,6 +201,7 @@ func Unset(g Graph, values ...any) Graph {
 			r.dest.Elem().Set(reflect.ValueOf(v))
 		}
 		delete(n.attrs, r.typ)
+		delete(n.attrRev, r.typ)
 		changed[r.typ] = struct{}{}
 	}
 	if len(changed) == 0 {
@@ -188,6 +209,9 @@ func Unset(g Graph, values ...any) Graph {
 	}
 	rev := nextRevisionLocked()
 	n.selfRev = rev
+	for t := range changed {
+		n.removedAttrs[t] = rev
+	}
 	propagateLocked(n, rev)
 	updateIndexesLocked(n, changed)
 	updateAttributeQueriesLocked(n, changed)
@@ -265,6 +289,7 @@ func Link(g Graph, graphs ...Graph) Graph {
 		}
 		rev := nextRevisionLocked()
 		parent.children[child] = rev
+		delete(parent.removedChildren, child.key)
 		child.parents[parent] = struct{}{}
 		parent.selfRev = rev
 		propagateLocked(parent, rev)
@@ -290,6 +315,7 @@ func Unlink(g Graph, graphs ...Graph) Graph {
 		delete(parent.children, child)
 		delete(child.parents, parent)
 		rev := nextRevisionLocked()
+		parent.removedChildren[child.key] = rev
 		parent.selfRev = rev
 		propagateLocked(parent, rev)
 		updateStructuralQueriesLocked(parent, child, false)
@@ -401,7 +427,7 @@ func Query(g Graph, values ...any) (Graph, func()) {
 	state.Lock()
 	q := &query{roots: append([]*node(nil), selected(g)...), matchers: ms, result: &selection{}, root: make(map[*node]struct{})}
 	for _, m := range ms {
-		key := indexKey{typ: m.typ, value: m.value, any: m.any}
+		key := indexKey(m)
 		acquireIndexLocked(key)
 		q.buckets = append(q.buckets, key)
 	}
@@ -428,7 +454,7 @@ func Query(g Graph, values ...any) (Graph, func()) {
 func Commit(g Graph) Graph {
 	state.Lock()
 	defer state.Unlock()
-	view := &subgraph{edges: make(map[*node][]*node)}
+	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange)}
 	roots := []*node{}
 	for _, root := range selected(g) {
 		base := root.baseline
@@ -446,6 +472,117 @@ func Commit(g Graph) Graph {
 	return Graph{nodes: roots, view: view}
 }
 
+// Apply merges a delta produced by Commit into a replica and returns the
+// corresponding roots. An empty target bootstraps a new replica from an
+// initial commit. Later deltas must be applied to that replica in order.
+func Apply(g, delta Graph) Graph {
+	state.Lock()
+	defer state.Unlock()
+	if len(selected(delta)) == 0 {
+		return g
+	}
+	if delta.view == nil {
+		panic("graph: apply requires a commit delta")
+	}
+
+	targets := make(map[uint64]*node)
+	for _, n := range reachableLocked(selected(g)) {
+		if _, duplicate := targets[n.key]; duplicate {
+			panic("graph: replica contains duplicate node identity")
+		}
+		targets[n.key] = n
+	}
+	deltaNodes := reachableViewLocked(selected(delta), delta.view)
+	rev := nextRevisionLocked()
+	created := make(map[*node]bool)
+	for _, source := range deltaNodes {
+		if targets[source.key] != nil {
+			continue
+		}
+		change := delta.view.changes[source]
+		state.nextID++
+		target := newNodeLocked(source.key, cloneAttrs(change.snapshot), rev)
+		target.id = state.nextID
+		targets[source.key] = target
+		created[target] = true
+		state.nodes[target] = struct{}{}
+	}
+
+	changed := make(map[*node]struct{})
+	for _, source := range deltaNodes {
+		target := targets[source.key]
+		change := delta.view.changes[source]
+		if !created[target] {
+			for typ, value := range change.attrs {
+				if old, ok := target.attrs[typ]; !ok || old != value {
+					target.attrs[typ] = value
+					target.attrRev[typ] = rev
+					delete(target.removedAttrs, typ)
+					changed[target] = struct{}{}
+				}
+			}
+			for _, typ := range change.removedAttrs {
+				if _, ok := target.attrs[typ]; ok {
+					delete(target.attrs, typ)
+					delete(target.attrRev, typ)
+					target.removedAttrs[typ] = rev
+					changed[target] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, source := range deltaNodes {
+		parent := targets[source.key]
+		change := delta.view.changes[source]
+		for _, key := range change.removedChildren {
+			child := targets[key]
+			if child == nil {
+				continue
+			}
+			if _, ok := parent.children[child]; ok {
+				delete(parent.children, child)
+				delete(child.parents, parent)
+				parent.removedChildren[key] = rev
+				changed[parent] = struct{}{}
+			}
+		}
+		for _, sourceChild := range delta.view.edges[source] {
+			if _, added := change.addedChildren[sourceChild.key]; !added {
+				continue
+			}
+			child := targets[sourceChild.key]
+			if _, ok := parent.children[child]; !ok {
+				if child == parent || reachesLocked(child, parent) {
+					panic("graph: delta would create a cycle")
+				}
+				parent.children[child] = rev
+				delete(parent.removedChildren, child.key)
+				child.parents[parent] = struct{}{}
+				changed[parent] = struct{}{}
+			}
+		}
+	}
+	for target := range created {
+		changed[target] = struct{}{}
+	}
+	for target := range changed {
+		target.selfRev = rev
+		propagateLocked(target, rev)
+		updateIndexesLocked(target, nil)
+	}
+	if len(changed) != 0 {
+		for q := range state.queries {
+			recomputeQueryLocked(q)
+		}
+	}
+
+	roots := make([]*node, 0, len(selected(delta)))
+	for _, source := range selected(delta) {
+		roots = append(roots, targets[source.key])
+	}
+	return Graph{nodes: roots}
+}
+
 func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]bool) bool {
 	if visiting[n] {
 		return false
@@ -453,11 +590,33 @@ func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]
 	visiting[n] = true
 	defer delete(visiting, n)
 	include := n.selfRev > base
+	change := nodeChange{
+		attrs:         make(map[reflect.Type]any),
+		addedChildren: make(map[uint64]struct{}),
+		snapshot:      cloneAttrs(n.attrs),
+	}
+	for typ, rev := range n.attrRev {
+		if rev > base {
+			change.attrs[typ] = n.attrs[typ]
+		}
+	}
+	for typ, rev := range n.removedAttrs {
+		if rev > base {
+			change.removedAttrs = append(change.removedAttrs, typ)
+		}
+	}
+	for key, rev := range n.removedChildren {
+		if rev > base {
+			change.removedChildren = append(change.removedChildren, key)
+		}
+	}
 	children := orderedChildren(n)
 	for _, c := range children {
 		edgeRev := n.children[c]
 		if edgeRev > base {
 			view.edges[n] = append(view.edges[n], c)
+			change.addedChildren[c.key] = struct{}{}
+			buildCommitLocked(c, 0, view, visiting)
 			include = true
 			continue
 		}
@@ -465,6 +624,9 @@ func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]
 			view.edges[n] = append(view.edges[n], c)
 			include = true
 		}
+	}
+	if include {
+		view.changes[n] = change
 	}
 	return include
 }
@@ -474,6 +636,47 @@ func selected(g Graph) []*node {
 		return g.live.nodes
 	}
 	return g.nodes
+}
+
+func newNodeLocked(key uint64, attrs map[reflect.Type]any, rev uint64) *node {
+	attrRev := make(map[reflect.Type]uint64, len(attrs))
+	for typ := range attrs {
+		attrRev[typ] = rev
+	}
+	return &node{
+		id: state.nextID, key: key, attrs: attrs, attrRev: attrRev,
+		removedAttrs: make(map[reflect.Type]uint64), children: make(map[*node]uint64),
+		removedChildren: make(map[uint64]uint64), parents: make(map[*node]struct{}),
+		selfRev: rev, treeRev: rev,
+	}
+}
+
+func cloneAttrs(attrs map[reflect.Type]any) map[reflect.Type]any {
+	clone := make(map[reflect.Type]any, len(attrs))
+	for typ, value := range attrs {
+		clone[typ] = value
+	}
+	return clone
+}
+
+func reachableViewLocked(roots []*node, view *subgraph) []*node {
+	seen := make(map[*node]struct{})
+	out := make([]*node, 0)
+	var visit func(*node)
+	visit = func(n *node) {
+		if _, ok := seen[n]; ok {
+			return
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+		for _, child := range view.edges[n] {
+			visit(child)
+		}
+	}
+	for _, root := range roots {
+		visit(root)
+	}
+	return out
 }
 func first(g Graph) *node {
 	ns := selected(g)
