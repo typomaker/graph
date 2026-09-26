@@ -104,12 +104,22 @@ func init() {
 }
 
 // Type returns a matcher meaning "an attribute of type T, with any value".
+//
+// For example, this query selects every reachable node with a Position
+// attribute:
+//
+//	positions, closePositions := Query(root, Type[Position]())
+//	defer closePositions()
 func Type[T any]() any {
 	t := reflect.TypeOf((*T)(nil)).Elem()
 	return typeMatcher{typ: normalizeType(t)}
 }
 
 // New creates one independent node containing the supplied attributes.
+//
+// For example, this creates a node with Name and Position attributes:
+//
+//	player := New(Name("player"), Position{X: 10, Y: 20})
 func New(value any, values ...any) Graph {
 	all := append([]any{value}, values...)
 	attrs := storedAttributes(all)
@@ -125,6 +135,12 @@ func New(value any, values ...any) Graph {
 
 // Get returns the first node when at least one requested attribute matches.
 // Pointer arguments receive the stored value when present.
+//
+// For example, this retrieves a Position attribute and reports whether it was
+// present:
+//
+//	var position Position
+//	found := !Empty(Get(player, &position))
 func Get(g Graph, values ...any) Graph {
 	requests := inspectRequests(values, true)
 	state.RLock()
@@ -160,6 +176,10 @@ type request struct {
 }
 
 // Set adds or replaces attributes on the first node and returns it iff changed.
+//
+// For example, this updates the first selected node and detects a change:
+//
+//	changed := !Empty(Set(player, Position{X: 20, Y: 30}))
 func Set(g Graph, values ...any) Graph {
 	attrs := storedAttributes(values)
 	state.Lock()
@@ -194,6 +214,11 @@ func Set(g Graph, values ...any) Graph {
 
 // Unset removes requested attributes from the first node and optionally writes
 // old values to pointer arguments.
+//
+// For example, this removes Position while retaining its previous value:
+//
+//	var previous Position
+//	removed := !Empty(Unset(player, &previous))
 func Unset(g Graph, values ...any) Graph {
 	requests := inspectRequests(values, true)
 	state.Lock()
@@ -231,6 +256,11 @@ func Unset(g Graph, values ...any) Graph {
 
 // At returns all immediate children, or the supplied candidates that are
 // immediate children, preserving their argument order.
+//
+// For example, this selects all children and then filters two candidates:
+//
+//	children := At(parent)
+//	selected := At(parent, secondChild, firstChild)
 func At(g Graph, graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
@@ -277,6 +307,10 @@ func At(g Graph, graphs ...Graph) Graph {
 
 // Link creates outgoing relations from the first node to the first node of
 // each argument. It panics if any relation would create a cycle.
+//
+// For example, this attaches two children and returns the newly linked nodes:
+//
+//	linked := Link(parent, firstChild, secondChild)
 func Link(g Graph, graphs ...Graph) Graph {
 	state.Lock()
 	defer state.Unlock()
@@ -311,6 +345,10 @@ func Link(g Graph, graphs ...Graph) Graph {
 }
 
 // Unlink removes existing outgoing relations.
+//
+// For example, this detaches child and reports whether the relation existed:
+//
+//	removed := !Empty(Unlink(parent, child))
 func Unlink(g Graph, graphs ...Graph) Graph {
 	state.Lock()
 	defer state.Unlock()
@@ -336,6 +374,12 @@ func Unlink(g Graph, graphs ...Graph) Graph {
 }
 
 // Each iterates over singleton Graph values in selection order.
+//
+// For example, this visits every node in a selection:
+//
+//	for node := range Each(selection) {
+//		Set(node, Visible(true))
+//	}
 func Each(g Graph) iter.Seq[Graph] {
 	state.RLock()
 	nodes := append([]*node(nil), selected(g)...)
@@ -351,12 +395,27 @@ func Each(g Graph) iter.Seq[Graph] {
 }
 
 // Len returns the number of nodes in the selection.
+//
+// For example:
+//
+//	count := Len(At(parent))
 func Len(g Graph) int { state.RLock(); defer state.RUnlock(); return len(selected(g)) }
 
 // Empty reports whether the selection contains no nodes.
+//
+// For example:
+//
+//	if Empty(Get(player, Type[Position]())) {
+//		Set(player, Position{})
+//	}
 func Empty(g Graph) bool { return Len(g) == 0 }
 
 // Merge returns the ordered union of all selections.
+//
+// For example, duplicates are removed while the first occurrence order is
+// retained:
+//
+//	all := Merge(firstSelection, secondSelection, firstSelection)
 func Merge(graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
@@ -374,6 +433,10 @@ func Merge(graphs ...Graph) Graph {
 }
 
 // Include returns the intersection of all selections in first-selection order.
+//
+// For example, this keeps nodes present in both selections:
+//
+//	visiblePlayers := Include(players, visible)
 func Include(graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
@@ -406,6 +469,10 @@ func Include(graphs ...Graph) Graph {
 }
 
 // Exclude subtracts every later selection from the first.
+//
+// For example, this selects players that are not hidden or disconnected:
+//
+//	activePlayers := Exclude(players, hidden, disconnected)
 func Exclude(graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
@@ -433,6 +500,14 @@ func Exclude(graphs ...Graph) Graph {
 }
 
 // Query creates a live AND query over nodes reachable from g (including g).
+// The returned close function releases the query; callers should always call
+// it when they no longer need live updates.
+//
+// For example, this selection tracks reachable nodes having both Player and
+// Position attributes:
+//
+//	players, closePlayers := Query(root, Type[Player](), Type[Position]())
+//	defer closePlayers()
 func Query(g Graph, values ...any) (Graph, func()) {
 	ms := queryMatchers(values)
 	state.Lock()
@@ -462,6 +537,12 @@ func Query(g Graph, values ...any) (Graph, func()) {
 
 // Commit advances the baseline of each selected root to the current revision.
 // Changes at or before that revision are omitted from subsequent Delta calls.
+//
+// For example, commit after synchronizing a replica so that the next delta
+// contains only later changes:
+//
+//	replica = Apply(replica, Delta(source))
+//	Commit(source)
 func Commit(g Graph) {
 	state.Lock()
 	defer state.Unlock()
@@ -474,6 +555,10 @@ func Commit(g Graph) {
 // preceding Commit. It does not advance the baseline, so repeated calls return
 // the same changes. Optional matchBy attributes define the stable composite
 // identity Apply must use.
+//
+// For example, this creates a delta whose nodes are identified by EntityID:
+//
+//	changes := Delta(source, Type[EntityID]())
 func Delta(g Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
@@ -508,6 +593,11 @@ func Delta(g Graph, matchBy ...any) Graph {
 // Delta. An ordinary graph is deeply merged by the composite attribute key;
 // its roots correspond by selection order, while descendants match when every
 // key attribute is equal.
+//
+// For example, this applies an EntityID-keyed delta to a replica:
+//
+//	changes := Delta(source, Type[EntityID]())
+//	replica = Apply(replica, changes, Type[EntityID]())
 func Apply(g, delta Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
