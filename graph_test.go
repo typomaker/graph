@@ -323,6 +323,55 @@ func TestApplyDeepMergesOrdinaryGraphByCompositeKey(t *testing.T) {
 	}
 }
 
+func TestApplyOrdinaryGraphMatchesNodesGlobally(t *testing.T) {
+	world := New(entityID("world"))
+	actor := New(entityID("actor"), entityKind("actor"))
+	skill := New(entityID("sprint"), entityKind("skill"), name("old"))
+	Link(world, actor)
+	Link(actor, skill)
+	Commit(world)
+
+	patchActor := New(entityID("actor"), entityKind("actor"))
+	perform := New(entityID("perform"), entityKind("perform"))
+	skillReference := New(entityID("sprint"), entityKind("skill"), name("updated"))
+	Link(patchActor, perform)
+	Link(patchActor, skillReference)
+	Link(perform, skillReference)
+
+	updatedSkills, closeUpdatedSkills := Query(world, name("updated"))
+	defer closeUpdatedSkills()
+
+	result := Apply(world, patchActor, Type[entityID]())
+	if first(result) != first(actor) {
+		t.Fatal("patch root was not matched globally")
+	}
+	var targetPerform Graph
+	for child := range Each(At(actor)) {
+		var id entityID
+		Get(child, &id)
+		if id == "perform" {
+			targetPerform = child
+		}
+	}
+	if Len(At(actor)) != 2 || Len(At(targetPerform)) != 1 || Empty(At(targetPerform, skill)) {
+		t.Fatal("existing node was not linked into the new branch")
+	}
+	if first(At(targetPerform)) != first(skill) {
+		t.Fatal("patch created a duplicate node")
+	}
+	var skillName name
+	Get(skill, &skillName)
+	if skillName != "updated" || Len(updatedSkills) != 1 {
+		t.Fatal("matched node attributes or live query were not updated")
+	}
+
+	Commit(world)
+	Apply(world, patchActor, Type[entityID]())
+	if !Empty(Delta(world)) || Len(At(actor)) != 2 || Len(At(targetPerform)) != 1 {
+		t.Fatal("reapplying the same patch was not a no-op")
+	}
+}
+
 func TestApplyOrdinaryGraphValidatesMatchKeys(t *testing.T) {
 	tests := []struct {
 		name  string

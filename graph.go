@@ -566,9 +566,9 @@ func Delta(g Graph, matchBy ...any) Graph {
 
 // Apply merges changes into g and returns the corresponding roots. Deltas use
 // their internal node identity unless matchBy attributes were supplied to
-// Delta. An ordinary graph is deeply merged by the composite attribute key;
-// its roots correspond by selection order, while descendants match when every
-// key attribute is equal.
+// Delta. An ordinary graph is additively merged by the composite attribute
+// key, matching nodes across the entire target graph. For compatibility, a
+// patch root without the key attributes corresponds by selection order.
 //
 // For example, this applies an EntityID-keyed delta to a replica:
 //
@@ -721,14 +721,18 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 		panic("graph: ordinary patch requires match attributes")
 	}
 	targetRoots := selected(g)
+	targets := newCompositeIndex(keyTypes, reachableLocked(targetRoots))
 	pairs := make([]mergePair, 0)
 	mapped := make(map[*node]*node)
+	patchNodes := &compositeIndex{types: keyTypes}
 	for i, source := range selected(patch) {
 		var target *node
-		if i < len(targetRoots) {
+		if _, keyed := optionalNodeMatchKey(source, keyTypes); keyed {
+			target = targets.find(source.attrs)
+		} else if i < len(targetRoots) {
 			target = targetRoots[i]
 		}
-		planMergeLocked(source, target, keyTypes, mapped, &pairs)
+		planMergeLocked(source, target, targets, patchNodes, mapped, &pairs)
 	}
 
 	rev := nextRevisionLocked()
@@ -792,46 +796,22 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 	return Graph{nodes: roots}
 }
 
-func planMergeLocked(source, target *node, keyTypes []reflect.Type, mapped map[*node]*node, pairs *[]mergePair) {
-	if existing, seen := mapped[source]; seen {
-		if target != nil {
-			if existing != nil && existing != target {
-				panic("graph: patch identity matches multiple target nodes")
-			}
-			if existing == nil {
-				mapped[source] = target
-				for i := range *pairs {
-					if (*pairs)[i].source == source {
-						(*pairs)[i].target = target
-						break
-					}
-				}
-				planMergeChildrenLocked(source, target, keyTypes, mapped, pairs)
-			}
-		}
+func planMergeLocked(source, target *node, targets, patchNodes *compositeIndex, mapped map[*node]*node, pairs *[]mergePair) {
+	if _, seen := mapped[source]; seen {
 		return
+	}
+	if _, keyed := optionalNodeMatchKey(source, targets.types); keyed && !patchNodes.add(source) {
+		panic("graph: duplicate patch match key")
 	}
 	mapped[source] = target
 	*pairs = append(*pairs, mergePair{source: source, target: target})
-	planMergeChildrenLocked(source, target, keyTypes, mapped, pairs)
+	planMergeChildrenLocked(source, targets, patchNodes, mapped, pairs)
 }
 
-func planMergeChildrenLocked(source, target *node, keyTypes []reflect.Type, mapped map[*node]*node, pairs *[]mergePair) {
-	patchChildren := &compositeIndex{types: keyTypes}
-	var targetChildren *compositeIndex
-	if target != nil {
-		targetChildren = newCompositeIndex(keyTypes, orderedChildren(target))
-	}
+func planMergeChildrenLocked(source *node, targets, patchNodes *compositeIndex, mapped map[*node]*node, pairs *[]mergePair) {
 	for _, sourceChild := range orderedChildren(source) {
-		nodeMatchKey(sourceChild, keyTypes)
-		if !patchChildren.add(sourceChild) {
-			panic("graph: duplicate patch child match key")
-		}
-		var match *node
-		if targetChildren != nil {
-			match = targetChildren.find(sourceChild.attrs)
-		}
-		planMergeLocked(sourceChild, match, keyTypes, mapped, pairs)
+		match := targets.find(sourceChild.attrs)
+		planMergeLocked(sourceChild, match, targets, patchNodes, mapped, pairs)
 	}
 }
 
