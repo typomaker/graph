@@ -547,8 +547,12 @@ func Delta(g Graph, matchBy ...any) Graph {
 		}
 	}
 	if len(keyTypes) != 0 {
+		identities := &compositeIndex{types: keyTypes}
 		for n, change := range view.changes {
 			nodeMatchKey(n, keyTypes)
+			if !identities.addAttrs(change.snapshot, n) {
+				panic("graph: multiple delta nodes have the same identity")
+			}
 			for _, removed := range change.removedChildren {
 				attrsMatchKey(removed.attrs, keyTypes)
 			}
@@ -586,6 +590,7 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 
 	targets := make(map[uint64]*node)
 	targetScope := reachableLocked(selected(g))
+	var keyedTargets *compositeIndex
 	if len(keyTypes) == 0 {
 		for _, n := range targetScope {
 			if _, duplicate := targets[n.key]; duplicate {
@@ -593,20 +598,22 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 			}
 			targets[n.key] = n
 		}
+	} else {
+		keyedTargets = newCompositeIndex(keyTypes, targetScope)
 	}
 	deltaNodes := reachableViewLocked(selected(delta), delta.view)
 	matches := make(map[*node]*node, len(deltaNodes))
-	for _, source := range deltaNodes {
-		if len(keyTypes) == 0 {
-			matches[source] = targets[source.key]
-			continue
-		}
-		matches[source] = findIdentityMatch(source.attrs, targetScope, keyTypes)
-	}
 	rev := nextRevisionLocked()
 	created := make(map[*node]bool)
 	for _, source := range deltaNodes {
-		if matches[source] != nil {
+		var target *node
+		if len(keyTypes) == 0 {
+			target = targets[source.key]
+		} else {
+			target = keyedTargets.find(delta.view.changes[source].snapshot)
+		}
+		if target != nil {
+			matches[source] = target
 			continue
 		}
 		change := delta.view.changes[source]
@@ -615,11 +622,13 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 		if len(keyTypes) != 0 {
 			key = state.nextID
 		}
-		target := newNodeLocked(key, cloneAttrs(change.snapshot), rev)
+		target = newNodeLocked(key, cloneAttrs(change.snapshot), rev)
 		target.id = state.nextID
 		targets[source.key] = target
 		matches[source] = target
-		targetScope = append(targetScope, target)
+		if keyedTargets != nil {
+			keyedTargets.add(target)
+		}
 		created[target] = true
 	}
 
@@ -654,7 +663,7 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 			if len(keyTypes) == 0 {
 				child = targets[removed.key]
 			} else {
-				child = findIdentityMatch(removed.attrs, orderedChildren(parent), keyTypes)
+				child = keyedTargets.find(removed.attrs)
 			}
 			if child == nil {
 				continue
@@ -808,27 +817,19 @@ func planMergeLocked(source, target *node, keyTypes []reflect.Type, mapped map[*
 }
 
 func planMergeChildrenLocked(source, target *node, keyTypes []reflect.Type, mapped map[*node]*node, pairs *[]mergePair) {
-	seenKeys := make([][]any, 0, len(source.children))
+	patchChildren := &compositeIndex{types: keyTypes}
+	var targetChildren *compositeIndex
+	if target != nil {
+		targetChildren = newCompositeIndex(keyTypes, orderedChildren(target))
+	}
 	for _, sourceChild := range orderedChildren(source) {
-		key := nodeMatchKey(sourceChild, keyTypes)
-		for _, seen := range seenKeys {
-			if equalMatchKey(key, seen) {
-				panic("graph: duplicate patch child match key")
-			}
+		nodeMatchKey(sourceChild, keyTypes)
+		if !patchChildren.add(sourceChild) {
+			panic("graph: duplicate patch child match key")
 		}
-		seenKeys = append(seenKeys, key)
 		var match *node
-		if target != nil {
-			for _, candidate := range orderedChildren(target) {
-				candidateKey, ok := optionalNodeMatchKey(candidate, keyTypes)
-				if !ok || !equalMatchKey(key, candidateKey) {
-					continue
-				}
-				if match != nil {
-					panic("graph: multiple target children match patch key")
-				}
-				match = candidate
-			}
+		if targetChildren != nil {
+			match = targetChildren.find(sourceChild.attrs)
 		}
 		planMergeLocked(sourceChild, match, keyTypes, mapped, pairs)
 	}
@@ -894,29 +895,67 @@ func optionalAttrsMatchKey(attrs map[reflect.Type]any, types []reflect.Type) ([]
 	return key, true
 }
 
-func findIdentityMatch(attrs map[reflect.Type]any, candidates []*node, types []reflect.Type) *node {
-	key := attrsMatchKey(attrs, types)
-	var match *node
-	for _, candidate := range candidates {
-		candidateKey, ok := optionalNodeMatchKey(candidate, types)
-		if !ok || !equalMatchKey(key, candidateKey) {
-			continue
-		}
-		if match != nil {
-			panic("graph: multiple target nodes match identity")
-		}
-		match = candidate
-	}
-	return match
+type compositeIndex struct {
+	types []reflect.Type
+	root  compositeIndexLevel
 }
 
-func equalMatchKey(a, b []any) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+type compositeIndexLevel struct {
+	children  map[any]*compositeIndexLevel
+	node      *node
+	duplicate bool
+}
+
+func newCompositeIndex(types []reflect.Type, nodes []*node) *compositeIndex {
+	index := &compositeIndex{types: types}
+	for _, n := range nodes {
+		index.add(n)
+	}
+	return index
+}
+
+func (i *compositeIndex) add(n *node) bool {
+	return i.addAttrs(n.attrs, n)
+}
+
+func (i *compositeIndex) addAttrs(attrs map[reflect.Type]any, n *node) bool {
+	key, ok := optionalAttrsMatchKey(attrs, i.types)
+	if !ok {
+		return true
+	}
+	level := &i.root
+	for _, value := range key {
+		if level.children == nil {
+			level.children = make(map[any]*compositeIndexLevel)
+		}
+		next := level.children[value]
+		if next == nil {
+			next = &compositeIndexLevel{}
+			level.children[value] = next
+		}
+		level = next
+	}
+	if level.node != nil && level.node != n {
+		level.duplicate = true
+		return false
+	}
+	level.node = n
+	return true
+}
+
+func (i *compositeIndex) find(attrs map[reflect.Type]any) *node {
+	key := attrsMatchKey(attrs, i.types)
+	level := &i.root
+	for _, value := range key {
+		level = level.children[value]
+		if level == nil {
+			return nil
 		}
 	}
-	return true
+	if level.duplicate {
+		panic("graph: multiple target nodes match identity")
+	}
+	return level.node
 }
 
 func buildDeltaLocked(n *node, view *subgraph, visiting map[*node]bool, full bool) bool {

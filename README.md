@@ -321,6 +321,11 @@ Every node in this mode must contain every identity attribute. Their values
 must remain stable and uniquely identify a node within the replica. `Apply`
 panics if its identity attributes differ from those used by `Delta`.
 
+`Apply` builds a temporary composite index of the reachable target nodes before
+processing a keyed delta. Matching therefore scales linearly with the target
+subgraph plus the delta, rather than scanning the target once per changed node.
+The index is discarded when `Apply` returns and does not retain detached nodes.
+
 When no identity attributes are supplied, `Delta` and `Apply` use an
 immutable internal node ID. This is suitable for a replica bootstrapped from
 the source's initial delta because that operation transfers the identity. It

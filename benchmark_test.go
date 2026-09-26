@@ -77,3 +77,26 @@ func BenchmarkQueryUnrelatedUpdate10K(b *testing.B) {
 		b.Fatal("unexpected query result")
 	}
 }
+
+func BenchmarkApplyDelta10K(b *testing.B) {
+	const size = 10_000
+	source := New(benchmarkKind{}, benchmarkID(-1), name("source"))
+	target := New(benchmarkKind{}, benchmarkID(-1), name("target"))
+	sourceNodes := make([]Graph, size)
+	for i := range size {
+		sourceNodes[i] = New(benchmarkKind{}, benchmarkID(i), benchmarkHealth(100))
+		targetNode := New(benchmarkKind{}, benchmarkID(i), benchmarkHealth(100))
+		Link(source, sourceNodes[i])
+		Link(target, targetNode)
+	}
+	Commit(source)
+	for i, sourceNode := range sourceNodes {
+		Set(sourceNode, benchmarkHealth(100+i))
+	}
+	delta := Delta(source, Type[benchmarkKind](), Type[benchmarkID]())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		Apply(target, delta, Type[benchmarkKind](), Type[benchmarkID]())
+	}
+}
