@@ -24,7 +24,7 @@ type node struct {
 	attrRev         map[reflect.Type]uint64
 	removedAttrs    map[reflect.Type]uint64
 	children        map[*node]uint64 // edge creation revision
-	removedChildren map[uint64]uint64
+	removedChildren map[uint64]removedChild
 	parents         map[*node]struct{}
 	selfRev         uint64
 	treeRev         uint64
@@ -37,16 +37,27 @@ type selection struct {
 }
 
 type subgraph struct {
-	edges   map[*node][]*node
-	changes map[*node]nodeChange
+	edges      map[*node][]*node
+	changes    map[*node]nodeChange
+	matchTypes []reflect.Type
+}
+
+type removedChild struct {
+	revision uint64
+	attrs    map[reflect.Type]any
 }
 
 type nodeChange struct {
 	attrs           map[reflect.Type]any
 	removedAttrs    []reflect.Type
 	addedChildren   map[uint64]struct{}
-	removedChildren []uint64
+	removedChildren []removedChildChange
 	snapshot        map[reflect.Type]any
+}
+
+type removedChildChange struct {
+	key   uint64
+	attrs map[reflect.Type]any
 }
 
 type typeMatcher struct{ typ reflect.Type }
@@ -315,7 +326,7 @@ func Unlink(g Graph, graphs ...Graph) Graph {
 		delete(parent.children, child)
 		delete(child.parents, parent)
 		rev := nextRevisionLocked()
-		parent.removedChildren[child.key] = rev
+		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 		parent.selfRev = rev
 		propagateLocked(parent, rev)
 		updateStructuralQueriesLocked(parent, child, false)
@@ -450,20 +461,34 @@ func Query(g Graph, values ...any) (Graph, func()) {
 }
 
 // Commit returns the current paths from each selected root to changes since its
-// preceding commit. The returned Graph is a pruned structural view.
-func Commit(g Graph) Graph {
+// preceding commit. The returned Graph is a pruned structural view. Optional
+// matchBy attributes define the stable composite identity Apply must use.
+func Commit(g Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
-	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange)}
+	keyTypes := identityTypes(matchBy)
+	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange), matchTypes: keyTypes}
 	roots := []*node{}
+	dirtyRoots := []*node{}
 	for _, root := range selected(g) {
 		base := root.baseline
 		if root.treeRev <= base {
 			continue
 		}
+		dirtyRoots = append(dirtyRoots, root)
 		if buildCommitLocked(root, base, view, map[*node]bool{}) {
 			roots = append(roots, root)
 		}
+	}
+	if len(keyTypes) != 0 {
+		for n, change := range view.changes {
+			nodeMatchKey(n, keyTypes)
+			for _, removed := range change.removedChildren {
+				attrsMatchKey(removed.attrs, keyTypes)
+			}
+		}
+	}
+	for _, root := range dirtyRoots {
 		root.baseline = state.revision
 	}
 	if len(roots) == 0 {
@@ -485,36 +510,54 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 	if delta.view == nil {
 		return mergeGraphLocked(g, delta, matchTypes(matchBy))
 	}
-	if len(matchBy) != 0 {
-		panic("graph: commit delta does not use match attributes")
+	keyTypes := identityTypes(matchBy)
+	if !sameTypes(keyTypes, delta.view.matchTypes) {
+		panic("graph: apply match attributes differ from commit")
 	}
 
 	targets := make(map[uint64]*node)
-	for _, n := range reachableLocked(selected(g)) {
-		if _, duplicate := targets[n.key]; duplicate {
-			panic("graph: replica contains duplicate node identity")
+	targetScope := reachableLocked(selected(g))
+	if len(keyTypes) == 0 {
+		for _, n := range targetScope {
+			if _, duplicate := targets[n.key]; duplicate {
+				panic("graph: replica contains duplicate node identity")
+			}
+			targets[n.key] = n
 		}
-		targets[n.key] = n
 	}
 	deltaNodes := reachableViewLocked(selected(delta), delta.view)
+	matches := make(map[*node]*node, len(deltaNodes))
+	for _, source := range deltaNodes {
+		if len(keyTypes) == 0 {
+			matches[source] = targets[source.key]
+			continue
+		}
+		matches[source] = findIdentityMatch(source.attrs, targetScope, keyTypes)
+	}
 	rev := nextRevisionLocked()
 	created := make(map[*node]bool)
 	for _, source := range deltaNodes {
-		if targets[source.key] != nil {
+		if matches[source] != nil {
 			continue
 		}
 		change := delta.view.changes[source]
 		state.nextID++
-		target := newNodeLocked(source.key, cloneAttrs(change.snapshot), rev)
+		key := source.key
+		if len(keyTypes) != 0 {
+			key = state.nextID
+		}
+		target := newNodeLocked(key, cloneAttrs(change.snapshot), rev)
 		target.id = state.nextID
 		targets[source.key] = target
+		matches[source] = target
+		targetScope = append(targetScope, target)
 		created[target] = true
 		state.nodes[target] = struct{}{}
 	}
 
 	changed := make(map[*node]struct{})
 	for _, source := range deltaNodes {
-		target := targets[source.key]
+		target := matches[source]
 		change := delta.view.changes[source]
 		if !created[target] {
 			for typ, value := range change.attrs {
@@ -536,17 +579,22 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 		}
 	}
 	for _, source := range deltaNodes {
-		parent := targets[source.key]
+		parent := matches[source]
 		change := delta.view.changes[source]
-		for _, key := range change.removedChildren {
-			child := targets[key]
+		for _, removed := range change.removedChildren {
+			var child *node
+			if len(keyTypes) == 0 {
+				child = targets[removed.key]
+			} else {
+				child = findIdentityMatch(removed.attrs, orderedChildren(parent), keyTypes)
+			}
 			if child == nil {
 				continue
 			}
 			if _, ok := parent.children[child]; ok {
 				delete(parent.children, child)
 				delete(child.parents, parent)
-				parent.removedChildren[key] = rev
+				parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 				changed[parent] = struct{}{}
 			}
 		}
@@ -554,7 +602,7 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 			if _, added := change.addedChildren[sourceChild.key]; !added {
 				continue
 			}
-			child := targets[sourceChild.key]
+			child := matches[sourceChild]
 			if _, ok := parent.children[child]; !ok {
 				if child == parent || reachesLocked(child, parent) {
 					panic("graph: delta would create a cycle")
@@ -582,7 +630,7 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 
 	roots := make([]*node, 0, len(selected(delta)))
 	for _, source := range selected(delta) {
-		roots = append(roots, targets[source.key])
+		roots = append(roots, matches[source])
 	}
 	return Graph{nodes: roots}
 }
@@ -722,12 +770,31 @@ func planMergeChildrenLocked(source, target *node, keyTypes []reflect.Type, mapp
 }
 
 func matchTypes(values []any) []reflect.Type {
+	return identityTypes(values)
+}
+
+func identityTypes(values []any) []reflect.Type {
+	if len(values) == 0 {
+		return nil
+	}
 	requests := inspectRequests(values, false)
 	types := make([]reflect.Type, len(requests))
 	for i, request := range requests {
 		types[i] = request.typ
 	}
 	return types
+}
+
+func sameTypes(a, b []reflect.Type) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func nodeMatchKey(n *node, types []reflect.Type) []any {
@@ -739,15 +806,43 @@ func nodeMatchKey(n *node, types []reflect.Type) []any {
 }
 
 func optionalNodeMatchKey(n *node, types []reflect.Type) ([]any, bool) {
+	return optionalAttrsMatchKey(n.attrs, types)
+}
+
+func attrsMatchKey(attrs map[reflect.Type]any, types []reflect.Type) []any {
+	key, ok := optionalAttrsMatchKey(attrs, types)
+	if !ok {
+		panic("graph: node lacks a match attribute")
+	}
+	return key
+}
+
+func optionalAttrsMatchKey(attrs map[reflect.Type]any, types []reflect.Type) ([]any, bool) {
 	key := make([]any, len(types))
 	for i, typ := range types {
-		value, ok := n.attrs[typ]
+		value, ok := attrs[typ]
 		if !ok {
 			return nil, false
 		}
 		key[i] = value
 	}
 	return key, true
+}
+
+func findIdentityMatch(attrs map[reflect.Type]any, candidates []*node, types []reflect.Type) *node {
+	key := attrsMatchKey(attrs, types)
+	var match *node
+	for _, candidate := range candidates {
+		candidateKey, ok := optionalNodeMatchKey(candidate, types)
+		if !ok || !equalMatchKey(key, candidateKey) {
+			continue
+		}
+		if match != nil {
+			panic("graph: multiple target nodes match identity")
+		}
+		match = candidate
+	}
+	return match
 }
 
 func equalMatchKey(a, b []any) bool {
@@ -781,9 +876,9 @@ func buildCommitLocked(n *node, base uint64, view *subgraph, visiting map[*node]
 			change.removedAttrs = append(change.removedAttrs, typ)
 		}
 	}
-	for key, rev := range n.removedChildren {
-		if rev > base {
-			change.removedChildren = append(change.removedChildren, key)
+	for key, removed := range n.removedChildren {
+		if removed.revision > base {
+			change.removedChildren = append(change.removedChildren, removedChildChange{key: key, attrs: cloneAttrs(removed.attrs)})
 		}
 	}
 	children := orderedChildren(n)
@@ -822,7 +917,7 @@ func newNodeLocked(key uint64, attrs map[reflect.Type]any, rev uint64) *node {
 	return &node{
 		id: state.nextID, key: key, attrs: attrs, attrRev: attrRev,
 		removedAttrs: make(map[reflect.Type]uint64), children: make(map[*node]uint64),
-		removedChildren: make(map[uint64]uint64), parents: make(map[*node]struct{}),
+		removedChildren: make(map[uint64]removedChild), parents: make(map[*node]struct{}),
 		selfRev: rev, treeRev: rev,
 	}
 }

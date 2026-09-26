@@ -276,6 +276,36 @@ replicas. Deltas are stateful and must be applied in commit order. `Graph` and
 its deltas are in-memory values; encoding and transport across processes are
 outside this package's current API.
 
+Two independently constructed replicas can instead use the same stable
+application attributes as a composite identity. Pass the attributes to both
+operations in the same order:
+
+```go
+delta := graph.Commit(
+	source,
+	graph.Type[EntityKind](),
+	graph.Type[ID](),
+)
+
+graph.Apply(
+	replica,
+	delta,
+	graph.Type[EntityKind](),
+	graph.Type[ID](),
+)
+```
+
+Every node in this mode must contain every identity attribute. Their values
+must remain stable and uniquely identify a node within the replica. `Apply`
+panics if its identity attributes differ from those used by `Commit`.
+
+When no identity attributes are supplied, `Commit` and `Apply` use an
+immutable internal node ID. This is suitable for a replica bootstrapped from
+the source's initial delta because that operation transfers the identity. It
+cannot match independently constructed graphs. A creation timestamp is not
+used: timestamps can collide, depend on clock behavior, and do not establish
+that two separately created nodes represent the same entity.
+
 ### Merge a programmatic patch
 
 `Apply` can also deeply merge an ordinary graph that was built without

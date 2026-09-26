@@ -368,3 +368,53 @@ func TestApplyOrdinaryGraphValidatesMatchKeys(t *testing.T) {
 		})
 	}
 }
+
+func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.T) {
+	keys := []any{Type[entityKind](), Type[entityID]()}
+	source := New(entityKind("world"), entityID("main"), name("source"))
+	sourceActor := New(entityKind("actor"), entityID("one"), health{10, 10})
+	sourceRemoved := New(entityKind("item"), entityID("old"), name("old item"))
+	Link(source, sourceActor, sourceRemoved)
+	Commit(source, keys...)
+
+	target := New(entityKind("world"), entityID("main"), name("target"))
+	targetActor := New(entityKind("actor"), entityID("one"), health{1, 10})
+	targetRemoved := New(entityKind("item"), entityID("old"), name("old item"))
+	Link(target, targetActor, targetRemoved)
+
+	Set(sourceActor, health{8, 10})
+	Unlink(source, sourceRemoved)
+	sourceAdded := New(entityKind("item"), entityID("new"), name("new item"))
+	Link(source, sourceAdded)
+	delta := Commit(source, keys...)
+	Apply(target, delta, keys...)
+
+	var got health
+	Get(targetActor, &got)
+	if got != (health{8, 10}) {
+		t.Fatal("independent replica node was not matched")
+	}
+	if !Empty(At(target, targetRemoved)) || Len(At(target)) != 2 {
+		t.Fatal("keyed structural changes were not applied")
+	}
+	var foundAdded bool
+	for child := range Each(At(target)) {
+		var id entityID
+		Get(child, &id)
+		foundAdded = foundAdded || id == "new"
+	}
+	if !foundAdded {
+		t.Fatal("keyed added node was not applied")
+	}
+}
+
+func TestApplyRejectsCommitIdentityMismatch(t *testing.T) {
+	source := New(entityID("root"))
+	delta := Commit(source, Type[entityID]())
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic")
+		}
+	}()
+	Apply(New(entityID("root")), delta)
+}
