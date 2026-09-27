@@ -200,6 +200,21 @@ func BenchmarkStructuralToggleBranch100Of10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchAddedBranch100Of10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	branch := New(benchmarkKind("branch"))
+	for i := 0; i < 99; i++ {
+		Link(branch, New(benchmarkKind("branch"), benchmarkID(fmt.Sprint(i))))
+	}
+	Commit(root)
+	Link(root, branch)
+	Search(root, benchmarkKind("actor")) // Rebuild traversal order outside timing.
+	b.ResetTimer()
+	for range b.N {
+		Search(root, benchmarkKind("branch"))
+	}
+}
+
 func BenchmarkSearchFirstAfterStructuralChange10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	leaf := New(benchmarkKind("leaf"))
