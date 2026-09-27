@@ -104,7 +104,7 @@ for actor := range graph.Each(actors) {
 
 ## Synchronization
 
-`Commit` establishes a revision baseline for reachable nodes. `Delta` creates a change graph since that baseline, and `Apply` applies such a delta. Optional type matchers define a composite identity for independent replicas.
+`Commit` establishes a revision baseline for reachable nodes and publishes an immutable search index for each selected root. `Delta` creates a change graph since that baseline, and `Apply` applies such a delta. Optional type matchers define a composite identity for independent replicas.
 
 ```go
 changes := graph.Delta(source, graph.Type[Kind](), graph.Type[ID]())
@@ -122,7 +122,9 @@ graph.Patch(target, patch, graph.Type[ID]())
 
 ## Performance
 
-`Select`, `Follow`, and `Search` are snapshot operations. `Select` and `Follow` inspect only the current selection plus explicitly followed paths. `Search` walks the reachable graph once and evaluates its predicate. No persistent query index is maintained, so mutations do not pay query-index update costs.
+`Select`, `Follow`, and `Search` are snapshot operations. After `Commit`, `Search` can use immutable type and value postings and evaluate structural paths backwards through internal parent relations. Conjunctions start with their most selective posting. Results retain graph traversal order.
+
+Mutations do not update postings. They invalidate indexes through the existing tree revision, so searches after `Set`, `Unset`, `Link`, or `Unlink` automatically fall back to a current graph traversal. Calling `Commit` publishes a replacement index. This keeps mutations inexpensive and never exposes stale search results. Selections returned by an indexed search retain that index as long as its root revision remains current, allowing `Select` and `Follow` to use it for structural prefiltering.
 
 ```sh
 go test -bench=. -benchmem

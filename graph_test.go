@@ -267,3 +267,90 @@ func TestSharedNodeCommit(t *testing.T) {
 		t.Fatal("global baseline")
 	}
 }
+
+func TestCommitBuildsAndInvalidatesSearchIndex(t *testing.T) {
+	root := New(kind("world"))
+	firstActor := New(kind("actor"), ident("one"))
+	secondActor := New(kind("actor"), ident("two"))
+	Link(root, firstActor, secondActor)
+	Commit(root)
+
+	index := first(root).index
+	if index == nil || !validSearchIndex(first(root)) || len(index.nodes) != 3 {
+		t.Fatal("commit did not publish a valid root index")
+	}
+	if got := Search(root, kind("actor"), ident("two")); Len(got) != 1 || value[ident](t, got) != "two" {
+		t.Fatal("indexed attribute search")
+	}
+
+	Set(secondActor, ident("changed"))
+	if validSearchIndex(first(root)) {
+		t.Fatal("mutation did not invalidate index")
+	}
+	if !Empty(Search(root, ident("two"))) || Len(Search(root, ident("changed"))) != 1 {
+		t.Fatal("stale index was used instead of traversal")
+	}
+
+	Commit(root)
+	if !validSearchIndex(first(root)) || first(root).index == index {
+		t.Fatal("commit did not replace stale index")
+	}
+}
+
+func TestCommittedPathSearchAndFollow(t *testing.T) {
+	world := New(kind("world"))
+	locationA := New(kind("location"), name("a"))
+	locationB := New(kind("location"), name("b"))
+	containsA := New(kind("contains"))
+	containsB := New(kind("contains"))
+	actorA := New(kind("actor"), ident("one"))
+	actorB := New(kind("actor"), ident("two"))
+	Link(world, locationA, locationB)
+	Link(locationA, containsA)
+	Link(locationB, containsB)
+	Link(containsA, actorA)
+	Link(containsB, actorB)
+	Commit(world)
+
+	expression := Path(kind("contains"), And(kind("actor"), ident("two")))
+	locations := Search(world, kind("location"), expression)
+	if Len(locations) != 1 || value[name](t, locations) != "b" {
+		t.Fatal("indexed reverse path")
+	}
+	allLocations := Search(world, kind("location"), Or(
+		Path(kind("contains"), And(kind("actor"), ident("one"))),
+		Path(kind("contains"), And(kind("actor"), ident("two"))),
+	))
+	if Len(allLocations) != 2 || Len(Search(world, Type[any]())) != 7 {
+		t.Fatal("indexed or or wildcard")
+	}
+	actors := Follow(locations, kind("location"), expression)
+	if Len(actors) != 1 || value[ident](t, actors) != "two" {
+		t.Fatal("indexed follow")
+	}
+
+	Unlink(containsB, actorB)
+	if !Empty(Search(world, kind("location"), expression)) || !Empty(Follow(locationB, expression)) {
+		t.Fatal("stale structural index was used")
+	}
+}
+
+func TestSearchCombinesIndexedAndUncommittedRoots(t *testing.T) {
+	committed := New(kind("root"))
+	committedActor := New(kind("actor"), ident("committed"))
+	Link(committed, committedActor)
+	Commit(committed)
+
+	uncommitted := New(kind("root"))
+	uncommittedActor := New(kind("actor"), ident("uncommitted"))
+	Link(uncommitted, uncommittedActor)
+	shared := New(kind("actor"), ident("shared"))
+	Link(committed, shared)
+	Link(uncommitted, shared)
+	Commit(committed)
+
+	result := Search(Union(committed, uncommitted), kind("actor"))
+	if Len(result) != 3 {
+		t.Fatal("mixed indexed and traversal roots")
+	}
+}

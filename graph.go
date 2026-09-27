@@ -14,6 +14,7 @@ import (
 type Graph struct {
 	nodes []*node
 	view  *subgraph
+	index *searchIndex
 }
 
 type node struct {
@@ -29,7 +30,21 @@ type node struct {
 	selfRev         uint64
 	treeRev         uint64
 	baseline        uint64
+	index           *searchIndex
 }
+
+type searchIndex struct {
+	root     *node
+	revision uint64
+	nodes    []*node
+	ordinal  map[*node]uint32
+	parents  [][]uint32
+	all      posting
+	byType   map[reflect.Type]posting
+	byValue  map[reflect.Type]map[any]posting
+}
+
+type posting []uint32
 
 type subgraph struct {
 	edges      map[*node][]*node
@@ -326,10 +341,11 @@ func Each(g Graph) iter.Seq[Graph] {
 	state.RLock()
 	nodes := append([]*node(nil), selected(g)...)
 	view := g.view
+	index := graphSearchIndex(g)
 	state.RUnlock()
 	return func(yield func(Graph) bool) {
 		for _, n := range nodes {
-			if !yield(singleton(n, view)) {
+			if !yield(Graph{nodes: []*node{n}, view: view, index: index}) {
 				return
 			}
 		}
@@ -446,13 +462,21 @@ func Select(g Graph, values ...any) Graph {
 	condition := buildPredicate(predicateAnd, values)
 	state.RLock()
 	defer state.RUnlock()
+	index := graphSearchIndex(g)
+	var indexedMatches posting
+	if index != nil && containsPath(condition) {
+		indexedMatches = index.match(condition)
+	}
 	out := make([]*node, 0, len(selected(g)))
 	for _, n := range selected(g) {
+		if index != nil && containsPath(condition) && !index.postingContains(indexedMatches, n) {
+			continue
+		}
 		if matchesPredicateLocked(n, condition, g.view) {
 			out = append(out, n)
 		}
 	}
-	return Graph{nodes: out, view: g.view}
+	return Graph{nodes: out, view: g.view, index: index}
 }
 
 // Follow filters the currently selected nodes and returns the endpoints of
@@ -461,9 +485,17 @@ func Follow(g Graph, values ...any) Graph {
 	condition := buildPredicate(predicateAnd, values)
 	state.RLock()
 	defer state.RUnlock()
+	index := graphSearchIndex(g)
+	var indexedMatches posting
+	if index != nil && containsPath(condition) {
+		indexedMatches = index.match(condition)
+	}
 	out := make([]*node, 0)
 	seen := make(map[*node]struct{})
 	for _, n := range selected(g) {
+		if index != nil && containsPath(condition) && !index.postingContains(indexedMatches, n) {
+			continue
+		}
 		result := evaluatePredicateLocked(n, condition, g.view)
 		if !result.matched {
 			continue
@@ -476,7 +508,7 @@ func Follow(g Graph, values ...any) Graph {
 			out = append(out, match)
 		}
 	}
-	return Graph{nodes: out, view: g.view}
+	return Graph{nodes: out, view: g.view, index: index}
 }
 
 // Search recursively filters every node reachable from the current selection
@@ -485,23 +517,51 @@ func Search(g Graph, values ...any) Graph {
 	condition := buildPredicate(predicateAnd, values)
 	state.RLock()
 	defer state.RUnlock()
-	seen := make(map[*node]struct{})
+	roots := selected(g)
+	if len(roots) == 1 && g.view == nil && validSearchIndex(roots[0]) {
+		matches := roots[0].index.match(condition)
+		out := make([]*node, len(matches))
+		for i, ordinal := range matches {
+			out[i] = roots[0].index.nodes[ordinal]
+		}
+		return Graph{nodes: out, index: roots[0].index}
+	}
+	visited := make(map[*node]struct{})
+	var emitted map[*node]struct{}
+	if len(roots) > 1 {
+		emitted = make(map[*node]struct{})
+	}
 	out := make([]*node, 0)
 	var visit func(*node)
 	visit = func(n *node) {
-		if _, duplicate := seen[n]; duplicate {
+		if _, duplicate := visited[n]; duplicate {
 			return
 		}
-		seen[n] = struct{}{}
+		visited[n] = struct{}{}
 		if matchesPredicateLocked(n, condition, g.view) {
-			out = append(out, n)
+			if emitted == nil {
+				out = append(out, n)
+			} else if _, duplicate := emitted[n]; !duplicate {
+				emitted[n] = struct{}{}
+				out = append(out, n)
+			}
 		}
 		for _, child := range selectedChildrenLocked(n, g.view) {
 			visit(child)
 		}
 	}
-	for _, root := range selected(g) {
+	for _, root := range roots {
 		if root == nil {
+			continue
+		}
+		if g.view == nil && validSearchIndex(root) {
+			for _, ordinal := range root.index.match(condition) {
+				n := root.index.nodes[ordinal]
+				if _, duplicate := emitted[n]; !duplicate {
+					emitted[n] = struct{}{}
+					out = append(out, n)
+				}
+			}
 			continue
 		}
 		visit(root)
@@ -510,8 +570,9 @@ func Search(g Graph, values ...any) Graph {
 }
 
 // Commit advances the baseline of every node reachable from the selection to
-// the current revision. Changes at or before that revision are omitted from
-// subsequent Delta calls through any root that reaches those nodes.
+// the current revision and publishes an immutable search index for each root.
+// Changes at or before that revision are omitted from subsequent Delta calls
+// through any root that reaches those nodes.
 //
 // For example, commit after synchronizing a replica so that the next delta
 // contains only later changes:
@@ -521,8 +582,17 @@ func Search(g Graph, values ...any) Graph {
 func Commit(g Graph) {
 	state.Lock()
 	defer state.Unlock()
-	for _, n := range reachableLocked(selected(g)) {
-		n.baseline = state.revision
+	seenRoots := make(map[*node]struct{})
+	for _, root := range selected(g) {
+		if _, duplicate := seenRoots[root]; duplicate {
+			continue
+		}
+		seenRoots[root] = struct{}{}
+		nodes := reachableLocked([]*node{root})
+		for _, n := range nodes {
+			n.baseline = state.revision
+		}
+		root.index = buildSearchIndexLocked(root, nodes)
 	}
 }
 
@@ -1033,12 +1103,6 @@ func first(g Graph) *node {
 	}
 	return ns[0]
 }
-func singleton(n *node, v *subgraph) Graph {
-	if n == nil {
-		return Graph{}
-	}
-	return Graph{nodes: []*node{n}, view: v}
-}
 func normalizeType(t reflect.Type) reflect.Type {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -1243,6 +1307,184 @@ func reachableLocked(roots []*node) []*node {
 	}
 	return out
 }
+
+func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
+	index := &searchIndex{
+		root:     root,
+		revision: root.treeRev,
+		nodes:    append([]*node(nil), nodes...),
+		ordinal:  make(map[*node]uint32, len(nodes)),
+		parents:  make([][]uint32, len(nodes)),
+		all:      make(posting, len(nodes)),
+		byType:   make(map[reflect.Type]posting),
+		byValue:  make(map[reflect.Type]map[any]posting),
+	}
+	for ordinal, n := range nodes {
+		if uint64(ordinal) > uint64(^uint32(0)) {
+			panic("graph: search index exceeds uint32 capacity")
+		}
+		id := uint32(ordinal)
+		index.ordinal[n] = id
+		index.all[ordinal] = id
+	}
+	for ordinal, n := range nodes {
+		id := uint32(ordinal)
+		for typ, value := range n.attrs {
+			index.byType[typ] = appendIndexPosting(index.byType[typ], id, index.all)
+			values := index.byValue[typ]
+			if values == nil {
+				values = make(map[any]posting)
+				index.byValue[typ] = values
+			}
+			values[value] = appendIndexPosting(values[value], id, index.all)
+		}
+	}
+	for ordinal, n := range nodes {
+		parents := make([]uint32, 0, len(n.parents))
+		for parent := range n.parents {
+			if id, exists := index.ordinal[parent]; exists {
+				parents = append(parents, id)
+			}
+		}
+		sort.Slice(parents, func(i, j int) bool { return parents[i] < parents[j] })
+		index.parents[ordinal] = parents
+	}
+	return index
+}
+
+func appendIndexPosting(values posting, ordinal uint32, all posting) posting {
+	if len(values) == 0 {
+		index := int(ordinal)
+		return all[index : index+1 : index+1]
+	}
+	return append(values, ordinal)
+}
+
+func validSearchIndex(root *node) bool {
+	return root.index != nil && root.index.root == root && root.index.revision == root.treeRev
+}
+
+func (index *searchIndex) match(condition *predicate) posting {
+	switch condition.op {
+	case predicateMatch:
+		if condition.matcher.any {
+			return index.byType[condition.matcher.typ]
+		}
+		return index.byValue[condition.matcher.typ][condition.matcher.value]
+	case predicateAny:
+		return index.all
+	case predicateAnd:
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.match(child)
+			if len(operands[i]) == 0 {
+				return nil
+			}
+		}
+		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		result := operands[0]
+		for _, operand := range operands[1:] {
+			result = intersectPostings(result, operand)
+			if len(result) == 0 {
+				return nil
+			}
+		}
+		return result
+	case predicateOr:
+		var result posting
+		for _, child := range condition.children {
+			result = unionPostings(result, index.match(child))
+		}
+		return result
+	case predicatePath:
+		current := index.match(condition.children[len(condition.children)-1])
+		for step := len(condition.children) - 2; step >= 0 && len(current) != 0; step-- {
+			current = intersectPostings(index.parentPosting(current), index.match(condition.children[step]))
+		}
+		return index.parentPosting(current)
+	default:
+		panic("graph: invalid predicate")
+	}
+}
+
+func graphSearchIndex(g Graph) *searchIndex {
+	if g.view != nil {
+		return nil
+	}
+	if g.index != nil && g.index.revision == g.index.root.treeRev {
+		return g.index
+	}
+	if len(g.nodes) == 1 && validSearchIndex(g.nodes[0]) {
+		return g.nodes[0].index
+	}
+	return nil
+}
+
+func (index *searchIndex) postingContains(values posting, n *node) bool {
+	ordinal, exists := index.ordinal[n]
+	if !exists {
+		return false
+	}
+	position := sort.Search(len(values), func(i int) bool { return values[i] >= ordinal })
+	return position < len(values) && values[position] == ordinal
+}
+
+func (index *searchIndex) parentPosting(children posting) posting {
+	if len(children) == 0 {
+		return nil
+	}
+	words := make([]uint64, (len(index.nodes)+63)/64)
+	for _, child := range children {
+		for _, parent := range index.parents[child] {
+			words[parent/64] |= uint64(1) << (parent % 64)
+		}
+	}
+	result := make(posting, 0)
+	for ordinal := range index.nodes {
+		id := uint32(ordinal)
+		if words[id/64]&(uint64(1)<<(id%64)) != 0 {
+			result = append(result, id)
+		}
+	}
+	return result
+}
+
+func intersectPostings(left, right posting) posting {
+	result := make(posting, 0, min(len(left), len(right)))
+	for i, j := 0, 0; i < len(left) && j < len(right); {
+		switch {
+		case left[i] < right[j]:
+			i++
+		case left[i] > right[j]:
+			j++
+		default:
+			result = append(result, left[i])
+			i++
+			j++
+		}
+	}
+	return result
+}
+
+func unionPostings(left, right posting) posting {
+	result := make(posting, 0, len(left)+len(right))
+	for i, j := 0, 0; i < len(left) || j < len(right); {
+		switch {
+		case j == len(right) || i < len(left) && left[i] < right[j]:
+			result = append(result, left[i])
+			i++
+		case i == len(left) || right[j] < left[i]:
+			result = append(result, right[j])
+			j++
+		default:
+			result = append(result, left[i])
+			i++
+			j++
+		}
+	}
+	return result
+}
+
 func matchesMatcherLocked(n *node, m matcher) bool {
 	v, ok := n.attrs[m.typ]
 	return ok && (m.any || v == m.value)
