@@ -2,131 +2,141 @@ package graph
 
 import "testing"
 
-type actor struct{}
-type health struct{ Current, Max int }
 type name string
-type entityID string
-type entityKind string
-type faction string
+type kind string
+type ident string
+type health struct{ Current, Maximum int }
+type marker struct{}
 
-type location struct{}
-type contains struct{}
+func value[T any](t *testing.T, g Graph) T {
+	t.Helper()
+	v, ok := Get[T](g)
+	if !ok {
+		t.Fatalf("missing %T", v)
+	}
+	return v
+}
+func children(g Graph) Graph { return Follow(g, Path(Type[any]())) }
 
-func TestAttributesAndSelections(t *testing.T) {
-	a := New(actor{}, health{10, 10})
-	b := New(actor{}, health{5, 10})
-	if Len(Union(a, b, a)) != 2 {
-		t.Fatal("merge")
+func TestAttributesAndMutations(t *testing.T) {
+	n := New(name("one"), health{10, 10})
+	if got := value[name](t, n); got != "one" {
+		t.Fatal(got)
 	}
-	var h health
-	if Empty(As(a, &h)) || h.Current != 10 {
-		t.Fatal("get")
+	if Set(n, name("one")) {
+		t.Fatal("equal value changed")
 	}
-	if !Empty(Set(a, health{10, 10})) {
-		t.Fatal("equal set changed")
+	if !Set(n, name("two")) || value[name](t, n) != "two" {
+		t.Fatal("set")
 	}
-	if Empty(Set(a, health{9, 10})) {
-		t.Fatal("set did not change")
-	}
-	if Empty(Unset(a, Type[health]())) || !Empty(As(a, Type[health]())) {
+	old, ok := Unset[health](n)
+	if !ok || old != (health{10, 10}) {
 		t.Fatal("unset")
 	}
-}
-
-func TestAsRequiresEveryAttributeBeforeWritingDestinations(t *testing.T) {
-	n := New(actor{}, health{10, 10})
-	got := health{99, 99}
-	if !Empty(As(n, Type[actor](), name("missing"), &got)) {
-		t.Fatal("as matched when one predicate failed")
+	if _, ok := Get[health](n); ok {
+		t.Fatal("attribute remains")
 	}
-	if got != (health{99, 99}) {
-		t.Fatal("failed as partially wrote a destination")
+	if _, ok := Unset[health](n); ok {
+		t.Fatal("second unset")
 	}
-	if Empty(As(n, Type[actor](), health{10, 10}, &got)) || got != (health{10, 10}) {
-		t.Fatal("successful as did not write its destination")
+	if Set(Graph{}, name("x")) {
+		t.Fatal("empty set")
+	}
+	if _, ok := Get[name](Graph{}); ok {
+		t.Fatal("empty get")
 	}
 }
 
-func TestAsFiltersSelectionAndReadsFirstResult(t *testing.T) {
-	firstActor := New(actor{}, health{10, 10})
-	secondActor := New(actor{}, health{20, 20})
-	actorWithoutHealth := New(actor{})
-	nonActor := New(health{30, 30})
-	selection := Union(nonActor, firstActor, actorWithoutHealth, secondActor)
-
-	var got health
-	result := As(selection, Type[actor](), &got)
-	if Len(result) != 2 {
-		t.Fatalf("filtered selection length=%d", Len(result))
+func TestSelectFollowAndSearch(t *testing.T) {
+	world := New(kind("world"), name("root"))
+	locationA := New(kind("location"), name("a"))
+	locationB := New(kind("location"), name("b"))
+	containsA := New(kind("contains"))
+	containsB := New(kind("contains"))
+	actorA := New(kind("actor"), ident("actor-1"))
+	actorB := New(kind("actor"), ident("actor-2"))
+	Link(world, locationA, locationB)
+	Link(locationA, containsA)
+	Link(locationB, containsB)
+	Link(containsA, actorA)
+	Link(containsB, actorB)
+	path := Path(kind("contains"), And(kind("actor"), ident("actor-1")))
+	locations := Search(world, kind("location"), path)
+	if Len(locations) != 1 || value[name](t, locations) != "a" {
+		t.Fatal("search path")
 	}
-	if first(result) != first(firstActor) || got != (health{10, 10}) {
-		t.Fatal("destination was not read from the first matching node")
+	if !Empty(Select(world, kind("location"))) {
+		t.Fatal("select recursed")
+	}
+	if Len(Select(Union(locationA, locationB), kind("location"))) != 2 {
+		t.Fatal("select")
+	}
+	ends := Follow(Union(locationA, locationB), kind("location"), path)
+	if Len(ends) != 1 || value[ident](t, ends) != "actor-1" {
+		t.Fatal("follow")
+	}
+	if Len(Follow(actorA, kind("actor"))) != 1 {
+		t.Fatal("follow without path")
+	}
+	if Len(Follow(world, Path(Type[any]()))) != 2 {
+		t.Fatal("wildcard children")
+	}
+	if Len(Search(world, Or(ident("actor-1"), ident("actor-2")))) != 2 {
+		t.Fatal("or")
+	}
+	if Len(Search(world, And(kind("actor"), Or(ident("actor-1"), ident("actor-2"))))) != 2 {
+		t.Fatal("and")
 	}
 }
 
-func TestQueryComposesAndAndOr(t *testing.T) {
-	root := New(name("root"))
-	red := New(actor{}, faction("red"))
-	blue := New(actor{}, faction("blue"))
-	neutral := New(actor{}, faction("neutral"))
-	nonActor := New(faction("red"))
-	Link(root, red, blue, neutral, nonActor)
-
-	result, closeResult := Query(root, And(
-		Type[actor](),
-		Or(faction("red"), faction("blue")),
-	))
-	defer closeResult()
-	if Len(result) != 2 {
-		t.Fatalf("nested and/or length=%d", Len(result))
+func TestFollowCombinesStructuralExpressions(t *testing.T) {
+	root := New(name("root"), marker{})
+	a := New(kind("a"))
+	b := New(kind("b"))
+	Link(root, a, b)
+	if Len(Follow(root, Or(marker{}, Path(kind("a"))))) != 2 {
+		t.Fatal("or endpoints")
 	}
-
-	Set(neutral, faction("red"))
-	if Len(result) != 3 {
-		t.Fatal("nested or did not react to an attribute update")
+	if Len(Follow(root, And(marker{}, Path(Or(kind("a"), kind("b")))))) != 2 {
+		t.Fatal("and endpoints")
+	}
+	if !Empty(Follow(root, And(Path(kind("a")), Path(kind("missing"))))) {
+		t.Fatal("all paths must match")
 	}
 }
 
-func TestDAGQueryAndCommit(t *testing.T) {
-	root := New(name("root"))
-	a := New(actor{})
-	child := New(name("child"))
-	Link(root, a)
-	Link(a, child)
-	q, close := Query(root, Type[actor]())
-	if Len(q) != 1 {
-		t.Fatal("bootstrap")
+func TestSelectionAndRelations(t *testing.T) {
+	a := New(name("a"))
+	b := New(name("b"))
+	c := New(name("c"))
+	if !Link(a, b, c) || Link(a, b) {
+		t.Fatal("link result")
 	}
-	b := New(actor{})
-	Link(root, b)
-	if Len(q) != 2 {
-		t.Fatal("link update")
+	if Len(children(a)) != 2 {
+		t.Fatal("children")
 	}
-	Unset(b, Type[actor]())
-	if Len(q) != 1 {
-		t.Fatal("attribute update")
+	if !Unlink(a, b) || Unlink(a, b) || Unlink(Graph{}, b) {
+		t.Fatal("unlink result")
 	}
-	Set(b, actor{})
-	if Len(q) != 2 {
-		t.Fatal("attribute insertion update")
+	if Len(children(a)) != 1 {
+		t.Fatal("unlink")
 	}
-	close()
-	Unset(b, Type[actor]())
-	if Len(q) != 2 {
-		t.Fatal("closed query changed")
+	if Len(Union(a, b, a)) != 2 {
+		t.Fatal("union")
 	}
-	Commit(root)
-	Set(child, health{1, 2})
-	delta := Delta(root)
-	if Len(delta) != 1 || Len(At(delta)) != 1 || Len(At(At(delta))) != 1 {
-		t.Fatal("pruned delta path")
+	if Len(Intersect(Union(a, b, c), Union(c, a))) != 2 || !Empty(Intersect()) {
+		t.Fatal("intersect")
 	}
-	if Empty(Delta(root)) {
-		t.Fatal("delta advanced the baseline")
+	if Len(Difference(Union(a, b, c), b, c)) != 1 || !Empty(Difference()) {
+		t.Fatal("difference")
 	}
-	Commit(root)
-	if !Empty(Delta(root)) {
-		t.Fatal("delta after commit not empty")
+	count := 0
+	for range Each(Union(a, b)) {
+		count++
+		break
+	}
+	if count != 1 {
+		t.Fatal("each")
 	}
 }
 
@@ -142,662 +152,118 @@ func TestCyclePanics(t *testing.T) {
 	Link(b, a)
 }
 
-func TestQueryStructuralUpdatesPreserveMultipleParentReachability(t *testing.T) {
-	root := New(name("query-root"))
-	left := New(name("left"))
-	right := New(name("right"))
-	target := New(actor{})
-	Link(root, left, right)
-	Link(left, target)
-	Link(right, target)
-	result, closeResult := Query(root, Type[actor]())
-	defer closeResult()
-	if Len(result) != 1 {
-		t.Fatalf("bootstrap length=%d", Len(result))
-	}
-	Unlink(left, target)
-	if Len(result) != 1 {
-		t.Fatal("node disappeared while still reachable through second parent")
-	}
-	Unlink(right, target)
-	if !Empty(result) {
-		t.Fatal("unreachable node remains in query")
-	}
-	Link(left, target)
-	if Len(result) != 1 {
-		t.Fatal("relinked subtree was not added incrementally")
-	}
-}
-
-func TestPathQueryMatchesImmediateStructuralChain(t *testing.T) {
-	world := New(name("world"))
-	firstLocation := New(location{}, name("first"))
-	secondLocation := New(location{}, name("second"))
-	firstContains := New(contains{})
-	secondContains := New(contains{})
-	target := New(actor{}, entityID("actor-1"))
-	other := New(actor{}, entityID("actor-2"))
-	Link(world, firstLocation, secondLocation)
-	Link(firstLocation, firstContains)
-	Link(secondLocation, secondContains)
-	Link(firstContains, target)
-	Link(secondContains, other)
-
-	locations, closeLocations := Query(
-		world,
-		Path(
-			Type[location](),
-			Type[contains](),
-			And(Type[actor](), entityID("actor-1")),
-		),
-	)
-	defer closeLocations()
-
-	if Len(locations) != 1 || first(locations) != first(firstLocation) {
-		t.Fatal("path query did not return the matching path start")
-	}
-	eitherLocations, closeEitherLocations := Query(
-		world,
-		Path(
-			Type[location](),
-			Type[contains](),
-			And(Type[actor](), Or(entityID("actor-1"), entityID("actor-2"))),
-		),
-	)
-	defer closeEitherLocations()
-	if Len(eitherLocations) != 2 {
-		t.Fatal("path query did not compose and/or at one level")
-	}
-
-	intermediate := New(name("intermediate"))
-	Unlink(firstContains, target)
-	Link(firstContains, intermediate)
-	Link(intermediate, target)
-	if !Empty(locations) {
-		t.Fatal("path query skipped a non-matching intermediate node")
-	}
-}
-
-func TestPathQueryTracksAttributeAndRelationChanges(t *testing.T) {
-	world := New(name("world"))
-	place := New(location{})
-	relation := New(contains{})
-	target := New(actor{}, entityID("other"))
-	Link(world, place)
-	Link(place, relation)
-	Link(relation, target)
-
-	locations, closeLocations := Query(
-		world,
-		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
-	)
-	if !Empty(locations) {
-		t.Fatal("path query matched the wrong endpoint")
-	}
-
-	Set(target, entityID("actor-1"))
-	if Len(locations) != 1 {
-		t.Fatal("endpoint attribute update did not add the path start")
-	}
-	Set(target, health{Current: 1, Max: 1})
-	if Len(locations) != 1 {
-		t.Fatal("unrelated attribute update changed the path result")
-	}
-	Unset(relation, Type[contains]())
-	if !Empty(locations) {
-		t.Fatal("intermediate attribute removal did not remove the path start")
-	}
-	Set(relation, contains{})
-	if Len(locations) != 1 {
-		t.Fatal("intermediate attribute insertion did not restore the path start")
-	}
-	Unlink(place, relation)
-	if !Empty(locations) {
-		t.Fatal("relation removal did not remove the path start")
-	}
-	Link(place, relation)
-	if Len(locations) != 1 {
-		t.Fatal("relation insertion did not restore the path start")
-	}
-
-	closeLocations()
-	Unset(target, Type[actor]())
-	if Len(locations) != 1 {
-		t.Fatal("closed path query changed")
-	}
-}
-
-func TestPathExpressionValidationPanics(t *testing.T) {
-	tests := []struct {
-		name string
-		fn   func()
-	}{
-		{"empty and", func() { And() }},
-		{"empty or", func() { Or() }},
-		{"empty path", func() { Path() }},
-		{"nested path", func() { Path(Path(Type[actor]())) }},
-		{"mixed query expression", func() { Query(New(actor{}), Path(Type[actor]()), Type[actor]()) }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				if recover() == nil {
-					t.Fatal("expected panic")
-				}
-			}()
-			tt.fn()
-		})
-	}
-}
-
-func TestAndCanGroupAWholeQuery(t *testing.T) {
+func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	root := New(name("root"))
-	target := New(actor{}, entityID("actor-1"))
-	Link(root, target)
-
-	result, closeResult := Query(root, And(Type[actor](), entityID("actor-1")))
-	defer closeResult()
-	if Len(result) != 1 || first(result) != first(target) {
-		t.Fatal("top-level and did not preserve query semantics")
-	}
-
-	Set(target, health{Current: 1, Max: 1})
-	if Len(result) != 1 {
-		t.Fatal("unrelated attribute update changed a grouped query")
-	}
-}
-
-func TestIdenticalQueriesShareIndexAndCloseIndependently(t *testing.T) {
-	root := New(name("root"))
-	target := New(actor{}, entityID("actor-1"))
-	Link(root, target)
-
-	state.RLock()
-	queriesBefore := len(state.queries)
-	state.RUnlock()
-	firstResult, closeFirst := Query(root, Type[actor](), entityID("actor-1"))
-	secondResult, closeSecond := Query(root, Type[actor](), entityID("actor-1"))
-
-	state.RLock()
-	queriesWithListeners := len(state.queries)
-	state.RUnlock()
-	if queriesWithListeners != queriesBefore+1 {
-		t.Fatal("identical queries did not share one index")
-	}
-
-	Set(target, entityID("other"))
-	if !Empty(firstResult) || !Empty(secondResult) {
-		t.Fatal("shared query listeners did not update")
-	}
-	closeFirst()
-	Set(target, entityID("actor-1"))
-	if !Empty(firstResult) {
-		t.Fatal("closed listener did not remain a snapshot")
-	}
-	if Len(secondResult) != 1 {
-		t.Fatal("closing one listener stopped the shared index")
-	}
-
-	closeSecond()
-	state.RLock()
-	queriesAfter := len(state.queries)
-	state.RUnlock()
-	if queriesAfter != queriesBefore {
-		t.Fatal("last close did not release the shared index")
-	}
-}
-
-func TestPathQueryCountsMultipleSupportingChildren(t *testing.T) {
-	world := New(name("world"))
-	place := New(location{})
-	firstRelation := New(contains{})
-	secondRelation := New(contains{})
-	target := New(actor{}, entityID("actor-1"))
-	Link(world, place)
-	Link(place, firstRelation, secondRelation)
-	Link(firstRelation, target)
-	Link(secondRelation, target)
-
-	locations, closeLocations := Query(
-		world,
-		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
-	)
-	defer closeLocations()
-	if Len(locations) != 1 {
-		t.Fatal("multiple supporting paths did not produce one result")
-	}
-
-	Unlink(firstRelation, target)
-	if Len(locations) != 1 {
-		t.Fatal("removing one supporting path removed the result")
-	}
-	Unlink(secondRelation, target)
-	if !Empty(locations) {
-		t.Fatal("result remained after removing every supporting path")
-	}
-}
-
-func TestPathQueryIndexesNewlyReachableSubtree(t *testing.T) {
-	world := New(name("world"))
-	place := New(location{})
-	relation := New(contains{})
-	target := New(actor{}, entityID("actor-1"))
-	Link(place, relation)
-	Link(relation, target)
-
-	locations, closeLocations := Query(
-		world,
-		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
-	)
-	defer closeLocations()
-	if !Empty(locations) {
-		t.Fatal("detached subtree unexpectedly matched")
-	}
-
-	Link(world, place)
-	if Len(locations) != 1 {
-		t.Fatal("newly reachable subtree was not indexed")
-	}
-	Unlink(world, place)
-	if !Empty(locations) {
-		t.Fatal("detached subtree remained in the path index")
-	}
-}
-
-func TestPathQueryLinksAlreadyReachableNodes(t *testing.T) {
-	world := New(name("world"))
-	place := New(location{})
-	relation := New(contains{})
-	target := New(actor{}, entityID("actor-1"))
-	Link(world, place, relation, target)
-
-	locations, closeLocations := Query(
-		world,
-		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
-	)
-	defer closeLocations()
-
-	Link(place, relation)
-	Link(relation, target)
-	if Len(locations) != 1 {
-		t.Fatal("links between reachable nodes did not update the path index")
-	}
-	Unlink(place, relation)
-	if !Empty(locations) {
-		t.Fatal("unlink between reachable nodes did not update the path index")
-	}
-}
-
-func TestDetachedNodeRemainsUsableAndCanBeRelinked(t *testing.T) {
-	root := New(name("root"))
-	child := New(actor{}, name("child"))
+	child := New(name("old"))
 	Link(root, child)
-	result, closeResult := Query(root, Type[actor]())
-	defer closeResult()
-
-	Unlink(root, child)
-	if !Empty(result) {
-		t.Fatal("detached node remained in parent query")
-	}
-	if Empty(As(child, Type[actor]())) {
-		t.Fatal("user-held detached node became invalid")
-	}
-	detachedResult, closeDetached := Query(child, Type[actor]())
-	if Len(detachedResult) != 1 {
-		t.Fatal("detached node cannot be queried")
-	}
-	closeDetached()
-
-	Link(root, child)
-	if Len(result) != 1 {
-		t.Fatal("relinked node did not return to parent query")
+	found := Search(root, name("old"))
+	Set(child, name("new"))
+	if Len(found) != 1 || !Empty(Search(root, name("old"))) {
+		t.Fatal("snapshot")
 	}
 }
 
-func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
-	source := New(name("world"), health{10, 10})
-	actorNode := New(actor{}, name("actor"))
-	item := New(name("item"))
-	Link(source, actorNode)
-	Link(actorNode, item)
-
-	replica := Apply(Graph{}, Delta(source))
+func TestDeltaApplyAndCommit(t *testing.T) {
+	source := New(kind("world"), ident("main"), health{10, 10})
+	actor := New(kind("actor"), ident("one"), name("old"))
+	item := New(kind("item"), ident("old"))
+	Link(source, actor)
+	Link(actor, item)
+	initial := Delta(source, Type[kind](), Type[ident]())
+	if Len(children(initial)) != 1 || Len(Search(initial, kind("item"))) != 1 {
+		t.Fatal("delta selection view")
+	}
+	replica := Apply(Graph{}, initial)
 	Commit(source)
-	if Len(replica) != 1 || Len(At(replica)) != 1 || Len(At(At(replica))) != 1 {
-		t.Fatal("initial delta did not reproduce the graph")
+	if Len(children(replica)) != 1 || Len(children(children(replica))) != 1 {
+		t.Fatal("bootstrap")
 	}
-	var got health
-	if Empty(As(replica, &got)) || got != (health{10, 10}) {
-		t.Fatal("initial attributes were not applied")
-	}
-
-	replicaActors, closeReplicaActors := Query(replica, Type[actor]())
-	defer closeReplicaActors()
-	if Len(replicaActors) != 1 {
-		t.Fatal("replica query bootstrap")
-	}
-
 	Set(source, health{7, 10})
-	Unset(actorNode, Type[actor]())
-	newBranch := New(actor{}, name("new actor"))
-	newItem := New(name("new item"))
-	Link(newBranch, newItem)
-	Link(source, newBranch)
-	Unlink(actorNode, item)
-
-	updated := Apply(replica, Delta(source))
+	Unset[name](actor)
+	Unlink(actor, item)
+	added := New(kind("item"), ident("new"))
+	Link(source, added)
+	Apply(replica, Delta(source, Type[kind](), Type[ident]()))
 	Commit(source)
-	if Len(updated) != 1 {
-		t.Fatal("updated roots")
+	if value[health](t, replica) != (health{7, 10}) || Len(children(replica)) != 2 {
+		t.Fatal("apply")
 	}
-	if Empty(As(replica, &got)) || got != (health{7, 10}) {
-		t.Fatal("changed attribute was not applied")
+	replicaActor := Search(replica, kind("actor"))
+	if _, ok := Get[name](replicaActor); ok || !Empty(children(replicaActor)) {
+		t.Fatal("removals")
 	}
-	children := At(replica)
-	if Len(children) != 2 {
-		t.Fatal("added branch was not applied")
-	}
-	var oldActor, replicatedNewActor Graph
-	for child := range Each(children) {
-		var childName name
-		As(child, &childName)
-		switch childName {
-		case "actor":
-			oldActor = child
-		case "new actor":
-			replicatedNewActor = child
-		}
-	}
-	if !Empty(As(oldActor, Type[actor]())) || !Empty(At(oldActor)) {
-		t.Fatal("attribute or edge removal was not applied")
-	}
-	if Empty(As(replicatedNewActor, Type[actor]())) || Len(At(replicatedNewActor)) != 1 {
-		t.Fatal("new subtree was not applied")
-	}
-	if Len(replicaActors) != 1 {
-		t.Fatal("live query was not updated by apply")
+	if !Empty(Delta(source)) {
+		t.Fatal("commit")
 	}
 }
 
-func TestApplyRejectsNonDelta(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-	Apply(New(name("target")), New(name("not a delta")))
+func TestPatchDeepMerge(t *testing.T) {
+	world := New(ident("world"), name("old"))
+	actor := New(ident("actor"), kind("actor"), health{10, 10})
+	Link(world, actor)
+	patch := New(ident("world"), name("new"))
+	actorPatch := New(ident("actor"), kind("actor"), name("renamed"))
+	itemPatch := New(ident("item"), kind("item"))
+	Link(actorPatch, itemPatch)
+	Link(patch, actorPatch)
+	result := Patch(world, patch, Type[ident]())
+	if Len(result) != 1 || value[name](t, world) != "new" || value[name](t, actor) != "renamed" {
+		t.Fatal("patch attrs")
+	}
+	if value[health](t, actor) != (health{10, 10}) || Len(children(actor)) != 1 {
+		t.Fatal("patch merge")
+	}
+	Commit(world)
+	Patch(world, patch, Type[ident]())
+	if !Empty(Delta(world)) {
+		t.Fatal("patch no-op")
+	}
 }
 
-func TestPatchRejectsDelta(t *testing.T) {
-	delta := Delta(New(name("source")))
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-	Patch(New(name("target")), delta, Type[name]())
+func TestApplyAndPatchValidation(t *testing.T) {
+	t.Run("apply ordinary", func(t *testing.T) { defer expectPanic(t); Apply(New(name("target")), New(name("ordinary"))) })
+	t.Run("patch delta", func(t *testing.T) {
+		defer expectPanic(t)
+		Patch(New(ident("target")), Delta(New(ident("source"))), Type[ident]())
+	})
+	t.Run("patch missing key", func(t *testing.T) {
+		defer expectPanic(t)
+		root := New(ident("root"))
+		p := New(ident("root"))
+		Link(p, New(name("child")))
+		Patch(root, p, Type[ident]())
+	})
+	if Empty(Apply(New(name("target")), Graph{})) {
+		t.Fatal("empty delta")
+	}
 }
 
-func TestSelectionOperationsAndNavigation(t *testing.T) {
+func TestValidationPanics(t *testing.T) {
+	tests := []func(){func() { New(nil) }, func() { New(name("x"), nil) }, func() { v := name("x"); New(&v) }, func() { New([]int{1}) }, func() { New(name("x"), name("y")) }, func() { Select(New(name("x"))) }, func() { Path() }, func() { Path(Path(name("x"))) }, func() { Get[any](New(name("x"))) }, func() { Unset[*name](New(name("x"))) }}
+	for _, fn := range tests {
+		func() { defer expectPanic(t); fn() }()
+	}
+}
+func expectPanic(t *testing.T) {
+	t.Helper()
+	if recover() == nil {
+		t.Fatal("expected panic")
+	}
+}
+
+func TestSharedNodeCommit(t *testing.T) {
 	a := New(name("a"))
 	b := New(name("b"))
-	c := New(name("c"))
-	Link(a, b, c)
-	if Len(At(a, c, b, c, Graph{})) != 2 {
-		t.Fatal("filtered children")
-	}
-	if Len(Intersect(Union(a, b, c), Union(c, a), Union(a, c))) != 2 {
-		t.Fatal("intersection")
-	}
-	if !Empty(Intersect()) || Len(Difference(Union(a, b, c), b, c)) != 1 || !Empty(Difference()) {
-		t.Fatal("empty or difference")
-	}
-	count := 0
-	for range Each(Union(a, b)) {
-		count++
-		break
-	}
-	if count != 1 {
-		t.Fatal("early iteration stop")
-	}
-	if !Empty(At(Graph{})) || !Empty(Link(Graph{}, a)) || !Empty(Unlink(Graph{}, a)) {
-		t.Fatal("empty graph operations")
-	}
-	if !Empty(Link(a, b)) || !Empty(Unlink(a, New(name("missing")))) {
-		t.Fatal("relation no-op")
-	}
-}
-
-func TestAttributeValidationPanics(t *testing.T) {
-	tests := []struct {
-		name string
-		fn   func()
-	}{
-		{"new without attributes", func() { New(nil) }},
-		{"nil attribute", func() { New(name("x"), nil) }},
-		{"pointer attribute", func() { value := name("x"); New(&value) }},
-		{"non-comparable attribute", func() { New([]int{1}) }},
-		{"duplicate attribute", func() { New(name("x"), name("y")) }},
-		{"as without requests", func() { As(New(name("x"))) }},
-		{"nil request", func() { As(New(name("x")), nil) }},
-		{"nil destination", func() { var value *name; As(New(name("x")), value) }},
-		{"non-comparable request", func() { As(New(name("x")), []int{1}) }},
-		{"duplicate destination", func() { var first, second name; As(New(name("x")), &first, &second) }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				if recover() == nil {
-					t.Fatal("expected panic")
-				}
-			}()
-			tt.fn()
-		})
-	}
-}
-
-func TestApplyEmptyDeltaIsNoOp(t *testing.T) {
-	target := New(name("target"))
-	if Empty(Apply(target, Graph{})) {
-		t.Fatal("empty delta discarded target")
-	}
-}
-
-func TestPatchDeepMergesGraphByCompositeKey(t *testing.T) {
-	world := New(name("world"), health{100, 100})
-	actorOne := New(entityKind("actor"), entityID("one"), name("old"), health{10, 10})
-	itemOne := New(entityKind("item"), entityID("one"), name("sword"))
-	Link(world, actorOne, itemOne)
-	oldNames, closeOldNames := Query(world, name("old"))
-	defer closeOldNames()
-
-	patch := New(name("patched world"))
-	actorPatch := New(entityKind("actor"), entityID("one"), name("new"))
-	newActorPatch := New(entityKind("actor"), entityID("two"), health{5, 5})
-	nestedItemPatch := New(entityKind("item"), entityID("nested"), name("shield"))
-	Link(newActorPatch, nestedItemPatch)
-	Link(patch, actorPatch, newActorPatch)
-
-	result := Patch(world, patch, Type[entityKind](), Type[entityID]())
-	if Len(result) != 1 || Len(At(world)) != 3 {
-		t.Fatal("ordinary patch structure was not merged")
-	}
-	var worldName name
-	var actorName name
-	var retainedHealth health
-	As(world, &worldName)
-	As(actorOne, &actorName, &retainedHealth)
-	if worldName != "patched world" || actorName != "new" || retainedHealth != (health{10, 10}) {
-		t.Fatal("attributes were not deeply merged")
-	}
-	if !Empty(oldNames) {
-		t.Fatal("live query index was not updated")
-	}
-	if Len(At(actorOne)) != 0 {
-		t.Fatal("composite key matched the item with the same ID")
-	}
-	var added Graph
-	for child := range Each(At(world)) {
-		var kind entityKind
-		var id entityID
-		As(child, &kind, &id)
-		if kind == "actor" && id == "two" {
-			added = child
-		}
-	}
-	if Empty(added) || Len(At(added)) != 1 {
-		t.Fatal("new nested branch was not cloned")
-	}
-}
-
-func TestPatchMatchesNodesGlobally(t *testing.T) {
-	world := New(entityID("world"))
-	actor := New(entityID("actor"), entityKind("actor"))
-	skill := New(entityID("sprint"), entityKind("skill"), name("old"))
-	Link(world, actor)
-	Link(actor, skill)
-	Commit(world)
-
-	patchActor := New(entityID("actor"), entityKind("actor"))
-	perform := New(entityID("perform"), entityKind("perform"))
-	skillReference := New(entityID("sprint"), entityKind("skill"), name("updated"))
-	Link(patchActor, perform)
-	Link(patchActor, skillReference)
-	Link(perform, skillReference)
-
-	updatedSkills, closeUpdatedSkills := Query(world, name("updated"))
-	defer closeUpdatedSkills()
-
-	result := Patch(world, patchActor, Type[entityID]())
-	if first(result) != first(actor) {
-		t.Fatal("patch root was not matched globally")
-	}
-	var targetPerform Graph
-	for child := range Each(At(actor)) {
-		var id entityID
-		As(child, &id)
-		if id == "perform" {
-			targetPerform = child
-		}
-	}
-	if Len(At(actor)) != 2 || Len(At(targetPerform)) != 1 || Empty(At(targetPerform, skill)) {
-		t.Fatal("existing node was not linked into the new branch")
-	}
-	if first(At(targetPerform)) != first(skill) {
-		t.Fatal("patch created a duplicate node")
-	}
-	var skillName name
-	As(skill, &skillName)
-	if skillName != "updated" || Len(updatedSkills) != 1 {
-		t.Fatal("matched node attributes or live query were not updated")
-	}
-
-	Commit(world)
-	Patch(world, patchActor, Type[entityID]())
-	if !Empty(Delta(world)) || Len(At(actor)) != 2 || Len(At(targetPerform)) != 1 {
-		t.Fatal("reapplying the same patch was not a no-op")
-	}
-}
-
-func TestPatchValidatesMatchKeys(t *testing.T) {
-	tests := []struct {
-		name  string
-		world Graph
-		patch Graph
-	}{
-		{
-			name:  "missing key",
-			world: New(name("world")),
-			patch: func() Graph {
-				root := New(name("patch"))
-				Link(root, New(name("child")))
-				return root
-			}(),
-		},
-		{
-			name:  "duplicate patch key",
-			world: New(name("world")),
-			patch: func() Graph {
-				root := New(name("patch"))
-				Link(root, New(entityID("same")), New(entityID("same")))
-				return root
-			}(),
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				if recover() == nil {
-					t.Fatal("expected panic")
-				}
-			}()
-			Patch(tt.world, tt.patch, Type[entityID]())
-		})
-	}
-}
-
-func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.T) {
-	keys := []any{Type[entityKind](), Type[entityID]()}
-	source := New(entityKind("world"), entityID("main"), name("source"))
-	sourceActor := New(entityKind("actor"), entityID("one"), health{10, 10})
-	sourceRemoved := New(entityKind("item"), entityID("old"), name("old item"))
-	Link(source, sourceActor, sourceRemoved)
-	Commit(source)
-
-	target := New(entityKind("world"), entityID("main"), name("target"))
-	targetActor := New(entityKind("actor"), entityID("one"), health{1, 10})
-	targetRemoved := New(entityKind("item"), entityID("old"), name("old item"))
-	Link(target, targetActor, targetRemoved)
-
-	Set(sourceActor, health{8, 10})
-	Unlink(source, sourceRemoved)
-	sourceAdded := New(entityKind("item"), entityID("new"), name("new item"))
-	Link(source, sourceAdded)
-	delta := Delta(source, keys...)
-	Apply(target, delta)
-
-	var got health
-	As(targetActor, &got)
-	if got != (health{8, 10}) {
-		t.Fatal("independent replica node was not matched")
-	}
-	if !Empty(At(target, targetRemoved)) || Len(At(target)) != 2 {
-		t.Fatal("keyed structural changes were not applied")
-	}
-	var foundAdded bool
-	for child := range Each(At(target)) {
-		var id entityID
-		As(child, &id)
-		foundAdded = foundAdded || id == "new"
-	}
-	if !foundAdded {
-		t.Fatal("keyed added node was not applied")
-	}
-}
-
-func TestCommitRecursivelyAdvancesNodeBaselines(t *testing.T) {
-	root := New(name("root"))
-	branch := New(name("branch"))
-	shared := New(name("shared"), health{10, 10})
-	otherRoot := New(name("other root"))
-	Link(root, branch)
-	Link(branch, shared)
-	Link(otherRoot, shared)
-	Commit(Union(root, otherRoot))
-
+	shared := New(health{10, 10})
+	Link(a, shared)
+	Link(b, shared)
+	Commit(Union(a, b))
 	Set(shared, health{9, 10})
-	if Empty(Delta(root)) || Empty(Delta(branch)) || Empty(Delta(otherRoot)) {
-		t.Fatal("changed shared node was not visible through every owner")
+	if Empty(Delta(a)) || Empty(Delta(b)) {
+		t.Fatal("shared delta")
 	}
-
-	Commit(branch)
-	if !Empty(Delta(branch)) || !Empty(Delta(root)) || !Empty(Delta(otherRoot)) {
-		t.Fatal("subgraph commit did not globally commit its reachable nodes")
-	}
-
-	Set(shared, health{8, 10})
-	Commit(root)
-	if !Empty(Delta(otherRoot)) {
-		t.Fatal("root commit did not commit a node shared with another graph")
+	Commit(a)
+	if !Empty(Delta(b)) {
+		t.Fatal("global baseline")
 	}
 }

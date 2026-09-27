@@ -1,461 +1,137 @@
 # graph
 
-`graph` is a compact Go library for storing typed data in a directed acyclic graph (DAG).
+`graph` is a small, type-oriented directed acyclic graph for Go. Nodes and edges stay private; the public `Graph` value represents a node or an ordered selection.
 
-It addresses a recurring problem in game worlds, configuration systems, dependency graphs, scenes, and domain models: data needs to be composed from independent components, connected through relationships, queried by type or value, and tracked for branch-level changes.
+## Install
 
-There are no public `Node`, `Edge`, or internal identifier types. The entire public API operates on `Graph`, which can represent one node, a selection of nodes, or an empty result. Attributes are ordinary comparable Go values.
-
-## Features
-
-- Typed attributes without schema registration
-- Directed relations, multiple parents, and cycle prevention
-- Selection and set operations
-- Reactive queries updated by `Set`, `Unset`, `Link`, and `Unlink`
-- Structural path queries over immediate relations
-- Revision propagation and pruned change graphs through `Delta`
-- Explicit delta baselines through `Commit`
-- Replica synchronization through `Delta` and `Apply`
-- Thread-safe operations and a small package-level API
-
-## Installation
-
-```bash
+```sh
 go get github.com/typomaker/graph
 ```
 
-The library requires Go 1.23 or newer.
+## Nodes and attributes
 
-## Quick start
-
-```go
-package main
-
-import (
-	"fmt"
-
-	"github.com/typomaker/graph"
-)
-
-type World struct{}
-type Actor struct{}
-type ID string
-type Health struct {
-	Current int
-	Max     int
-}
-
-func main() {
-	world := graph.New(World{})
-	player := graph.New(
-		Actor{},
-		ID("player-1"),
-		Health{Current: 100, Max: 100},
-	)
-
-	graph.Link(world, player)
-
-	var health Health
-	if !graph.Empty(graph.As(player, &health)) {
-		fmt.Println(health.Current) // 100
-	}
-}
-```
-
-## Attributes
-
-An attribute type is its key. A node can contain at most one value of each type.
+Every attribute is a comparable, non-pointer value identified by its concrete Go type.
 
 ```go
 type Name string
-type Alive bool
+type Position struct{ X, Y int }
 
-actor := graph.New(
-	Actor{},
-	Name("Ada"),
-	Alive(true),
-	Health{Current: 80, Max: 100},
-)
+player := graph.New(Name("player"), Position{X: 10, Y: 20})
+position, ok := graph.Get[Position](player)
+changed := graph.Set(player, Position{X: 20, Y: 30})
+previous, removed := graph.Unset[Position](player)
 ```
 
-Attributes must be comparable Go values, such as numbers, strings, named types, or structs containing comparable fields. Slices, maps, functions, interface values, and pointers cannot be stored. Pointers are used only as destinations when reading or removing attributes.
+`Get` and `Unset` operate on the first selected node. `Set` returns true only when it inserts or changes the attribute. `Unset` returns the previous value and whether it existed.
 
-### Check and read
+## Relations
 
-`Type[T]()` matches any value of type `T`. A value of type `T` performs an exact comparison. A `*T` argument requires and reads the stored value.
-
-```go
-hasHealth := graph.As(actor, graph.Type[Health]())
-isAlive := graph.As(actor, Alive(true))
-
-var health Health
-if !graph.Empty(graph.As(actor, &health)) {
-	health.Current -= 10
-}
-```
-
-`As` filters every node in its input selection and returns all nodes for which
-every argument matches. Pointer destinations are required on every returned
-node and receive values from the first result only after matching completes,
-so a failed operation never leaves partial output.
-
-### Set and remove
-
-`Set` and `Unset` return the node only when data actually changes. This makes no-op detection inexpensive.
+`Link` creates outgoing edges from the first node in its first argument to the first node in each following argument. `Unlink` removes them. Both return true when at least one edge changed.
 
 ```go
-changed := graph.Set(actor, Health{Current: 70, Max: 100})
-if !graph.Empty(changed) {
-	// Health changed.
-}
-
-// Read the old value and remove the attribute.
-var old Health
-removed := graph.Unset(actor, &old)
-
-// Remove without reading the value.
-graph.Unset(actor, graph.Type[Alive]())
-```
-
-## Relations and navigation
-
-Relations are directed from parent to child and carry no data of their own.
-
-```go
-type Inventory struct{}
-type Item struct{}
-type Damage int
-
-world := graph.New(World{})
-player := graph.New(Actor{}, ID("player-1"))
-inventory := graph.New(Inventory{})
-rifle := graph.New(Item{}, Damage(20))
+world := graph.New(Name("world"))
+player := graph.New(Name("player"))
+inventory := graph.New(Name("inventory"))
 
 graph.Link(world, player)
 graph.Link(player, inventory)
-graph.Link(inventory, rifle)
-
-children := graph.At(player) // Immediate children: inventory.
-fmt.Println(graph.Len(children))
-
-if !graph.Empty(graph.At(inventory, rifle)) {
-	fmt.Println("rifle is in inventory")
-}
-
-graph.Unlink(inventory, rifle)
+graph.Unlink(player, inventory)
 ```
 
-Linking an existing pair and unlinking a missing pair are safe no-ops. Creating a cycle panics because it violates the DAG invariant.
+The graph is acyclic. `Link` panics if an edge would introduce a cycle. A node may have several parents.
 
-`Unlink` removes only the relation. A detached node remains usable while a
-user-held `Graph`, an active query, a delta, or another edge references it, and
-it can be linked again later. The package does not keep a global registry of
-all nodes, so a detached component with no remaining references can be
-reclaimed by Go's garbage collector.
+## Selecting nodes
 
-A child may have multiple parents:
+Selectors are synchronous snapshots and do not require a closer:
+
+- `Select` tests only the nodes already present in the input selection and returns matching starting nodes.
+- `Search` tests the input nodes and every node reachable from them, returning matching starting nodes.
+- `Follow` tests the input nodes like `Select`, but returns endpoints produced by structural expressions. Without `Path`, it is equivalent to `Select`.
+
+Plain arguments use AND semantics. `And` and `Or` provide explicit grouping. A value matches the same type and value; `Type[T]()` matches any value of type `T`; `Type[any]()` matches any node.
 
 ```go
-shared := graph.New(Item{}, ID("shared-map"))
-alice := graph.New(Actor{}, ID("alice"))
-bob := graph.New(Actor{}, ID("bob"))
-
-graph.Link(alice, shared)
-graph.Link(bob, shared)
+actors := graph.Search(world, graph.Type[Actor]())
+visiblePlayers := graph.Search(
+    world,
+    graph.Type[Player](),
+    graph.Or(Team("red"), Team("blue")),
+)
 ```
 
-If a relationship needs state, represent it as a node. For example, model travel progress as `Actor -> Travel -> City` and store progress on `Travel`.
+Selections do not update after graph mutations. Run the selector again when a fresh result is needed.
 
-## Selections
+## Structural paths
 
-A `Graph` may contain any number of nodes. `Each` iterates over it as single-node `Graph` values.
+`Path` starts with the immediate children of each candidate. Every subsequent step follows one outgoing edge. Ordinary predicates never search descendants implicitly.
+
+For a structure `Location -> Contains -> Actor`:
 
 ```go
-actors, closeActors := graph.Query(world, graph.Type[Actor]())
-defer closeActors()
+locations := graph.Search(
+    world,
+    graph.Type[Location](),
+    graph.Path(
+        graph.Type[Contains](),
+        graph.And(graph.Type[Actor](), ID("actor-1")),
+    ),
+)
+```
 
+The same expression can return terminal actors:
+
+```go
+actors := graph.Follow(
+    locations,
+    graph.Type[Location](),
+    graph.Path(graph.Type[Contains](), graph.Type[Actor]()),
+)
+```
+
+Use `graph.Follow(node, graph.Path(graph.Type[any]()))` to obtain immediate children.
+
+A path step may contain `And` or `Or`, but not another `Path`. When an `And` expression contains several paths, every path must match and `Follow` returns the union of their endpoints. An `Or` expression returns endpoints from every matching alternative.
+
+## Selection operations
+
+`Union`, `Intersect`, and `Difference` combine selections while preserving stable order and removing duplicates. `Len` and `Empty` inspect them. `Each` iterates over singleton `Graph` values.
+
+```go
 for actor := range graph.Each(actors) {
-	graph.Set(actor, Health{Current: 100, Max: 100})
+    graph.Set(actor, Visible(true))
 }
-
-fmt.Println(graph.Len(actors))
-fmt.Println(graph.Empty(actors))
 ```
 
-Set operations remove duplicates and preserve first appearance:
+## Synchronization
+
+`Commit` establishes a revision baseline for reachable nodes. `Delta` creates a change graph since that baseline, and `Apply` applies such a delta. Optional type matchers define a composite identity for independent replicas.
 
 ```go
-all := graph.Union(players, enemies)
-both := graph.Intersect(visible, selectable)
-active := graph.Difference(all, disconnected)
-```
-
-`As` filters every node in a selection. Mutations and structural operations
-use only the first node of their `Graph` arguments; use `Each` for explicit
-bulk updates.
-
-## Reactive queries
-
-`Query` searches the selected roots and every node reachable from them. Matchers use AND semantics. The bootstrap result is available immediately and remains current as the graph changes.
-
-```go
-type Faction string
-
-pirates, closePirates := graph.Query(
-	world,
-	graph.Type[Actor](),
-	Faction("pirates"),
-	Alive(true),
-)
-defer closePirates()
-
-// The matching node automatically appears in pirates.
-jack := graph.New(Actor{}, Faction("pirates"), Alive(true))
-graph.Link(world, jack)
-
-// It automatically leaves the result after this update.
-graph.Set(jack, Alive(false))
-```
-
-`And` and `Or` compose nested predicates when a query needs explicit logical
-grouping:
-
-```go
-actors, closeActors := graph.Query(
-	world,
-	graph.And(
-		graph.Type[Actor](),
-		graph.Or(Faction("pirates"), Faction("guards")),
-	),
-)
-defer closeActors()
-```
-
-Call the returned close function when the live result is no longer needed. It is idempotent. After closing, the returned `Graph` remains available as a snapshot but no longer updates.
-
-Each active query materializes only its result and reachable scope. Attribute
-changes are dispatched only to queries whose matchers use the changed types.
-Identical queries over the same ordered roots share this state while retaining
-independent live selections. Closing one selection freezes only that snapshot;
-the shared state is released after the last identical query closes.
-
-Search by a user-defined identifier in the same way:
-
-```go
-player, closePlayer := graph.Query(
-	world,
-	graph.Type[Actor](),
-	ID("player-1"),
-)
-defer closePlayer()
-```
-
-### Structural path queries
-
-`Path` matches a chain of nodes connected by immediate outgoing relations and
-returns the node matching its first step. Use `And` to require multiple
-attributes on one step:
-
-```go
-type Location struct{}
-type Contains struct{}
-
-locations, closeLocations := graph.Query(
-	world,
-	graph.Path(
-		graph.Type[Location](),
-		graph.Type[Contains](),
-		graph.And(
-			graph.Type[Actor](),
-			ID("actor-1"),
-		),
-	),
-)
-defer closeLocations()
-```
-
-This query selects each reachable `Location` with an immediate `Contains`
-child that itself has an immediate `Actor` child whose `ID` is `"actor-1"`.
-Every path step must match exactly one node; `Path` does not skip intermediate
-nodes. The live result reacts to attribute changes and to links or unlinks
-anywhere in the matching chain.
-
-Each live path query builds its own level index during bootstrap. Every level
-tracks matching nodes and the number of immediate children that support the
-next step. Attribute and relation changes therefore propagate only through
-the affected nodes and their parents, up to the length of the path. Closing
-the query releases this query-specific index; no global relation index is
-retained.
-
-## Track changed branches with Delta and Commit
-
-`Delta` returns the smallest current subgraph connecting the supplied roots to
-nodes changed since the baseline. Reading a delta does not modify the baseline.
-`Commit` explicitly advances the baseline of every reachable node to the
-current revision.
-
-```go
-world := graph.New(World{})
-player := graph.New(Actor{})
-inventory := graph.New(Inventory{})
-rifle := graph.New(Item{}, Damage(20))
-
-graph.Link(world, player)
-graph.Link(player, inventory)
-graph.Link(inventory, rifle)
-
-graph.Commit(world) // Record the initial baseline.
-
-graph.Set(rifle, Damage(25))
-changed := graph.Delta(world)
-
-// changed contains only world -> player -> inventory -> rifle.
-for root := range graph.Each(changed) {
-	for child := range graph.Each(graph.At(root)) {
-		// Process the changed branch.
-		_ = child
-	}
-}
-
-fmt.Println(graph.Empty(graph.Delta(world))) // false: reading is repeatable
-graph.Commit(world)
-fmt.Println(graph.Empty(graph.Delta(world))) // true
-```
-
-Real attribute or relation changes update revisions and propagate dirty information through every parent. No-op operations do not change revisions.
-
-A commit is global for the selected subgraph. `Commit(world)` commits every
-node reachable from `world`, while `Commit(player)` commits only `player` and
-its descendants. If a node is shared by multiple roots, committing it through
-one root also removes its changes from deltas read through the other roots.
-Callers are responsible for committing only after every intended consumer has
-processed the changes.
-
-## Synchronize replicas
-
-`Apply` merges a delta into another in-memory replica. Bootstrap the replica by
-applying the source's first delta to an empty graph. Commit the source after the
-delta has been accepted, then repeat the same sequence for later changes:
-
-```go
-source := graph.New(World{})
-player := graph.New(Actor{}, Health{Current: 100, Max: 100})
-graph.Link(source, player)
-
-initial := graph.Delta(source)
-replica := graph.Apply(graph.Graph{}, initial)
-graph.Commit(source)
-
-graph.Set(player, Health{Current: 90, Max: 100})
-delta := graph.Delta(source)
-graph.Apply(replica, delta)
+changes := graph.Delta(source, graph.Type[Kind](), graph.Type[ID]())
+target = graph.Apply(target, changes)
 graph.Commit(source)
 ```
 
-Applying a delta reproduces attribute additions, replacements, and removals,
-as well as linked, unlinked, and newly created branches. Live queries on the
-replica are updated.
-
-The initial delta establishes the internal node identities shared by the two
-replicas. Deltas must be applied and committed in order. `Graph` and
-its deltas are in-memory values; encoding and transport across processes are
-outside this package's current API.
-
-Two independently constructed replicas can instead use the same stable
-application attributes as a composite identity. Store the identity definition
-in the delta:
+`Patch` additively merges an ordinary graph by a required composite key:
 
 ```go
-delta := graph.Delta(
-	source,
-	graph.Type[EntityKind](),
-	graph.Type[ID](),
-)
-
-graph.Apply(replica, delta)
+graph.Patch(target, patch, graph.Type[ID]())
 ```
 
-Every node in this mode must contain every identity attribute. Their values
-must remain stable and uniquely identify a node within the replica. `Apply`
-reads the identity definition from the delta.
-
-`Apply` builds a temporary composite index of the reachable target nodes before
-processing a keyed delta. Matching therefore scales linearly with the target
-subgraph plus the delta, rather than scanning the target once per changed node.
-The index is discarded when `Apply` returns and does not retain detached nodes.
-
-When no identity attributes are supplied, `Delta` and `Apply` use an
-immutable internal node ID. This is suitable for a replica bootstrapped from
-the source's initial delta because that operation transfers the identity. It
-cannot match independently constructed graphs. A creation timestamp is not
-used: timestamps can collide, depend on clock behavior, and do not establish
-that two separately created nodes represent the same entity.
-
-### Merge a programmatic patch
-
-`Patch` deeply merges an ordinary graph that was built without
-revision metadata. Supply one or more attribute types that form the composite
-identity of every non-root node:
-
-```go
-patch := graph.New(WorldName("changed"))
-changedPlayer := graph.New(EntityKind("actor"), ID("player-1"), Health{Current: 80, Max: 100})
-newItem := graph.New(EntityKind("item"), ID("shield"), Armor(20))
-graph.Link(changedPlayer, newItem)
-graph.Link(patch, changedPlayer)
-
-graph.Patch(
-	world,
-	patch,
-	graph.Type[EntityKind](),
-	graph.Type[ID](),
-)
-```
-
-Patch roots correspond to target roots by selection order. Descendants match
-only when all supplied attributes are equal. Matching nodes receive every
-attribute present in the patch, and missing branches are copied recursively.
-Attributes and branches absent from an ordinary patch remain unchanged; use a
-`Delta` when removals must be represented. Match keys must be present on
-every patch descendant and unique among siblings.
-
-## Programmer errors
-
-The library panics when an invariant is violated:
-
-- A `nil`, pointer, or non-comparable stored attribute
-- Duplicate stored attribute types or duplicate `As` destinations in one call
-- A relation that creates a cycle
-
-`T` and `*T` refer to the same attribute type. An empty `Graph` is valid; reads and mutations on it return an empty result.
+`Apply` and `Patch` build temporary composite indexes for their operation and discard them on return.
 
 ## Performance
 
-A reactive result is stored as a ready-to-use selection, so `Len` does not repeat the search. A relevant attribute mutation updates only the affected node, while an unrelated attribute type does not recompute the query.
+`Select`, `Follow`, and `Search` are snapshot operations. `Select` and `Follow` inspect only the current selection plus explicitly followed paths. `Search` walks the reachable graph once and evaluates its predicate. No persistent query index is maintained, so mutations do not pay query-index update costs.
 
-Run the benchmarks with:
-
-```bash
-go test -run '^$' -bench '^BenchmarkQuery' -benchmem
+```sh
+go test -bench=. -benchmem
 ```
 
-Indicative results for a 10,000-node graph on an Apple M1 Max:
+## Constraints
 
-| Operation | Time | Allocations |
-|---|---:|---:|
-| Exact-query bootstrap | ~2.0 ms | 147 |
-| Reuse active exact query | ~0.41 us | 13 |
-| Reactive result `Len` | ~14 ns | 0 |
-| Relevant attribute update | ~0.51 us | 4 |
-| Unrelated attribute update | ~0.40 us | 3 |
-
-For a three-step path over 10,000 independent branches, indicative results on
-the same machine are:
-
-| Operation | Time | Allocations |
-|---|---:|---:|
-| Path-query bootstrap | ~14.8 ms | ~20,371 |
-| Relevant endpoint update | ~0.83 us | 3-4 |
-| Path `Unlink` and `Link` pair | ~1.45 us | 6 |
-
-Actual results depend on the processor, graph shape, number of active queries, and result size.
+- Attributes must be comparable, non-pointer values.
+- A node can hold only one attribute of each concrete type.
+- Logical expressions and selectors require at least one predicate.
+- `Path` requires at least one step and cannot be nested.
+- Graph state is process-local and safe for concurrent access.
