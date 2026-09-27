@@ -23,6 +23,7 @@ type node struct {
 	attrRev         map[reflect.Type]uint64
 	removedAttrs    map[reflect.Type]uint64
 	children        map[*node]uint64 // edge creation revision
+	childOrder      []*node
 	removedChildren map[uint64]removedChild
 	parents         map[*node]struct{}
 	selfRev         uint64
@@ -276,7 +277,7 @@ func Link(g Graph, graphs ...Graph) bool {
 			continue
 		}
 		rev := nextRevisionLocked()
-		parent.children[child] = rev
+		addChildLocked(parent, child, rev)
 		delete(parent.removedChildren, child.key)
 		child.parents[parent] = struct{}{}
 		parent.selfRev = rev
@@ -303,7 +304,7 @@ func Unlink(g Graph, graphs ...Graph) bool {
 		if _, exists := parent.children[child]; !exists {
 			continue
 		}
-		delete(parent.children, child)
+		removeChildLocked(parent, child)
 		delete(child.parents, parent)
 		rev := nextRevisionLocked()
 		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
@@ -442,45 +443,32 @@ func Difference(graphs ...Graph) Graph {
 
 // Select filters the currently selected nodes and returns matching starts.
 func Select(g Graph, values ...any) Graph {
-	return selectNodes(g, false, false, values)
+	condition := buildPredicate(predicateAnd, values)
+	state.RLock()
+	defer state.RUnlock()
+	out := make([]*node, 0, len(selected(g)))
+	for _, n := range selected(g) {
+		if matchesPredicateLocked(n, condition, g.view) {
+			out = append(out, n)
+		}
+	}
+	return Graph{nodes: out, view: g.view}
 }
 
 // Follow filters the currently selected nodes and returns the endpoints of
 // matching expressions. Without Path it is equivalent to Select.
 func Follow(g Graph, values ...any) Graph {
-	return selectNodes(g, false, true, values)
-}
-
-// Search recursively filters every node reachable from the current selection
-// and returns matching starts.
-func Search(g Graph, values ...any) Graph {
-	return selectNodes(g, true, false, values)
-}
-
-func selectNodes(g Graph, recursive, endpoints bool, values []any) Graph {
 	condition := buildPredicate(predicateAnd, values)
 	state.RLock()
 	defer state.RUnlock()
-	candidates := selected(g)
-	if recursive {
-		if g.view != nil {
-			candidates = reachableViewLocked(candidates, g.view)
-		} else {
-			candidates = reachableLocked(candidates)
-		}
-	}
-	out := make([]*node, 0, len(candidates))
+	out := make([]*node, 0)
 	seen := make(map[*node]struct{})
-	for _, n := range candidates {
+	for _, n := range selected(g) {
 		result := evaluatePredicateLocked(n, condition, g.view)
 		if !result.matched {
 			continue
 		}
-		matches := []*node{n}
-		if endpoints {
-			matches = result.endpoints
-		}
-		for _, match := range matches {
+		for _, match := range result.endpoints {
 			if _, duplicate := seen[match]; duplicate {
 				continue
 			}
@@ -488,7 +476,37 @@ func selectNodes(g Graph, recursive, endpoints bool, values []any) Graph {
 			out = append(out, match)
 		}
 	}
-	return Graph{nodes: out}
+	return Graph{nodes: out, view: g.view}
+}
+
+// Search recursively filters every node reachable from the current selection
+// and returns matching starts.
+func Search(g Graph, values ...any) Graph {
+	condition := buildPredicate(predicateAnd, values)
+	state.RLock()
+	defer state.RUnlock()
+	seen := make(map[*node]struct{})
+	out := make([]*node, 0)
+	var visit func(*node)
+	visit = func(n *node) {
+		if _, duplicate := seen[n]; duplicate {
+			return
+		}
+		seen[n] = struct{}{}
+		if matchesPredicateLocked(n, condition, g.view) {
+			out = append(out, n)
+		}
+		for _, child := range selectedChildrenLocked(n, g.view) {
+			visit(child)
+		}
+	}
+	for _, root := range selected(g) {
+		if root == nil {
+			continue
+		}
+		visit(root)
+	}
+	return Graph{nodes: out, view: g.view}
 }
 
 // Commit advances the baseline of every node reachable from the selection to
@@ -648,7 +666,7 @@ func Apply(g, delta Graph) Graph {
 				continue
 			}
 			if _, ok := parent.children[child]; ok {
-				delete(parent.children, child)
+				removeChildLocked(parent, child)
 				delete(child.parents, parent)
 				parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 				changed[parent] = struct{}{}
@@ -663,7 +681,7 @@ func Apply(g, delta Graph) Graph {
 				if child == parent || reachesLocked(child, parent) {
 					panic("graph: delta would create a cycle")
 				}
-				parent.children[child] = rev
+				addChildLocked(parent, child, rev)
 				delete(parent.removedChildren, child.key)
 				child.parents[parent] = struct{}{}
 				changed[parent] = struct{}{}
@@ -765,7 +783,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			if targetChild == pair.target || reachesLocked(targetChild, pair.target) {
 				panic("graph: patch would create a cycle")
 			}
-			pair.target.children[targetChild] = rev
+			addChildLocked(pair.target, targetChild, rev)
 			delete(pair.target.removedChildren, targetChild.key)
 			targetChild.parents[pair.target] = struct{}{}
 			changed[pair.target] = struct{}{}
@@ -1181,17 +1199,30 @@ func nodeSet(ns []*node) map[*node]struct{} {
 	return s
 }
 func orderedChildren(n *node) []*node {
-	out := make([]*node, 0, len(n.children))
-	for c := range n.children {
-		out = append(out, c)
-	}
-	if len(out) > 1 {
-		sortNodes(out)
-	}
-	return out
+	return n.childOrder
 }
-func sortNodes(ns []*node) {
-	sort.Slice(ns, func(i, j int) bool { return ns[i].id < ns[j].id })
+
+func addChildLocked(parent, child *node, revision uint64) {
+	parent.children[child] = revision
+	index := sort.Search(len(parent.childOrder), func(i int) bool {
+		return parent.childOrder[i].id >= child.id
+	})
+	parent.childOrder = append(parent.childOrder, nil)
+	copy(parent.childOrder[index+1:], parent.childOrder[index:])
+	parent.childOrder[index] = child
+}
+
+func removeChildLocked(parent, child *node) {
+	delete(parent.children, child)
+	for index, current := range parent.childOrder {
+		if current != child {
+			continue
+		}
+		copy(parent.childOrder[index:], parent.childOrder[index+1:])
+		parent.childOrder[len(parent.childOrder)-1] = nil
+		parent.childOrder = parent.childOrder[:len(parent.childOrder)-1]
+		return
+	}
 }
 func reachableLocked(roots []*node) []*node {
 	seen := map[*node]struct{}{}
@@ -1215,6 +1246,51 @@ func reachableLocked(roots []*node) []*node {
 func matchesMatcherLocked(n *node, m matcher) bool {
 	v, ok := n.attrs[m.typ]
 	return ok && (m.any || v == m.value)
+}
+
+func matchesPredicateLocked(n *node, condition *predicate, view *subgraph) bool {
+	switch condition.op {
+	case predicateMatch:
+		return matchesMatcherLocked(n, condition.matcher)
+	case predicateAny:
+		return true
+	case predicateAnd:
+		// Cheap local predicates reject candidates before structural traversal.
+		for _, child := range condition.children {
+			if child.op != predicatePath && !matchesPredicateLocked(n, child, view) {
+				return false
+			}
+		}
+		for _, child := range condition.children {
+			if child.op == predicatePath && !matchesPredicateLocked(n, child, view) {
+				return false
+			}
+		}
+		return true
+	case predicateOr:
+		for _, child := range condition.children {
+			if matchesPredicateLocked(n, child, view) {
+				return true
+			}
+		}
+		return false
+	case predicatePath:
+		return matchesPathLocked(n, condition.children, 0, view)
+	default:
+		panic("graph: invalid predicate")
+	}
+}
+
+func matchesPathLocked(parent *node, steps []*predicate, index int, view *subgraph) bool {
+	for _, child := range selectedChildrenLocked(parent, view) {
+		if !matchesPredicateLocked(child, steps[index], view) {
+			continue
+		}
+		if index == len(steps)-1 || matchesPathLocked(child, steps, index+1, view) {
+			return true
+		}
+	}
+	return false
 }
 
 type predicateResult struct {
@@ -1270,7 +1346,7 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 			next := make([]*node, 0, len(frontier))
 			seen := make(map[*node]struct{}, len(frontier))
 			for _, candidate := range frontier {
-				if evaluatePredicateLocked(candidate, step, view).matched {
+				if matchesPredicateLocked(candidate, step, view) {
 					if _, duplicate := seen[candidate]; !duplicate {
 						seen[candidate] = struct{}{}
 						next = append(next, candidate)
