@@ -50,6 +50,10 @@ type searchIndex struct {
 	affected          map[uint32]struct{}
 	added             []*node
 	addedOrdinal      map[*node]uint32
+	addedAll          posting
+	addedByType       map[reflect.Type]posting
+	addedByValue      map[reflect.Type]map[any]posting
+	addedIndexed      bool
 	order             map[*node]uint32
 	support           map[*node]uint32
 	active            map[*node]struct{}
@@ -58,6 +62,8 @@ type searchIndex struct {
 	addedEdges        map[graphEdge]struct{}
 	removedEdges      map[graphEdge]struct{}
 }
+
+const addedPostingThreshold = 32
 
 type posting []uint32
 
@@ -766,7 +772,9 @@ func Apply(g, delta Graph) Graph {
 		created[target] = true
 	}
 
-	changed := make(map[*node]struct{})
+	attributeChanged := make(map[*node]struct{})
+	structureChanged := make(map[*node]struct{})
+	structuralIndexes := make(map[*searchIndex]struct{})
 	for _, source := range deltaNodes {
 		target := matches[source]
 		change := delta.view.changes[source]
@@ -776,7 +784,7 @@ func Apply(g, delta Graph) Graph {
 					target.attrs[typ] = value
 					target.attrRev[typ] = rev
 					delete(target.removedAttrs, typ)
-					changed[target] = struct{}{}
+					attributeChanged[target] = struct{}{}
 				}
 			}
 			for _, typ := range change.removedAttrs {
@@ -784,7 +792,7 @@ func Apply(g, delta Graph) Graph {
 					delete(target.attrs, typ)
 					delete(target.attrRev, typ)
 					target.removedAttrs[typ] = rev
-					changed[target] = struct{}{}
+					attributeChanged[target] = struct{}{}
 				}
 			}
 		}
@@ -803,10 +811,11 @@ func Apply(g, delta Graph) Graph {
 				continue
 			}
 			if _, ok := parent.children[child]; ok {
+				collectStructuralIndexesLocked(parent, structuralIndexes)
 				removeChildLocked(parent, child)
 				delete(child.parents, parent)
 				parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
-				changed[parent] = struct{}{}
+				structureChanged[parent] = struct{}{}
 			}
 		}
 		for _, sourceChild := range delta.view.edges[source] {
@@ -818,19 +827,27 @@ func Apply(g, delta Graph) Graph {
 				if child == parent || reachesLocked(child, parent) {
 					panic("graph: delta would create a cycle")
 				}
+				collectStructuralIndexesLocked(parent, structuralIndexes)
 				addChildLocked(parent, child, rev)
 				delete(parent.removedChildren, child.key)
 				child.parents[parent] = struct{}{}
-				changed[parent] = struct{}{}
+				structureChanged[parent] = struct{}{}
 			}
 		}
 	}
-	for target := range created {
-		changed[target] = struct{}{}
+	for target := range attributeChanged {
+		target.selfRev = rev
+		propagateAttributeLocked(target, rev)
 	}
-	for target := range changed {
+	for target := range structureChanged {
 		target.selfRev = rev
 		propagateStructureLocked(target, rev)
+	}
+	for target := range created {
+		target.selfRev = rev
+	}
+	for index := range structuralIndexes {
+		index.reconcileStructureLocked()
 	}
 	roots := make([]*node, 0, len(selected(delta)))
 	for _, source := range selected(delta) {
@@ -895,10 +912,11 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 		created[target] = struct{}{}
 	}
 
-	changed := make(map[*node]struct{})
+	attributeChanged := make(map[*node]struct{})
+	structureChanged := make(map[*node]struct{})
+	structuralIndexes := make(map[*searchIndex]struct{})
 	for _, pair := range pairs {
 		if _, isNew := created[pair.target]; isNew {
-			changed[pair.target] = struct{}{}
 			continue
 		}
 		for typ, value := range pair.source.attrs {
@@ -908,7 +926,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			pair.target.attrs[typ] = value
 			pair.target.attrRev[typ] = rev
 			delete(pair.target.removedAttrs, typ)
-			changed[pair.target] = struct{}{}
+			attributeChanged[pair.target] = struct{}{}
 		}
 	}
 	for _, pair := range pairs {
@@ -920,15 +938,26 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			if targetChild == pair.target || reachesLocked(targetChild, pair.target) {
 				panic("graph: patch would create a cycle")
 			}
+			collectStructuralIndexesLocked(pair.target, structuralIndexes)
 			addChildLocked(pair.target, targetChild, rev)
 			delete(pair.target.removedChildren, targetChild.key)
 			targetChild.parents[pair.target] = struct{}{}
-			changed[pair.target] = struct{}{}
+			structureChanged[pair.target] = struct{}{}
 		}
 	}
-	for target := range changed {
+	for target := range attributeChanged {
+		target.selfRev = rev
+		propagateAttributeLocked(target, rev)
+	}
+	for target := range structureChanged {
 		target.selfRev = rev
 		propagateStructureLocked(target, rev)
+	}
+	for target := range created {
+		target.selfRev = rev
+	}
+	for index := range structuralIndexes {
+		index.reconcileStructureLocked()
 	}
 	roots := make([]*node, 0, len(selected(patch)))
 	for _, source := range selected(patch) {
@@ -1291,6 +1320,8 @@ func propagateAttributeLocked(n *node, rev uint64) {
 				} else {
 					x.index.dirty[ordinal] = struct{}{}
 				}
+			} else if _, exists := x.index.addedOrdinal[n]; exists && x.index.addedIndexed {
+				x.index.rebuildAddedPostingsLocked()
 			}
 		}
 		for p := range x.parents {
@@ -1356,6 +1387,72 @@ func updateStructuralIndexesLocked(parent, child *node, linked bool) {
 		}
 	}
 	visit(parent)
+}
+
+func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) {
+	seen := make(map[*node]struct{})
+	var visit func(*node)
+	visit = func(current *node) {
+		if _, duplicate := seen[current]; duplicate {
+			return
+		}
+		seen[current] = struct{}{}
+		if current.index != nil {
+			indexes[current.index] = struct{}{}
+		}
+		for parent := range current.parents {
+			visit(parent)
+		}
+	}
+	visit(n)
+}
+
+func (index *searchIndex) reconcileStructureLocked() {
+	current := reachableLocked([]*node{index.root})
+	index.support = make(map[*node]uint32, len(current))
+	index.active = make(map[*node]struct{}, len(current))
+	index.removed = make(map[uint32]struct{})
+	index.addedEdges = make(map[graphEdge]struct{})
+	index.removedEdges = make(map[graphEdge]struct{})
+	index.support[index.root] = 1
+	for _, n := range current {
+		index.active[n] = struct{}{}
+		if _, committed := index.ordinal[n]; !committed {
+			if _, known := index.addedOrdinal[n]; !known {
+				ordinal := uint32(len(index.nodes) + len(index.added))
+				index.addedOrdinal[n] = ordinal
+				index.added = append(index.added, n)
+				index.addedAll = append(index.addedAll, ordinal)
+			}
+		}
+		for _, child := range n.childOrder {
+			index.support[child]++
+			if !index.hasCommittedEdge(n, child) {
+				index.addedEdges[graphEdge{parent: n, child: child}] = struct{}{}
+			}
+		}
+	}
+	for ordinal, n := range index.nodes {
+		if _, active := index.active[n]; !active {
+			index.removed[uint32(ordinal)] = struct{}{}
+		}
+		for _, parentOrdinal := range index.parents[ordinal] {
+			parent := index.nodes[parentOrdinal]
+			if _, exists := parent.children[n]; !exists {
+				index.removedEdges[graphEdge{parent: parent, child: n}] = struct{}{}
+			}
+		}
+	}
+	if len(index.added) > addedPostingThreshold {
+		index.rebuildAddedPostingsLocked()
+	}
+	index.rebuildAffectedLocked()
+	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
+		index.resetCommittedOrderLocked()
+	} else {
+		index.orderDirty = true
+	}
+	index.overlayRevision = index.root.structureRev
 }
 
 func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool) {
@@ -1458,6 +1555,12 @@ func (index *searchIndex) activateLocked(n *node) {
 		ordinal := uint32(len(index.nodes) + len(index.added))
 		index.addedOrdinal[n] = ordinal
 		index.added = append(index.added, n)
+		index.addedAll = append(index.addedAll, ordinal)
+		if index.addedIndexed {
+			index.indexAddedNodeLocked(n, ordinal)
+		} else if len(index.added) > addedPostingThreshold {
+			index.rebuildAddedPostingsLocked()
+		}
 	}
 	for _, child := range n.childOrder {
 		wasInactive := index.support[child] == 0
@@ -1465,6 +1568,27 @@ func (index *searchIndex) activateLocked(n *node) {
 		if wasInactive {
 			index.activateLocked(child)
 		}
+	}
+}
+
+func (index *searchIndex) rebuildAddedPostingsLocked() {
+	index.addedByType = make(map[reflect.Type]posting)
+	index.addedByValue = make(map[reflect.Type]map[any]posting)
+	index.addedIndexed = true
+	for offset, n := range index.added {
+		index.indexAddedNodeLocked(n, uint32(len(index.nodes)+offset))
+	}
+}
+
+func (index *searchIndex) indexAddedNodeLocked(n *node, ordinal uint32) {
+	for typ, value := range n.attrs {
+		index.addedByType[typ] = append(index.addedByType[typ], ordinal)
+		values := index.addedByValue[typ]
+		if values == nil {
+			values = make(map[any]posting)
+			index.addedByValue[typ] = values
+		}
+		values[value] = append(values[value], ordinal)
 	}
 }
 
@@ -1744,12 +1868,74 @@ func (index *searchIndex) matchCurrent(condition *predicate) posting {
 			current = append(current, ordinal)
 		}
 	}
-	for offset, n := range index.added {
-		if _, active := index.active[n]; active && matchesPredicateLocked(n, condition, nil) {
-			current = append(current, uint32(len(index.nodes)+offset))
+	if index.addedIndexed && !path {
+		current = index.appendActiveAdded(current, index.matchAdded(condition))
+	} else {
+		for offset, n := range index.added {
+			if _, active := index.active[n]; active && matchesPredicateLocked(n, condition, nil) {
+				current = append(current, uint32(len(index.nodes)+offset))
+			}
 		}
 	}
 	return mergePostingOverlay(base, excluded, current)
+}
+
+func (index *searchIndex) appendActiveAdded(result, values posting) posting {
+	if available := cap(result) - len(result); available < len(values) {
+		grown := make(posting, len(result), len(result)+len(values))
+		copy(grown, result)
+		result = grown
+	}
+	for _, ordinal := range values {
+		if _, active := index.active[index.nodeAt(ordinal)]; active {
+			result = append(result, ordinal)
+		}
+	}
+	return result
+}
+
+func (index *searchIndex) matchAdded(condition *predicate) posting {
+	switch condition.op {
+	case predicateMatch:
+		if condition.matcher.any {
+			return index.addedByType[condition.matcher.typ]
+		}
+		return index.addedByValue[condition.matcher.typ][condition.matcher.value]
+	case predicateAny:
+		return index.addedAll
+	case predicateAnd:
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.matchAdded(child)
+			if len(operands[i]) == 0 {
+				return nil
+			}
+		}
+		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		result := operands[0]
+		for _, operand := range operands[1:] {
+			result = intersectPostings(result, operand)
+			if len(result) == 0 {
+				return nil
+			}
+		}
+		return result
+	case predicateOr:
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.matchAdded(child)
+		}
+		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		var result posting
+		for _, operand := range operands {
+			result = unionPostings(result, operand)
+		}
+		return result
+	case predicatePath:
+		panic("graph: added path matching requires traversal")
+	default:
+		panic("graph: invalid predicate")
+	}
 }
 
 func postingFromSet(values map[uint32]struct{}) posting {
@@ -1890,6 +2076,12 @@ func intersectPostings(left, right posting) posting {
 }
 
 func mergePostingOverlay(base, excluded, replacements posting) posting {
+	if len(base) == 0 {
+		return replacements
+	}
+	if len(excluded) == 0 && len(replacements) == 0 {
+		return base
+	}
 	result := make(posting, 0, len(base)+len(replacements))
 	for i, removed, replacement := 0, 0, 0; i < len(base) || replacement < len(replacements); {
 		for removed < len(excluded) && i < len(base) && excluded[removed] < base[i] {

@@ -394,6 +394,96 @@ func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	}
 }
 
+func TestAddedNodePostingsTrackAttributesAndReachability(t *testing.T) {
+	root := New(kind("root"))
+	Commit(root)
+	branch := New(kind("branch"))
+	added := make([]Graph, addedPostingThreshold+1)
+	for i := range added {
+		added[i] = New(kind("actor"), ident(string(rune('a'+i))))
+		Link(branch, added[i])
+	}
+	Link(root, branch)
+
+	index := first(root).index
+	if !index.addedIndexed || Len(Search(root, kind("actor"))) != len(added) {
+		t.Fatal("large added overlay was not indexed")
+	}
+	if Len(Search(root, Type[any]())) != len(added)+2 || Len(Search(root, Type[kind]())) != len(added)+2 {
+		t.Fatal("added wildcard postings")
+	}
+	if Len(Search(root, And(kind("actor"), Or(ident("a"), ident("b"))))) != 2 {
+		t.Fatal("added logical postings")
+	}
+	if Len(Search(root, Or(kind("branch"), ident("a")))) != 2 {
+		t.Fatal("added union postings")
+	}
+	state.Lock()
+	index.reconcileStructureLocked()
+	state.Unlock()
+	func() {
+		defer expectPanic(t)
+		index.matchAdded(predicateFromValue(Path(kind("actor"))))
+	}()
+	func() {
+		defer expectPanic(t)
+		index.matchAdded(&predicate{op: predicateOp(255)})
+	}()
+	Set(added[0], kind("changed"))
+	if Len(Search(root, kind("actor"))) != len(added)-1 || Len(Search(root, kind("changed"))) != 1 {
+		t.Fatal("added postings did not track Set")
+	}
+	Unset[kind](added[1])
+	if Len(Search(root, Type[kind]())) != len(added)+1 {
+		t.Fatal("added postings did not track Unset")
+	}
+	Unlink(root, branch)
+	if !Empty(Search(root, kind("actor"))) {
+		t.Fatal("inactive added postings remained searchable")
+	}
+	Link(root, branch)
+	if Len(Search(root, kind("actor"))) != len(added)-2 {
+		t.Fatal("reactivated added postings were not searchable")
+	}
+}
+
+func TestApplyAndPatchKeepCommittedSearchIndex(t *testing.T) {
+	t.Run("apply", func(t *testing.T) {
+		source := New(kind("root"), ident("root"))
+		original := New(kind("actor"), ident("original"))
+		Link(source, original)
+		replica := Apply(Graph{}, Delta(source, Type[ident]()))
+		Commit(source)
+		Commit(replica)
+		Unlink(source, original)
+		Apply(replica, Delta(source, Type[ident]()))
+		if !validSearchIndex(first(replica)) || !Empty(Search(replica, kind("actor"))) {
+			t.Fatal("apply removal invalidated the committed search index")
+		}
+		Commit(source)
+		child := New(kind("actor"), ident("child"))
+		Link(source, child)
+		Apply(replica, Delta(source, Type[ident]()))
+		if !validSearchIndex(first(replica)) || Len(Search(replica, kind("actor"))) != 1 {
+			t.Fatal("apply invalidated the committed search index")
+		}
+	})
+
+	t.Run("patch", func(t *testing.T) {
+		root := New(kind("root"), ident("root"))
+		Commit(root)
+		state.Lock()
+		first(root).index.reconcileStructureLocked()
+		state.Unlock()
+		patch := New(ident("root"))
+		Link(patch, New(kind("actor"), ident("child")))
+		Patch(root, patch, Type[ident]())
+		if !validSearchIndex(first(root)) || Len(Search(root, kind("actor"))) != 1 {
+			t.Fatal("patch invalidated the committed search index")
+		}
+	})
+}
+
 func TestStructuralOverlayCountsReachableParents(t *testing.T) {
 	root := New(kind("root"))
 	left := New(kind("parent"), name("left"))

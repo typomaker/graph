@@ -215,6 +215,53 @@ func BenchmarkSearchAddedBranch100Of10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchAddedBranch10KOf10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	branch := New(benchmarkKind("branch"))
+	for i := 0; i < 9999; i++ {
+		Link(branch, New(benchmarkKind("branch"), benchmarkID(fmt.Sprint(i))))
+	}
+	Commit(root)
+	Link(root, branch)
+	Search(root, benchmarkKind("actor"))
+	b.ResetTimer()
+	for range b.N {
+		Search(root, benchmarkKind("branch"))
+	}
+}
+
+func BenchmarkSearchAfterApply10K(b *testing.B) {
+	source := benchmarkWorld(10000)
+	replica := Apply(Graph{}, Delta(source))
+	Commit(source)
+	Commit(replica)
+	Link(source, New(benchmarkKind("actor"), benchmarkID("added")))
+	Apply(replica, Delta(source))
+	Search(replica, benchmarkKind("actor"))
+	b.ResetTimer()
+	for range b.N {
+		if Len(Search(replica, benchmarkKind("actor"))) != 10001 {
+			b.Fatal()
+		}
+	}
+}
+
+func BenchmarkSearchAfterPatch10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	Set(root, benchmarkID("root"))
+	Commit(root)
+	patch := New(benchmarkID("root"))
+	Link(patch, New(benchmarkKind("actor"), benchmarkID("added")))
+	Patch(root, patch, Type[benchmarkID]())
+	Search(root, benchmarkKind("actor"))
+	b.ResetTimer()
+	for range b.N {
+		if Len(Search(root, benchmarkKind("actor"))) != 10001 {
+			b.Fatal()
+		}
+	}
+}
+
 func BenchmarkSearchFirstAfterStructuralChange10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	leaf := New(benchmarkKind("leaf"))
