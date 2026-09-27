@@ -1391,9 +1391,14 @@ func (index *searchIndex) match(condition *predicate) posting {
 		}
 		return result
 	case predicateOr:
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.match(child)
+		}
+		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
 		var result posting
-		for _, child := range condition.children {
-			result = unionPostings(result, index.match(child))
+		for _, operand := range operands {
+			result = unionPostings(result, operand)
 		}
 		return result
 	case predicatePath:
