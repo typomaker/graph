@@ -367,7 +367,7 @@ func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	}
 
 	Unlink(branch, added)
-	if !validSearchIndex(first(root)) || !Empty(Search(root, kind("actor"))) {
+	if index := first(root).index; !validSearchIndex(first(root)) || len(index.addedEdges) != 0 || len(index.removedEdges) != 0 || !Empty(Search(root, kind("actor"))) {
 		t.Fatal("removed structural overlay node remained searchable")
 	}
 

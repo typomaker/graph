@@ -62,6 +62,20 @@ func BenchmarkSearchStructuralOverlay10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchCancelledEdge10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	leaf := New(benchmarkKind("leaf"))
+	Commit(root)
+	Link(root, leaf)
+	Unlink(root, leaf)
+	b.ResetTimer()
+	for range b.N {
+		if Len(Search(root, benchmarkKind("actor"))) != 10000 {
+			b.Fatal()
+		}
+	}
+}
+
 func BenchmarkSelect10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	all := Search(root, Type[any]())

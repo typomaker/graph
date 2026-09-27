@@ -46,7 +46,6 @@ type searchIndex struct {
 	byValue           map[reflect.Type]map[any]posting
 	dirty             map[uint32]struct{}
 	overlayRevision   uint64
-	structuralSeeds   map[*node]struct{}
 	removed           map[uint32]struct{}
 	affected          map[uint32]struct{}
 	added             []*node
@@ -55,9 +54,17 @@ type searchIndex struct {
 	support           map[*node]uint32
 	active            map[*node]struct{}
 	orderDirty        bool
+	orderOverlayBuilt bool
+	addedEdges        map[graphEdge]struct{}
+	removedEdges      map[graphEdge]struct{}
 }
 
 type posting []uint32
+
+type graphEdge struct {
+	parent *node
+	child  *node
+}
 
 type subgraph struct {
 	edges      map[*node][]*node
@@ -615,6 +622,7 @@ func searchWhileRebuildingOrder(g Graph, condition *predicate) (Graph, bool) {
 	}
 	visit(roots[0])
 	index.orderDirty = false
+	index.orderOverlayBuilt = true
 	return Graph{nodes: out, index: index}, true
 }
 
@@ -1332,8 +1340,7 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 		index.overlayRevision = index.root.structureRev
 		return
 	}
-	index.structuralSeeds[parent] = struct{}{}
-	index.markAffectedAncestorsLocked(parent)
+	index.normalizeEdgeLocked(parent, child, linked)
 	if linked {
 		wasInactive := index.support[child] == 0
 		index.support[child]++
@@ -1349,8 +1356,72 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 			index.deactivateLocked(child)
 		}
 	}
-	index.orderDirty = true
+	index.rebuildAffectedLocked()
+	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
+		index.resetCommittedOrderLocked()
+	} else {
+		index.orderDirty = true
+	}
 	index.overlayRevision = index.root.structureRev
+}
+
+func (index *searchIndex) normalizeEdgeLocked(parent, child *node, linked bool) {
+	edge := graphEdge{parent: parent, child: child}
+	committed := index.hasCommittedEdge(parent, child)
+	if linked {
+		if committed {
+			delete(index.removedEdges, edge)
+		} else {
+			index.addedEdges[edge] = struct{}{}
+		}
+		return
+	}
+	if committed {
+		index.removedEdges[edge] = struct{}{}
+	} else {
+		delete(index.addedEdges, edge)
+	}
+}
+
+func (index *searchIndex) hasCommittedEdge(parent, child *node) bool {
+	parentOrdinal, parentOK := index.ordinal[parent]
+	childOrdinal, childOK := index.ordinal[child]
+	if !parentOK || !childOK {
+		return false
+	}
+	parents := index.parents[childOrdinal]
+	position := sort.Search(len(parents), func(i int) bool { return parents[i] >= parentOrdinal })
+	return position < len(parents) && parents[position] == parentOrdinal
+}
+
+func (index *searchIndex) rebuildAffectedLocked() {
+	clear(index.affected)
+	for edge := range index.addedEdges {
+		index.markAffectedAncestorsLocked(edge.parent)
+	}
+	for edge := range index.removedEdges {
+		index.markAffectedAncestorsLocked(edge.parent)
+	}
+}
+
+func (index *searchIndex) hasActiveAddedNodes() bool {
+	for _, n := range index.added {
+		if _, active := index.active[n]; active {
+			return true
+		}
+	}
+	return false
+}
+
+func (index *searchIndex) resetCommittedOrderLocked() {
+	if index.orderOverlayBuilt {
+		index.order = make(map[*node]uint32, len(index.nodes))
+		for ordinal, n := range index.nodes {
+			index.order[n] = uint32(ordinal)
+		}
+	}
+	index.orderDirty = false
+	index.orderOverlayBuilt = false
 }
 
 func (index *searchIndex) activateLocked(n *node) {
@@ -1420,6 +1491,7 @@ func (index *searchIndex) rebuildOrderLocked() {
 		index.order[n] = uint32(position)
 	}
 	index.orderDirty = false
+	index.orderOverlayBuilt = true
 }
 func reachesLocked(from, target *node) bool {
 	seen := map[*node]struct{}{}
@@ -1518,13 +1590,14 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		byValue:           make(map[reflect.Type]map[any]posting),
 		dirty:             make(map[uint32]struct{}),
 		overlayRevision:   root.structureRev,
-		structuralSeeds:   make(map[*node]struct{}),
 		removed:           make(map[uint32]struct{}),
 		affected:          make(map[uint32]struct{}),
 		addedOrdinal:      make(map[*node]uint32),
 		order:             make(map[*node]uint32, len(nodes)),
 		support:           make(map[*node]uint32, len(nodes)),
 		active:            make(map[*node]struct{}, len(nodes)),
+		addedEdges:        make(map[graphEdge]struct{}),
+		removedEdges:      make(map[graphEdge]struct{}),
 	}
 	for ordinal, n := range nodes {
 		if uint64(ordinal) > uint64(^uint32(0)) {
@@ -1631,7 +1704,7 @@ func (index *searchIndex) match(condition *predicate) posting {
 
 func (index *searchIndex) matchCurrent(condition *predicate) posting {
 	base := index.match(condition)
-	structural := len(index.structuralSeeds) != 0
+	structural := len(index.addedEdges) != 0 || len(index.removedEdges) != 0 || len(index.removed) != 0 || index.hasActiveAddedNodes()
 	if len(index.dirty) == 0 && !structural {
 		return base
 	}
@@ -1641,7 +1714,7 @@ func (index *searchIndex) matchCurrent(condition *predicate) posting {
 		affected = unionPostings(affected, postingFromSet(index.affected))
 	}
 	removed := postingFromSet(index.removed)
-	unchanged := subtractPostings(subtractPostings(base, affected), removed)
+	excluded := unionPostings(affected, removed)
 	current := make(posting, 0, len(affected))
 	for _, ordinal := range affected {
 		if _, unreachable := index.removed[ordinal]; !unreachable && matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
@@ -1653,7 +1726,7 @@ func (index *searchIndex) matchCurrent(condition *predicate) posting {
 			current = append(current, uint32(len(index.nodes)+offset))
 		}
 	}
-	return unionPostings(unchanged, current)
+	return mergePostingOverlay(base, excluded, current)
 }
 
 func postingFromSet(values map[uint32]struct{}) posting {
@@ -1736,7 +1809,7 @@ func (index *searchIndex) nodeAt(ordinal uint32) *node {
 }
 
 func (index *searchIndex) orderMatches(values posting) posting {
-	if len(index.structuralSeeds) == 0 {
+	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
 		return values
 	}
 	result := append(posting(nil), values...)
@@ -1783,14 +1856,24 @@ func intersectPostings(left, right posting) posting {
 	return result
 }
 
-func subtractPostings(left, removed posting) posting {
-	result := make(posting, 0, len(left))
-	for i, j := 0, 0; i < len(left); i++ {
-		for j < len(removed) && removed[j] < left[i] {
-			j++
+func mergePostingOverlay(base, excluded, replacements posting) posting {
+	result := make(posting, 0, len(base)+len(replacements))
+	for i, removed, replacement := 0, 0, 0; i < len(base) || replacement < len(replacements); {
+		for removed < len(excluded) && i < len(base) && excluded[removed] < base[i] {
+			removed++
 		}
-		if j == len(removed) || removed[j] != left[i] {
-			result = append(result, left[i])
+		for i < len(base) && removed < len(excluded) && base[i] == excluded[removed] {
+			i++
+			removed++
+		}
+		if replacement < len(replacements) && (i == len(base) || replacements[replacement] < base[i]) {
+			result = append(result, replacements[replacement])
+			replacement++
+			continue
+		}
+		if i < len(base) {
+			result = append(result, base[i])
+			i++
 		}
 	}
 	return result
