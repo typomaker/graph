@@ -301,6 +301,21 @@ func TestCommitBuildsAndInvalidatesSearchIndex(t *testing.T) {
 	}
 }
 
+func TestAttributeOverlayClearsWhenCommittedStateReturns(t *testing.T) {
+	root := New(kind("root"))
+	child := New(ident("committed"), kind("actor"))
+	Link(root, child)
+	Commit(root)
+	Set(child, ident("changed"))
+	if len(first(root).index.dirty) != 1 {
+		t.Fatal("attribute change was not tracked")
+	}
+	Set(child, ident("committed"))
+	if len(first(root).index.dirty) != 0 || Len(Search(root, ident("committed"))) != 1 {
+		t.Fatal("restored committed attributes left a dirty overlay")
+	}
+}
+
 func TestCommittedPathSearchAndFollow(t *testing.T) {
 	world := New(kind("world"))
 	locationA := New(kind("location"), name("a"))

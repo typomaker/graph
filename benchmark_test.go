@@ -50,6 +50,19 @@ func BenchmarkSearchAttributeOverlay10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchRestoredAttribute10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	Commit(root)
+	Set(root, benchmarkID("dirty"))
+	Unset[benchmarkID](root)
+	b.ResetTimer()
+	for range b.N {
+		if Len(Search(root, benchmarkKind("actor"))) != 10000 {
+			b.Fatal()
+		}
+	}
+}
+
 func BenchmarkSearchStructuralOverlay10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	Commit(root)

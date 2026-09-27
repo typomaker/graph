@@ -1286,7 +1286,11 @@ func propagateAttributeLocked(n *node, rev uint64) {
 		}
 		if x.index != nil {
 			if ordinal, exists := x.index.ordinal[n]; exists {
-				x.index.dirty[ordinal] = struct{}{}
+				if x.index.attributesCommitted(n, ordinal) {
+					delete(x.index.dirty, ordinal)
+				} else {
+					x.index.dirty[ordinal] = struct{}{}
+				}
 			}
 		}
 		for p := range x.parents {
@@ -1294,6 +1298,25 @@ func propagateAttributeLocked(n *node, rev uint64) {
 		}
 	}
 	visit(n)
+}
+
+func (index *searchIndex) attributesCommitted(n *node, ordinal uint32) bool {
+	committedCount := 0
+	for typ, values := range index.byType {
+		if postingHas(values, ordinal) {
+			committedCount++
+			value, exists := n.attrs[typ]
+			if !exists || !postingHas(index.byValue[typ][value], ordinal) {
+				return false
+			}
+		}
+	}
+	return committedCount == len(n.attrs)
+}
+
+func postingHas(values posting, ordinal uint32) bool {
+	position := sort.Search(len(values), func(i int) bool { return values[i] >= ordinal })
+	return position < len(values) && values[position] == ordinal
 }
 
 func propagateStructureLocked(n *node, rev uint64) {
