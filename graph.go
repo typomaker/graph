@@ -4,6 +4,7 @@ package graph
 import (
 	"fmt"
 	"iter"
+	"math/bits"
 	"reflect"
 	"sort"
 	"sync"
@@ -29,19 +30,21 @@ type node struct {
 	parents         map[*node]struct{}
 	selfRev         uint64
 	treeRev         uint64
+	structureRev    uint64
 	baseline        uint64
 	index           *searchIndex
 }
 
 type searchIndex struct {
-	root     *node
-	revision uint64
-	nodes    []*node
-	ordinal  map[*node]uint32
-	parents  [][]uint32
-	all      posting
-	byType   map[reflect.Type]posting
-	byValue  map[reflect.Type]map[any]posting
+	root              *node
+	structureRevision uint64
+	nodes             []*node
+	ordinal           map[*node]uint32
+	parents           [][]uint32
+	all               posting
+	byType            map[reflect.Type]posting
+	byValue           map[reflect.Type]map[any]posting
+	dirty             map[uint32]struct{}
 }
 
 type posting []uint32
@@ -236,7 +239,7 @@ func Set[T any](g Graph, value T) bool {
 	for t := range changedTypes {
 		n.attrRev[t] = rev
 	}
-	propagateLocked(n, rev)
+	propagateAttributeLocked(n, rev)
 	return true
 }
 
@@ -260,7 +263,7 @@ func Unset[T any](g Graph) (T, bool) {
 	rev := nextRevisionLocked()
 	n.selfRev = rev
 	n.removedAttrs[typ] = rev
-	propagateLocked(n, rev)
+	propagateAttributeLocked(n, rev)
 	return value.(T), true
 }
 
@@ -296,7 +299,7 @@ func Link(g Graph, graphs ...Graph) bool {
 		delete(parent.removedChildren, child.key)
 		child.parents[parent] = struct{}{}
 		parent.selfRev = rev
-		propagateLocked(parent, rev)
+		propagateStructureLocked(parent, rev)
 		changed = true
 	}
 	return changed
@@ -324,7 +327,7 @@ func Unlink(g Graph, graphs ...Graph) bool {
 		rev := nextRevisionLocked()
 		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 		parent.selfRev = rev
-		propagateLocked(parent, rev)
+		propagateStructureLocked(parent, rev)
 		changed = true
 	}
 	return changed
@@ -465,7 +468,7 @@ func Select(g Graph, values ...any) Graph {
 	index := graphSearchIndex(g)
 	var indexedMatches posting
 	if index != nil && containsPath(condition) {
-		indexedMatches = index.match(condition)
+		indexedMatches = index.matchCurrent(condition)
 	}
 	out := make([]*node, 0, len(selected(g)))
 	for _, n := range selected(g) {
@@ -488,7 +491,7 @@ func Follow(g Graph, values ...any) Graph {
 	index := graphSearchIndex(g)
 	var indexedMatches posting
 	if index != nil && containsPath(condition) {
-		indexedMatches = index.match(condition)
+		indexedMatches = index.matchCurrent(condition)
 	}
 	out := make([]*node, 0)
 	seen := make(map[*node]struct{})
@@ -519,7 +522,7 @@ func Search(g Graph, values ...any) Graph {
 	defer state.RUnlock()
 	roots := selected(g)
 	if len(roots) == 1 && g.view == nil && validSearchIndex(roots[0]) {
-		matches := roots[0].index.match(condition)
+		matches := roots[0].index.matchCurrent(condition)
 		out := make([]*node, len(matches))
 		for i, ordinal := range matches {
 			out[i] = roots[0].index.nodes[ordinal]
@@ -555,7 +558,7 @@ func Search(g Graph, values ...any) Graph {
 			continue
 		}
 		if g.view == nil && validSearchIndex(root) {
-			for _, ordinal := range root.index.match(condition) {
+			for _, ordinal := range root.index.matchCurrent(condition) {
 				n := root.index.nodes[ordinal]
 				if _, duplicate := emitted[n]; !duplicate {
 					emitted[n] = struct{}{}
@@ -763,7 +766,7 @@ func Apply(g, delta Graph) Graph {
 	}
 	for target := range changed {
 		target.selfRev = rev
-		propagateLocked(target, rev)
+		propagateStructureLocked(target, rev)
 	}
 	roots := make([]*node, 0, len(selected(delta)))
 	for _, source := range selected(delta) {
@@ -861,7 +864,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 	}
 	for target := range changed {
 		target.selfRev = rev
-		propagateLocked(target, rev)
+		propagateStructureLocked(target, rev)
 	}
 	roots := make([]*node, 0, len(selected(patch)))
 	for _, source := range selected(patch) {
@@ -1065,7 +1068,7 @@ func newNodeLocked(key uint64, attrs map[reflect.Type]any, rev uint64) *node {
 		id: state.nextID, key: key, attrs: attrs, attrRev: attrRev,
 		removedAttrs: make(map[reflect.Type]uint64), children: make(map[*node]uint64),
 		removedChildren: make(map[uint64]removedChild), parents: make(map[*node]struct{}),
-		selfRev: rev, treeRev: rev,
+		selfRev: rev, treeRev: rev, structureRev: rev,
 	}
 }
 
@@ -1206,7 +1209,7 @@ func attributeType[T any]() reflect.Type {
 }
 
 func nextRevisionLocked() uint64 { state.revision++; return state.revision }
-func propagateLocked(n *node, rev uint64) {
+func propagateAttributeLocked(n *node, rev uint64) {
 	seen := map[*node]struct{}{}
 	var visit func(*node)
 	visit = func(x *node) {
@@ -1217,8 +1220,34 @@ func propagateLocked(n *node, rev uint64) {
 		if x.treeRev < rev {
 			x.treeRev = rev
 		}
+		if x.index != nil {
+			if ordinal, exists := x.index.ordinal[n]; exists {
+				x.index.dirty[ordinal] = struct{}{}
+			}
+		}
 		for p := range x.parents {
 			visit(p)
+		}
+	}
+	visit(n)
+}
+
+func propagateStructureLocked(n *node, rev uint64) {
+	seen := map[*node]struct{}{}
+	var visit func(*node)
+	visit = func(x *node) {
+		if _, ok := seen[x]; ok {
+			return
+		}
+		seen[x] = struct{}{}
+		if x.treeRev < rev {
+			x.treeRev = rev
+		}
+		if x.structureRev < rev {
+			x.structureRev = rev
+		}
+		for parent := range x.parents {
+			visit(parent)
 		}
 	}
 	visit(n)
@@ -1310,14 +1339,15 @@ func reachableLocked(roots []*node) []*node {
 
 func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 	index := &searchIndex{
-		root:     root,
-		revision: root.treeRev,
-		nodes:    append([]*node(nil), nodes...),
-		ordinal:  make(map[*node]uint32, len(nodes)),
-		parents:  make([][]uint32, len(nodes)),
-		all:      make(posting, len(nodes)),
-		byType:   make(map[reflect.Type]posting),
-		byValue:  make(map[reflect.Type]map[any]posting),
+		root:              root,
+		structureRevision: root.structureRev,
+		nodes:             append([]*node(nil), nodes...),
+		ordinal:           make(map[*node]uint32, len(nodes)),
+		parents:           make([][]uint32, len(nodes)),
+		all:               make(posting, len(nodes)),
+		byType:            make(map[reflect.Type]posting),
+		byValue:           make(map[reflect.Type]map[any]posting),
+		dirty:             make(map[uint32]struct{}),
 	}
 	for ordinal, n := range nodes {
 		if uint64(ordinal) > uint64(^uint32(0)) {
@@ -1361,7 +1391,7 @@ func appendIndexPosting(values posting, ordinal uint32, all posting) posting {
 }
 
 func validSearchIndex(root *node) bool {
-	return root.index != nil && root.index.root == root && root.index.revision == root.treeRev
+	return root.index != nil && root.index.root == root && root.index.structureRevision == root.structureRev
 }
 
 func (index *searchIndex) match(condition *predicate) posting {
@@ -1412,11 +1442,65 @@ func (index *searchIndex) match(condition *predicate) posting {
 	}
 }
 
+func (index *searchIndex) matchCurrent(condition *predicate) posting {
+	base := index.match(condition)
+	if len(index.dirty) == 0 {
+		return base
+	}
+	affected := index.dirtyPosting(containsPath(condition))
+	unchanged := subtractPostings(base, affected)
+	current := make(posting, 0, len(affected))
+	for _, ordinal := range affected {
+		if matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
+			current = append(current, ordinal)
+		}
+	}
+	return unionPostings(unchanged, current)
+}
+
+func (index *searchIndex) dirtyPosting(includeAncestors bool) posting {
+	if !includeAncestors {
+		result := make(posting, 0, len(index.dirty))
+		for ordinal := range index.dirty {
+			result = append(result, ordinal)
+		}
+		sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+		return result
+	}
+	words := make([]uint64, (len(index.nodes)+63)/64)
+	queue := make([]uint32, 0, len(index.dirty))
+	for ordinal := range index.dirty {
+		words[ordinal/64] |= uint64(1) << (ordinal % 64)
+		queue = append(queue, ordinal)
+	}
+	for len(queue) != 0 {
+		ordinal := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		for _, parent := range index.parents[ordinal] {
+			mask := uint64(1) << (parent % 64)
+			if words[parent/64]&mask != 0 {
+				continue
+			}
+			words[parent/64] |= mask
+			queue = append(queue, parent)
+		}
+	}
+	result := make(posting, 0, len(index.dirty))
+	for wordIndex, word := range words {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			result = append(result, uint32(wordIndex*64+bit))
+			word &= word - 1
+		}
+	}
+	return result
+}
+
 func graphSearchIndex(g Graph) *searchIndex {
 	if g.view != nil {
 		return nil
 	}
-	if g.index != nil && g.index.revision == g.index.root.treeRev {
+	if g.index != nil && g.index.root.index == g.index && g.index.structureRevision == g.index.root.structureRev {
 		return g.index
 	}
 	if len(g.nodes) == 1 && validSearchIndex(g.nodes[0]) {
@@ -1466,6 +1550,19 @@ func intersectPostings(left, right posting) posting {
 			result = append(result, left[i])
 			i++
 			j++
+		}
+	}
+	return result
+}
+
+func subtractPostings(left, removed posting) posting {
+	result := make(posting, 0, len(left))
+	for i, j := 0, 0; i < len(left); i++ {
+		for j < len(removed) && removed[j] < left[i] {
+			j++
+		}
+		if j == len(removed) || removed[j] != left[i] {
+			result = append(result, left[i])
 		}
 	}
 	return result

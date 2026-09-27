@@ -284,11 +284,15 @@ func TestCommitBuildsAndInvalidatesSearchIndex(t *testing.T) {
 	}
 
 	Set(secondActor, ident("changed"))
-	if validSearchIndex(first(root)) {
-		t.Fatal("mutation did not invalidate index")
+	if !validSearchIndex(first(root)) || len(first(root).index.dirty) != 1 {
+		t.Fatal("attribute mutation did not create an index overlay")
 	}
 	if !Empty(Search(root, ident("two"))) || Len(Search(root, ident("changed"))) != 1 {
-		t.Fatal("stale index was used instead of traversal")
+		t.Fatal("dirty overlay did not replace the indexed attribute")
+	}
+	Unset[ident](secondActor)
+	if result := Search(root, Type[ident]()); Len(result) != 1 || value[ident](t, result) != "one" || !validSearchIndex(first(root)) {
+		t.Fatal("dirty overlay did not remove the indexed attribute")
 	}
 
 	Commit(root)
@@ -328,6 +332,14 @@ func TestCommittedPathSearchAndFollow(t *testing.T) {
 	if Len(actors) != 1 || value[ident](t, actors) != "two" {
 		t.Fatal("indexed follow")
 	}
+	Set(actorB, ident("one"))
+	if !Empty(Search(world, kind("location"), expression)) {
+		t.Fatal("path index did not recheck ancestors of a dirty endpoint")
+	}
+	if Len(Search(world, kind("location"), Path(kind("contains"), And(kind("actor"), ident("one"))))) != 2 {
+		t.Fatal("path overlay did not add a newly matching endpoint")
+	}
+	Set(actorB, ident("two"))
 
 	Unlink(containsB, actorB)
 	if !Empty(Search(world, kind("location"), expression)) || !Empty(Follow(locationB, expression)) {

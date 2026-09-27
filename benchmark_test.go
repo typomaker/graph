@@ -38,10 +38,22 @@ func BenchmarkSearchCommitted10K(b *testing.B) {
 	}
 }
 
-func BenchmarkSearchStale10K(b *testing.B) {
+func BenchmarkSearchAttributeOverlay10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	Commit(root)
 	Set(root, benchmarkID("dirty"))
+	b.ResetTimer()
+	for range b.N {
+		if Len(Search(root, benchmarkKind("actor"))) != 10000 {
+			b.Fatal()
+		}
+	}
+}
+
+func BenchmarkSearchStructuralFallback10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	Commit(root)
+	Link(root, New(benchmarkKind("other")))
 	b.ResetTimer()
 	for range b.N {
 		if Len(Search(root, benchmarkKind("actor"))) != 10000 {
@@ -84,7 +96,7 @@ func BenchmarkPathSearchCommitted10K(b *testing.B) {
 	}
 }
 
-func BenchmarkPathSearchStale10K(b *testing.B) {
+func BenchmarkPathSearchAttributeOverlay10K(b *testing.B) {
 	root := benchmarkPathWorld(10000)
 	Commit(root)
 	Set(root, benchmarkID("dirty"))

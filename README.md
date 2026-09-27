@@ -124,7 +124,7 @@ graph.Patch(target, patch, graph.Type[ID]())
 
 `Select`, `Follow`, and `Search` are snapshot operations. After `Commit`, `Search` can use immutable type and value postings and evaluate structural paths backwards through internal parent relations. Conjunctions start with their most selective posting. Results retain graph traversal order.
 
-Mutations do not update postings. They invalidate indexes through the existing tree revision, so searches after `Set`, `Unset`, `Link`, or `Unlink` automatically fall back to a current graph traversal. Calling `Commit` publishes a replacement index. This keeps mutations inexpensive and never exposes stale search results. Selections returned by an indexed search retain that index as long as its root revision remains current, allowing `Select` and `Follow` to use it for structural prefiltering.
+Mutations do not rebuild postings. `Set` and `Unset` add the changed node to a small per-index overlay. Ordinary predicates recheck that node, while structural predicates also recheck its indexed ancestors, leaving every unaffected posting usable. `Link` and `Unlink` change reachability and therefore invalidate the structural snapshot; searches then fall back to a current graph traversal. Calling `Commit` publishes a replacement index and clears the overlay. This keeps attribute mutations inexpensive and never exposes stale search results. Selections returned by an indexed search retain that index while its structural revision remains current, allowing `Select` and `Follow` to use it for structural prefiltering.
 
 ```sh
 go test -bench=. -benchmem
