@@ -342,8 +342,40 @@ func TestCommittedPathSearchAndFollow(t *testing.T) {
 	Set(actorB, ident("two"))
 
 	Unlink(containsB, actorB)
-	if !Empty(Search(world, kind("location"), expression)) || !Empty(Follow(locationB, expression)) {
+	if !validSearchIndex(first(world)) || !Empty(Search(world, kind("location"), expression)) || !Empty(Follow(locationB, expression)) {
 		t.Fatal("stale structural index was used")
+	}
+	Link(containsB, actorB)
+	if Len(Search(world, kind("location"), expression)) != 1 {
+		t.Fatal("relinked committed endpoint did not update path overlay")
+	}
+}
+
+func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
+	root := New(kind("root"))
+	branch := New(kind("branch"))
+	Link(root, branch)
+	Commit(root)
+
+	added := New(kind("actor"), ident("added"))
+	Link(branch, added)
+	if !validSearchIndex(first(root)) || len(first(root).index.added) != 1 {
+		t.Fatal("link invalidated the committed index")
+	}
+	if result := Search(root, kind("actor")); Len(result) != 1 || value[ident](t, result) != "added" {
+		t.Fatal("added structural overlay node was not searched")
+	}
+
+	Unlink(branch, added)
+	if !validSearchIndex(first(root)) || !Empty(Search(root, kind("actor"))) {
+		t.Fatal("removed structural overlay node remained searchable")
+	}
+
+	Link(branch, added)
+	Commit(root)
+	Unlink(branch, added)
+	if !validSearchIndex(first(root)) || len(first(root).index.removed) != 1 || !Empty(Search(root, ident("added"))) {
+		t.Fatal("committed node removal did not use structural overlay")
 	}
 }
 

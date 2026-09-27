@@ -50,7 +50,7 @@ func BenchmarkSearchAttributeOverlay10K(b *testing.B) {
 	}
 }
 
-func BenchmarkSearchStructuralFallback10K(b *testing.B) {
+func BenchmarkSearchStructuralOverlay10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	Commit(root)
 	Link(root, New(benchmarkKind("other")))
