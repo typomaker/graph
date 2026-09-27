@@ -269,6 +269,92 @@ func TestSharedNodeCommit(t *testing.T) {
 	if !Empty(Delta(b)) {
 		t.Fatal("global baseline")
 	}
+	if len(first(b).dirtyChildren) != 0 {
+		t.Fatal("delta did not prune a globally committed shared branch")
+	}
+}
+
+func TestDeltaAndCommitUseChangedFrontier(t *testing.T) {
+	root := New(kind("root"))
+	children := make([]Graph, 100)
+	for i := range children {
+		children[i] = New(kind("child"), ident(string(rune(i))))
+		Link(root, children[i])
+	}
+	Commit(root)
+	Set(children[73], name("changed"))
+	delta := Delta(root)
+	if len(delta.view.changes) != 2 || len(delta.view.edges[first(root)]) != 1 || delta.view.edges[first(root)][0] != first(children[73]) {
+		t.Fatal("delta traversed outside the changed frontier")
+	}
+	index := first(root).index
+	Commit(root)
+	if first(root).index != index || !Empty(Delta(root)) || len(first(root).dirtyChildren) != 0 {
+		t.Fatal("incremental commit did not consume the changed frontier")
+	}
+	if result := Search(root, name("changed")); Len(result) != 1 || value[ident](t, result) != ident(string(rune(73))) {
+		t.Fatal("incremental commit lost the attribute overlay")
+	}
+}
+
+func TestSharedDiamondFrontierDeltaAndCommit(t *testing.T) {
+	root := New(kind("root"))
+	left := New(kind("parent"), name("left"))
+	right := New(kind("parent"), name("right"))
+	shared := New(kind("shared"), ident("shared"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Commit(root)
+
+	Set(shared, name("changed"))
+	delta := Delta(root)
+	if len(delta.view.edges[first(root)]) != 2 || len(delta.view.changes) != 4 {
+		t.Fatal("delta did not retain every path to a shared change")
+	}
+	Commit(root)
+	if !Empty(Delta(root)) {
+		t.Fatal("commit did not deduplicate a shared changed node")
+	}
+
+	Set(shared, name("again"))
+	Unlink(left, shared)
+	Commit(root)
+	if Len(Search(root, kind("shared"))) != 1 || !Empty(Delta(root)) {
+		t.Fatal("commit did not discard a detached dirty path")
+	}
+}
+
+func TestIncrementalStructuralCommitAndCompaction(t *testing.T) {
+	root := New(kind("root"))
+	Commit(root)
+	index := first(root).index
+	child := New(kind("child"))
+	Link(root, child)
+	Commit(root)
+	edge := graphEdge{parent: first(root), child: first(child)}
+	if first(root).index != index || len(index.addedEdges) != 0 {
+		t.Fatal("structural commit rebuilt the small overlay")
+	}
+	if _, committed := index.committedAdded[edge]; !committed || !Empty(Delta(root)) || Len(Search(root, kind("child"))) != 1 {
+		t.Fatal("added edge was not committed incrementally")
+	}
+	Unlink(root, child)
+	if Empty(Delta(root)) {
+		t.Fatal("committed added edge removal was not reported")
+	}
+	Commit(root)
+	if _, retained := index.committedAdded[edge]; retained || len(index.committedRemoved) != 0 || !Empty(Search(root, kind("child"))) {
+		t.Fatal("structural baseline did not normalize a removed added edge")
+	}
+
+	for i := 0; i < 300; i++ {
+		Link(root, New(kind("bulk"), ident(string(rune(i)))))
+	}
+	Commit(root)
+	if first(root).index == index || len(first(root).index.added) != 0 || Len(Search(root, kind("bulk"))) != 300 {
+		t.Fatal("large structural overlay did not compact")
+	}
 }
 
 func TestCommitBuildsAndInvalidatesSearchIndex(t *testing.T) {
@@ -299,8 +385,8 @@ func TestCommitBuildsAndInvalidatesSearchIndex(t *testing.T) {
 	}
 
 	Commit(root)
-	if !validSearchIndex(first(root)) || first(root).index == index {
-		t.Fatal("commit did not replace stale index")
+	if !validSearchIndex(first(root)) || first(root).index != index || !Empty(Delta(root)) {
+		t.Fatal("incremental commit did not retain the current index")
 	}
 }
 
@@ -392,7 +478,7 @@ func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	Link(branch, added)
 	Commit(root)
 	Unlink(branch, added)
-	if !validSearchIndex(first(root)) || len(first(root).index.removed) != 1 || !Empty(Search(root, ident("added"))) {
+	if index := first(root).index; !validSearchIndex(first(root)) || index.activeByOrdinal[index.addedOrdinal[first(added)]] || !Empty(Search(root, ident("added"))) {
 		t.Fatal("committed node removal did not use structural overlay")
 	}
 }
@@ -645,6 +731,13 @@ func TestAddedPathOverlayMatchesTraversalAcrossMutations(t *testing.T) {
 		}
 		assertIndexedSearchEqualsTraversal(t, root, Type[any]())
 		assertIndexedSearchEqualsTraversal(t, root, kind("location"), Path(kind("contains"), And(kind("actor"), name("target"))))
+		if step%11 == 0 {
+			Commit(root)
+			if !Empty(Delta(root)) {
+				t.Fatalf("step %d: incremental commit left a delta", step)
+			}
+			assertIndexedSearchEqualsTraversal(t, root, kind("location"), Path(kind("contains"), And(kind("actor"), name("target"))))
+		}
 	}
 }
 

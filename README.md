@@ -118,7 +118,9 @@ graph.Commit(source)
 graph.Patch(target, patch, graph.Type[ID]())
 ```
 
-`Apply` and `Patch` build temporary composite indexes for their operation and discard them on return.
+`Apply` uses the committed internal identity index when available. Requested composite-key indexes are cached on the root index and invalidated by relevant key or structural changes.
+
+The first `Commit` of a root traverses its reachable graph and builds the search index. Later commits consume the propagated change frontier: they advance baselines only along changed paths and fold small search overlays into the existing index. Large or fragmented overlays trigger an automatic full compaction. Baselines belong to nodes rather than roots, so committing a shared node acknowledges that node for every root that reaches it; stale frontiers on other roots are pruned by their next `Delta` or `Commit`.
 
 ## Performance
 
@@ -128,7 +130,9 @@ Mutations do not rebuild committed postings. `Set` and `Unset` add the changed n
 
 Small added branches are checked directly. Once an added-node overlay becomes large, it receives its own type and value postings, which are updated by later attribute and reachability changes. Dense ordinal arrays track reachability and traversal order without per-result hash lookups. Result order is rebuilt lazily by the first subsequent search; an identity-order flag bypasses subsequent checks, and compatible searches stream nodes directly into the returned selection.
 
-Structural paths choose between sparse parent expansion and dense bitmaps. Overlay paths use the same reverse evaluation across committed and added ordinals, including current edge additions and removals. Sorted mutation postings are prepared when the graph changes rather than on every search. Bulk `Apply` and `Patch` replay structural changes as one incremental batch. Committed indexes also retain internal identity and requested composite-key indexes so repeated synchronization does not rescan the graph. Relevant key-attribute or structural changes invalidate those caches. Calling `Commit` publishes a replacement index and clears all overlays. Selections returned by an indexed search retain that index while its overlay revision remains current, allowing `Select` and `Follow` to use it for structural prefiltering.
+Structural paths choose between sparse parent expansion and dense bitmaps. Overlay paths use the same reverse evaluation across committed and added ordinals, including current edge additions and removals. Sorted mutation postings are prepared when the graph changes rather than on every search. Bulk `Apply` and `Patch` replay structural changes as one incremental batch. Committed indexes also retain internal identity and requested composite-key indexes so repeated synchronization does not rescan the graph. Relevant key-attribute or structural changes invalidate those caches.
+
+Attribute and structural mutations register the immediate changed child at every reachable ancestor. `Delta` follows this frontier instead of scanning unchanged siblings. Calling `Commit` normally advances the same frontier and retains the layered index; automatic compaction publishes a replacement index only when accumulated overrides or tombstones become large. Selections returned by an indexed search retain the current root index while its overlay revision remains valid, allowing `Select` and `Follow` to use it for structural prefiltering.
 
 ```sh
 go test -bench=. -benchmem

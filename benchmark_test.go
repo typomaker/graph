@@ -7,6 +7,7 @@ import (
 
 type benchmarkKind string
 type benchmarkID string
+type benchmarkVersion int
 
 func benchmarkWorld(size int) Graph {
 	root := New(benchmarkKind("world"))
@@ -169,6 +170,110 @@ func BenchmarkCommit10K(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		Commit(root)
+	}
+}
+
+func BenchmarkDeltaOneOf10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	child := Graph{nodes: []*node{first(root).childOrder[5000]}}
+	Commit(root)
+	b.ResetTimer()
+	for i := range b.N {
+		Set(child, benchmarkVersion(i&1))
+		if Empty(Delta(root)) {
+			b.Fatal()
+		}
+	}
+}
+
+func BenchmarkDeltaUpdates10K(b *testing.B) {
+	for _, changed := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("Changed%d", changed), func(b *testing.B) {
+			root := benchmarkWorld(10000)
+			children := first(root).childOrder[:changed]
+			Commit(root)
+			b.ResetTimer()
+			for i := range b.N {
+				for _, child := range children {
+					Set(Graph{nodes: []*node{child}}, benchmarkVersion(i&1))
+				}
+				if Empty(Delta(root)) {
+					b.Fatal()
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkCommitUpdates10K(b *testing.B) {
+	for _, changed := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("Changed%d", changed), func(b *testing.B) {
+			root := benchmarkWorld(10000)
+			children := first(root).childOrder[:changed]
+			Commit(root)
+			b.ResetTimer()
+			for i := range b.N {
+				for _, child := range children {
+					Set(Graph{nodes: []*node{child}}, benchmarkVersion(i&1))
+				}
+				Commit(root)
+			}
+		})
+	}
+}
+
+func BenchmarkCommitStructuralLeaf10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	leaf := New(benchmarkKind("leaf"))
+	Commit(root)
+	linked := false
+	b.ResetTimer()
+	for range b.N {
+		if linked {
+			Unlink(root, leaf)
+		} else {
+			Link(root, leaf)
+		}
+		Commit(root)
+		linked = !linked
+	}
+}
+
+func BenchmarkDeltaDeep10K(b *testing.B) {
+	nodes := make([]Graph, 10000)
+	for i := range nodes {
+		nodes[i] = New(benchmarkKind("node"))
+	}
+	for i := len(nodes) - 2; i >= 0; i-- {
+		Link(nodes[i], nodes[i+1])
+	}
+	root := nodes[0]
+	leaf := nodes[len(nodes)-1]
+	Commit(root)
+	b.ResetTimer()
+	for i := range b.N {
+		Set(leaf, benchmarkVersion(i&1))
+		if Empty(Delta(root)) {
+			b.Fatal()
+		}
+	}
+}
+
+func BenchmarkDeltaShared100(b *testing.B) {
+	root := New(benchmarkKind("root"))
+	shared := New(benchmarkKind("shared"))
+	for range 100 {
+		parent := New(benchmarkKind("parent"))
+		Link(root, parent)
+		Link(parent, shared)
+	}
+	Commit(root)
+	b.ResetTimer()
+	for i := range b.N {
+		Set(shared, benchmarkVersion(i&1))
+		if Empty(Delta(root)) {
+			b.Fatal()
+		}
 	}
 }
 

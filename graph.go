@@ -29,6 +29,8 @@ type node struct {
 	childOrder      []*node
 	removedChildren map[uint64]removedChild
 	parents         map[*node]struct{}
+	dirtyChildren   map[*node]struct{}
+	dirtyChildOrder []*node
 	selfRev         uint64
 	treeRev         uint64
 	structureRev    uint64
@@ -71,6 +73,8 @@ type searchIndex struct {
 	orderDirty        bool
 	addedEdges        map[graphEdge]struct{}
 	removedEdges      map[graphEdge]struct{}
+	committedAdded    map[graphEdge]struct{}
+	committedRemoved  map[graphEdge]struct{}
 }
 
 const addedPostingThreshold = 32
@@ -342,6 +346,7 @@ func Link(g Graph, graphs ...Graph) bool {
 		addChildLocked(parent, child, rev)
 		delete(parent.removedChildren, child.key)
 		child.parents[parent] = struct{}{}
+		markDirtyChildLocked(parent, child)
 		parent.selfRev = rev
 		propagateStructureLocked(parent, rev)
 		updateStructuralIndexesLocked(parent, child, true)
@@ -740,9 +745,10 @@ func prepareSearchOrder(g Graph) {
 	}
 }
 
-// Commit advances the baseline of every node reachable from the selection to
-// the current revision and publishes an immutable search index for each root.
-// Changes at or before that revision are omitted from subsequent Delta calls
+// Commit advances changed paths from each selected root to the current
+// revision. The first commit builds a search index; later commits retain and
+// update it incrementally unless accumulated fragmentation requires compaction.
+// Changes at or before the baseline are omitted from subsequent Delta calls
 // through any root that reaches those nodes.
 //
 // For example, commit after synchronizing a replica so that the next delta
@@ -759,15 +765,58 @@ func Commit(g Graph) {
 			continue
 		}
 		seenRoots[root] = struct{}{}
-		nodes := reachableLocked([]*node{root})
-		for _, n := range nodes {
-			n.baseline = state.revision
+		if !validSearchIndex(root) {
+			nodes := reachableLocked([]*node{root})
+			for _, n := range nodes {
+				n.baseline = state.revision
+				clearDirtyChildrenLocked(n)
+			}
+			root.index = buildSearchIndexLocked(root, nodes)
+			continue
 		}
-		root.index = buildSearchIndexLocked(root, nodes)
+		if root.treeRev <= root.baseline {
+			continue
+		}
+		commitChangedLocked(root, state.revision, false, make(map[*node]struct{}))
+		root.index.commitOverlayLocked()
+		if root.index.shouldCompact() {
+			nodes := reachableLocked([]*node{root})
+			root.index = buildSearchIndexLocked(root, nodes)
+		}
 	}
 }
 
-// Delta returns the current paths from each selected root to changes since its
+func clearDirtyChildrenLocked(n *node) {
+	clear(n.dirtyChildren)
+	n.dirtyChildOrder = n.dirtyChildOrder[:0]
+}
+
+func commitChangedLocked(n *node, revision uint64, full bool, seen map[*node]struct{}) {
+	if _, duplicate := seen[n]; duplicate {
+		return
+	}
+	seen[n] = struct{}{}
+	base := n.baseline
+	n.baseline = revision
+	children := n.dirtyChildOrder
+	if full {
+		children = n.childOrder
+	}
+	for _, child := range children {
+		if _, linked := n.children[child]; !linked {
+			continue
+		}
+		edgeAdded := n.children[child] > base
+		if full || edgeAdded {
+			commitChangedLocked(child, revision, true, seen)
+		} else if child.treeRev > child.baseline {
+			commitChangedLocked(child, revision, false, seen)
+		}
+	}
+	clearDirtyChildrenLocked(n)
+}
+
+// Delta returns the registered changed paths from each selected root since its
 // preceding Commit. It does not advance the baseline, so repeated calls return
 // the same changes. Optional matchBy attributes define the stable composite
 // identity Apply must use.
@@ -785,7 +834,7 @@ func Delta(g Graph, matchBy ...any) Graph {
 		if root.treeRev <= root.baseline {
 			continue
 		}
-		if buildDeltaLocked(root, view, map[*node]bool{}, false) {
+		if buildDeltaLocked(root, view, make(map[*node]bool), false) {
 			roots = append(roots, root)
 		}
 	}
@@ -953,6 +1002,7 @@ func Apply(g, delta Graph) Graph {
 				addChildLocked(parent, child, rev)
 				delete(parent.removedChildren, child.key)
 				child.parents[parent] = struct{}{}
+				markDirtyChildLocked(parent, child)
 				structureChanged[parent] = struct{}{}
 				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child, linked: true})
 			}
@@ -1074,6 +1124,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			addChildLocked(pair.target, targetChild, rev)
 			delete(pair.target.removedChildren, targetChild.key)
 			targetChild.parents[pair.target] = struct{}{}
+			markDirtyChildLocked(pair.target, targetChild)
 			structureChanged[pair.target] = struct{}{}
 			structuralChanges = append(structuralChanges, structuralChange{parent: pair.target, child: targetChild, linked: true})
 		}
@@ -1232,17 +1283,18 @@ func (i *compositeIndex) find(attrs map[reflect.Type]any) *node {
 	return level.node
 }
 
-func buildDeltaLocked(n *node, view *subgraph, visiting map[*node]bool, full bool) bool {
-	if visiting[n] {
-		return false
+func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (include bool) {
+	if !full {
+		if result, exists := memo[n]; exists {
+			return result
+		}
+		defer func() { memo[n] = include }()
 	}
-	visiting[n] = true
-	defer delete(visiting, n)
 	base := n.baseline
 	if full {
 		base = 0
 	}
-	include := n.selfRev > base
+	include = n.selfRev > base
 	change := nodeChange{
 		attrs:         make(map[reflect.Type]any),
 		addedChildren: make(map[uint64]struct{}),
@@ -1263,20 +1315,47 @@ func buildDeltaLocked(n *node, view *subgraph, visiting map[*node]bool, full boo
 			change.removedChildren = append(change.removedChildren, removedChildChange{key: key, attrs: cloneAttrs(removed.attrs)})
 		}
 	}
-	children := orderedChildren(n)
+	children := n.dirtyChildOrder
+	if full {
+		children = orderedChildren(n)
+	}
 	for _, c := range children {
+		if !full {
+			if _, dirty := n.dirtyChildren[c]; !dirty {
+				continue
+			}
+			if _, linked := n.children[c]; !linked {
+				continue
+			}
+		}
 		edgeRev := n.children[c]
 		if edgeRev > base {
 			view.edges[n] = append(view.edges[n], c)
 			change.addedChildren[c.key] = struct{}{}
-			buildDeltaLocked(c, view, visiting, true)
+			buildDeltaLocked(c, view, memo, true)
 			include = true
 			continue
 		}
-		if c.treeRev > c.baseline && buildDeltaLocked(c, view, visiting, false) {
-			view.edges[n] = append(view.edges[n], c)
-			include = true
+		if c.treeRev > c.baseline {
+			if buildDeltaLocked(c, view, memo, false) {
+				view.edges[n] = append(view.edges[n], c)
+				include = true
+			} else if !full {
+				delete(n.dirtyChildren, c)
+			}
+		} else if !full {
+			delete(n.dirtyChildren, c)
 		}
+	}
+	if !full && len(n.dirtyChildOrder) > len(n.dirtyChildren)*2 {
+		write := 0
+		for _, child := range n.dirtyChildOrder {
+			if _, dirty := n.dirtyChildren[child]; dirty {
+				n.dirtyChildOrder[write] = child
+				write++
+			}
+		}
+		n.dirtyChildOrder = n.dirtyChildOrder[:write]
 	}
 	if include {
 		view.changes[n] = change
@@ -1297,7 +1376,8 @@ func newNodeLocked(key uint64, attrs map[reflect.Type]any, rev uint64) *node {
 		id: state.nextID, key: key, attrs: attrs, attrRev: attrRev,
 		removedAttrs: make(map[reflect.Type]uint64), children: make(map[*node]uint64),
 		removedChildren: make(map[uint64]removedChild), parents: make(map[*node]struct{}),
-		selfRev: rev, treeRev: rev, structureRev: rev,
+		dirtyChildren: make(map[*node]struct{}),
+		selfRev:       rev, treeRev: rev, structureRev: rev,
 	}
 }
 
@@ -1438,10 +1518,22 @@ func attributeType[T any]() reflect.Type {
 }
 
 func nextRevisionLocked() uint64 { state.revision++; return state.revision }
+
+func markDirtyChildLocked(parent, child *node) {
+	if _, exists := parent.dirtyChildren[child]; exists {
+		return
+	}
+	parent.dirtyChildren[child] = struct{}{}
+	parent.dirtyChildOrder = append(parent.dirtyChildOrder, child)
+}
+
 func propagateAttributeLocked(n *node, rev uint64) {
 	seen := map[*node]struct{}{}
-	var visit func(*node)
-	visit = func(x *node) {
+	var visit func(*node, *node)
+	visit = func(x, changedChild *node) {
+		if changedChild != nil {
+			markDirtyChildLocked(x, changedChild)
+		}
 		if _, ok := seen[x]; ok {
 			return
 		}
@@ -1463,10 +1555,10 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			x.index.dirtyOrdinals = postingFromSet(x.index.dirtyOrdinals, x.index.dirty)
 		}
 		for p := range x.parents {
-			visit(p)
+			visit(p, x)
 		}
 	}
-	visit(n)
+	visit(n, nil)
 }
 
 func (index *searchIndex) attributesCommitted(n *node, ordinal uint32) bool {
@@ -1490,8 +1582,11 @@ func postingHas(values posting, ordinal uint32) bool {
 
 func propagateStructureLocked(n *node, rev uint64) {
 	seen := map[*node]struct{}{}
-	var visit func(*node)
-	visit = func(x *node) {
+	var visit func(*node, *node)
+	visit = func(x, changedChild *node) {
+		if changedChild != nil {
+			markDirtyChildLocked(x, changedChild)
+		}
 		if _, ok := seen[x]; ok {
 			return
 		}
@@ -1503,10 +1598,10 @@ func propagateStructureLocked(n *node, rev uint64) {
 			x.structureRev = rev
 		}
 		for parent := range x.parents {
-			visit(parent)
+			visit(parent, x)
 		}
 	}
-	visit(n)
+	visit(n, nil)
 }
 
 func updateStructuralIndexesLocked(parent, child *node, linked bool) {
@@ -1595,7 +1690,66 @@ func (index *searchIndex) normalizeEdgeLocked(parent, child *node, linked bool) 
 	}
 }
 
+func (index *searchIndex) commitOverlayLocked() {
+	for _, parent := range index.added {
+		parentOrdinal := index.addedOrdinal[parent]
+		if !index.activeByOrdinal[parentOrdinal] {
+			continue
+		}
+		for _, child := range parent.childOrder {
+			childOrdinal, known := index.nodeOrdinal(child)
+			if !known || !index.activeByOrdinal[childOrdinal] || index.hasOriginalEdge(parent, child) {
+				continue
+			}
+			edge := graphEdge{parent: parent, child: child}
+			index.committedAdded[edge] = struct{}{}
+			delete(index.committedRemoved, edge)
+		}
+	}
+	for edge := range index.addedEdges {
+		if index.hasOriginalEdge(edge.parent, edge.child) {
+			delete(index.committedAdded, edge)
+			delete(index.committedRemoved, edge)
+		} else {
+			index.committedAdded[edge] = struct{}{}
+			delete(index.committedRemoved, edge)
+		}
+	}
+	for edge := range index.removedEdges {
+		if index.hasOriginalEdge(edge.parent, edge.child) {
+			index.committedRemoved[edge] = struct{}{}
+			delete(index.committedAdded, edge)
+		} else {
+			delete(index.committedAdded, edge)
+			delete(index.committedRemoved, edge)
+		}
+	}
+	clear(index.addedEdges)
+	clear(index.removedEdges)
+	clear(index.affected)
+	index.affectedOrdinals = index.affectedOrdinals[:0]
+	index.structureRevision = index.root.structureRev
+	index.overlayRevision = index.root.structureRev
+}
+
+func (index *searchIndex) shouldCompact() bool {
+	total := len(index.nodes) + len(index.added)
+	overlay := len(index.dirty) + len(index.removed) + len(index.added) + len(index.committedAdded) + len(index.committedRemoved)
+	return overlay > 256 && overlay*4 > total
+}
+
 func (index *searchIndex) hasCommittedEdge(parent, child *node) bool {
+	edge := graphEdge{parent: parent, child: child}
+	if _, removed := index.committedRemoved[edge]; removed {
+		return false
+	}
+	if _, added := index.committedAdded[edge]; added {
+		return true
+	}
+	return index.hasOriginalEdge(parent, child)
+}
+
+func (index *searchIndex) hasOriginalEdge(parent, child *node) bool {
 	parentOrdinal, parentOK := index.ordinal[parent]
 	childOrdinal, childOK := index.ordinal[child]
 	if !parentOK || !childOK {
@@ -1927,6 +2081,8 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		activeByOrdinal:   make([]bool, len(nodes)),
 		addedEdges:        make(map[graphEdge]struct{}),
 		removedEdges:      make(map[graphEdge]struct{}),
+		committedAdded:    make(map[graphEdge]struct{}),
+		committedRemoved:  make(map[graphEdge]struct{}),
 	}
 	for ordinal, n := range nodes {
 		if uint64(ordinal) > uint64(^uint32(0)) {
