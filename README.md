@@ -122,6 +122,8 @@ graph.Patch(target, patch, graph.Type[ID]())
 
 The first `Commit` of a root traverses its reachable graph and builds the search index. Later commits consume the propagated change frontier: they advance baselines only along changed paths and fold small search overlays into the existing index. Large or fragmented overlays trigger an automatic full compaction. Baselines belong to nodes rather than roots, so committing a shared node acknowledges that node for every root that reaches it; stale frontiers on other roots are pruned by their next `Delta` or `Commit`.
 
+When a new edge points to an already committed node, `Delta` includes that node's identity but omits its unchanged descendants. `Apply` can therefore connect an existing replica node without retransmitting its committed subtree. Edges to new nodes still include their complete new subgraphs.
+
 ## Performance
 
 `Select`, `Follow`, and `Search` are snapshot operations. After `Commit`, `Search` can use immutable type and value postings and evaluate structural paths backwards through internal parent relations. Conjunctions start with their most selective posting and choose merge or binary intersections according to posting density. Results retain graph traversal order.

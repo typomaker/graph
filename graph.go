@@ -819,7 +819,8 @@ func commitChangedLocked(n *node, revision uint64, full bool, seen map[*node]str
 // Delta returns the registered changed paths from each selected root since its
 // preceding Commit. It does not advance the baseline, so repeated calls return
 // the same changes. Optional matchBy attributes define the stable composite
-// identity Apply must use.
+// identity Apply must use. A new edge to a committed node includes that node's
+// identity without copying its unchanged descendants.
 //
 // For example, this creates a delta whose nodes are identified by EntityID:
 //
@@ -1332,7 +1333,18 @@ func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (
 		if edgeRev > base {
 			view.edges[n] = append(view.edges[n], c)
 			change.addedChildren[c.key] = struct{}{}
-			buildDeltaLocked(c, view, memo, true)
+			if c.baseline == 0 {
+				buildDeltaLocked(c, view, memo, true)
+			} else {
+				buildDeltaLocked(c, view, memo, false)
+				if _, exists := view.changes[c]; !exists {
+					view.changes[c] = nodeChange{
+						attrs:         make(map[reflect.Type]any),
+						addedChildren: make(map[uint64]struct{}),
+						snapshot:      cloneAttrs(c.attrs),
+					}
+				}
+			}
 			include = true
 			continue
 		}

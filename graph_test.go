@@ -200,6 +200,45 @@ func TestDeltaApplyAndCommit(t *testing.T) {
 	}
 }
 
+func TestDeltaNewLinkToCommittedChildIncludesIdentityOnly(t *testing.T) {
+	source := New(kind("world"), ident("world"))
+	actor := New(kind("actor"), ident("actor"))
+	inventory := New(kind("inventory"), ident("inventory"))
+	contains := New(kind("contains"), ident("contains"))
+	item := New(kind("item"), ident("item"))
+	Link(source, actor)
+	Link(actor, inventory)
+	Link(inventory, contains)
+	Link(contains, item)
+	replica := Apply(Graph{}, Delta(source, Type[ident]()))
+	Commit(source)
+
+	focus := New(kind("focus"), ident("focus"))
+	target := New(kind("target"), ident("target"))
+	Link(source, focus)
+	Link(focus, target)
+	Link(target, inventory)
+	delta := Delta(source, Type[ident]())
+
+	if Len(Search(delta, kind("inventory"))) != 1 || !Empty(Search(delta, Or(kind("contains"), kind("item")))) {
+		t.Fatal("delta included the unchanged subtree of a committed child")
+	}
+	deltaTarget := Search(delta, kind("target"))
+	if Len(children(deltaTarget)) != 1 || value[ident](t, children(deltaTarget)) != ident("inventory") {
+		t.Fatal("delta did not include the committed child's identity")
+	}
+
+	Apply(replica, delta)
+	replicaInventory := Search(replica, ident("inventory"))
+	replicaTarget := Search(replica, ident("target"))
+	if Len(replicaInventory) != 1 || Len(children(replicaTarget)) != 1 || first(children(replicaTarget)) != first(replicaInventory) {
+		t.Fatal("apply did not link target to the existing inventory")
+	}
+	if Len(Search(replicaInventory, kind("contains"), Path(kind("item")))) != 1 {
+		t.Fatal("apply did not preserve the existing inventory subtree")
+	}
+}
+
 func TestPatchDeepMerge(t *testing.T) {
 	world := New(ident("world"), name("old"))
 	actor := New(ident("actor"), kind("actor"), health{10, 10})
