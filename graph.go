@@ -6,6 +6,7 @@ import (
 	"iter"
 	"math/bits"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 )
@@ -44,21 +45,30 @@ type searchIndex struct {
 	all               posting
 	byType            map[reflect.Type]posting
 	byValue           map[reflect.Type]map[any]posting
+	byKey             map[uint64]*node
+	sameKey           map[*node]*node
+	compositeIndexes  []cachedCompositeIndex
 	dirty             map[uint32]struct{}
+	dirtyOrdinals     posting
 	overlayRevision   uint64
 	removed           map[uint32]struct{}
+	removedOrdinals   posting
 	affected          map[uint32]struct{}
+	affectedOrdinals  posting
 	added             []*node
 	addedOrdinal      map[*node]uint32
 	addedAll          posting
 	addedByType       map[reflect.Type]posting
 	addedByValue      map[reflect.Type]map[any]posting
 	addedIndexed      bool
-	order             map[*node]uint32
+	orderByOrdinal    []uint32
+	orderIdentity     bool
+	orderOverlayBuilt bool
 	support           map[*node]uint32
 	active            map[*node]struct{}
+	activeByOrdinal   []bool
+	activeAdded       int
 	orderDirty        bool
-	orderOverlayBuilt bool
 	addedEdges        map[graphEdge]struct{}
 	removedEdges      map[graphEdge]struct{}
 }
@@ -70,6 +80,17 @@ type posting []uint32
 type graphEdge struct {
 	parent *node
 	child  *node
+}
+
+type structuralChange struct {
+	parent *node
+	child  *node
+	linked bool
+}
+
+type cachedCompositeIndex struct {
+	types []reflect.Type
+	index *compositeIndex
 }
 
 type subgraph struct {
@@ -551,12 +572,16 @@ func Search(g Graph, values ...any) Graph {
 	defer state.RUnlock()
 	roots := selected(g)
 	if len(roots) == 1 && g.view == nil && validSearchIndex(roots[0]) {
-		matches := roots[0].index.orderMatches(roots[0].index.matchCurrent(condition))
+		index := roots[0].index
+		if out, streamed := index.streamCurrentMatches(condition); streamed {
+			return Graph{nodes: out, index: index}
+		}
+		matches := index.orderMatches(index.matchCurrent(condition))
 		out := make([]*node, len(matches))
 		for i, ordinal := range matches {
-			out[i] = roots[0].index.nodeAt(ordinal)
+			out[i] = index.nodeAt(ordinal)
 		}
-		return Graph{nodes: out, index: roots[0].index}
+		return Graph{nodes: out, index: index}
 	}
 	visited := make(map[*node]struct{})
 	var emitted map[*node]struct{}
@@ -601,6 +626,67 @@ func Search(g Graph, values ...any) Graph {
 	return Graph{nodes: out, view: g.view}
 }
 
+func (index *searchIndex) streamCurrentMatches(condition *predicate) ([]*node, bool) {
+	if !index.orderIdentity || containsPath(condition) || len(index.dirty) == 0 && len(index.removed) == 0 && index.activeAdded == 0 {
+		return nil, false
+	}
+	base := index.match(condition)
+	excluded := unionPostings(index.dirtyOrdinals, index.removedOrdinals)
+	replacements := make(posting, 0, len(index.dirtyOrdinals))
+	for _, ordinal := range index.dirtyOrdinals {
+		if index.activeByOrdinal[ordinal] && matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
+			replacements = append(replacements, ordinal)
+		}
+	}
+	if index.addedIndexed {
+		added := index.matchAdded(condition)
+		if len(base) == 0 && len(excluded) == 0 && len(replacements) == 0 {
+			result := make([]*node, 0, len(added))
+			for _, ordinal := range added {
+				if index.activeByOrdinal[ordinal] {
+					result = append(result, index.nodeAt(ordinal))
+				}
+			}
+			return result, true
+		}
+		replacements = index.appendActiveAdded(replacements, added)
+	} else {
+		for offset, n := range index.added {
+			ordinal := uint32(len(index.nodes) + offset)
+			if index.activeByOrdinal[ordinal] && matchesPredicateLocked(n, condition, nil) {
+				replacements = append(replacements, ordinal)
+			}
+		}
+	}
+	if len(excluded) == 0 && len(replacements) == 0 {
+		result := make([]*node, len(base))
+		for i, ordinal := range base {
+			result[i] = index.nodeAt(ordinal)
+		}
+		return result, true
+	}
+	result := make([]*node, 0, len(base)+len(replacements))
+	for i, removed, replacement := 0, 0, 0; i < len(base) || replacement < len(replacements); {
+		for removed < len(excluded) && i < len(base) && excluded[removed] < base[i] {
+			removed++
+		}
+		for i < len(base) && removed < len(excluded) && base[i] == excluded[removed] {
+			i++
+			removed++
+		}
+		if replacement < len(replacements) && (i == len(base) || replacements[replacement] < base[i]) {
+			result = append(result, index.nodeAt(replacements[replacement]))
+			replacement++
+			continue
+		}
+		if i < len(base) {
+			result = append(result, index.nodeAt(base[i]))
+			i++
+		}
+	}
+	return result, true
+}
+
 func searchWhileRebuildingOrder(g Graph, condition *predicate) (Graph, bool) {
 	state.Lock()
 	defer state.Unlock()
@@ -609,16 +695,28 @@ func searchWhileRebuildingOrder(g Graph, condition *predicate) (Graph, bool) {
 		return Graph{}, false
 	}
 	index := roots[0].index
-	index.order = make(map[*node]uint32, len(index.active))
+	index.orderByOrdinal = make([]uint32, len(index.activeByOrdinal))
+	index.orderIdentity = true
 	seen := make(map[*node]struct{}, len(index.active))
 	out := make([]*node, 0)
+	var previousOrdinal uint32
+	havePreviousOrdinal := false
 	var visit func(*node)
 	visit = func(n *node) {
 		if _, duplicate := seen[n]; duplicate {
 			return
 		}
 		seen[n] = struct{}{}
-		index.order[n] = uint32(len(index.order))
+		position := uint32(len(seen) - 1)
+		ordinal, exists := index.nodeOrdinal(n)
+		if exists {
+			index.orderByOrdinal[ordinal] = position
+			if havePreviousOrdinal && ordinal <= previousOrdinal {
+				index.orderIdentity = false
+			}
+			previousOrdinal = ordinal
+			havePreviousOrdinal = true
+		}
 		if matchesPredicateLocked(n, condition, nil) {
 			out = append(out, n)
 		}
@@ -729,26 +827,48 @@ func Apply(g, delta Graph) Graph {
 	keyTypes := delta.view.matchTypes
 
 	targets := make(map[uint64]*node)
-	targetScope := reachableLocked(selected(g))
+	var targetIndex *searchIndex
+	if roots := selected(g); len(roots) == 1 && validSearchIndex(roots[0]) {
+		targetIndex = roots[0].index
+	}
+	var targetScope []*node
+	if targetIndex == nil {
+		targetScope = reachableLocked(selected(g))
+	}
 	var keyedTargets *compositeIndex
 	if len(keyTypes) == 0 {
-		for _, n := range targetScope {
-			if _, duplicate := targets[n.key]; duplicate {
-				panic("graph: replica contains duplicate node identity")
+		if targetIndex == nil {
+			for _, n := range targetScope {
+				if _, duplicate := targets[n.key]; duplicate {
+					panic("graph: replica contains duplicate node identity")
+				}
+				targets[n.key] = n
 			}
-			targets[n.key] = n
 		}
 	} else {
-		keyedTargets = newCompositeIndex(keyTypes, targetScope)
+		if targetIndex != nil {
+			keyedTargets = targetIndex.compositeIndexLocked(keyTypes)
+		} else {
+			keyedTargets = newCompositeIndex(keyTypes, targetScope)
+		}
 	}
 	deltaNodes := reachableViewLocked(selected(delta), delta.view)
 	matches := make(map[*node]*node, len(deltaNodes))
 	rev := nextRevisionLocked()
 	created := make(map[*node]bool)
+	findTarget := func(key uint64) *node {
+		if target := targets[key]; target != nil {
+			return target
+		}
+		if targetIndex != nil {
+			return targetIndex.activeNodeByKey(key)
+		}
+		return nil
+	}
 	for _, source := range deltaNodes {
 		var target *node
 		if len(keyTypes) == 0 {
-			target = targets[source.key]
+			target = findTarget(source.key)
 		} else {
 			target = keyedTargets.find(delta.view.changes[source].snapshot)
 		}
@@ -775,6 +895,7 @@ func Apply(g, delta Graph) Graph {
 	attributeChanged := make(map[*node]struct{})
 	structureChanged := make(map[*node]struct{})
 	structuralIndexes := make(map[*searchIndex]struct{})
+	structuralChanges := make([]structuralChange, 0)
 	for _, source := range deltaNodes {
 		target := matches[source]
 		change := delta.view.changes[source]
@@ -803,7 +924,7 @@ func Apply(g, delta Graph) Graph {
 		for _, removed := range change.removedChildren {
 			var child *node
 			if len(keyTypes) == 0 {
-				child = targets[removed.key]
+				child = findTarget(removed.key)
 			} else {
 				child = keyedTargets.find(removed.attrs)
 			}
@@ -816,6 +937,7 @@ func Apply(g, delta Graph) Graph {
 				delete(child.parents, parent)
 				parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 				structureChanged[parent] = struct{}{}
+				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child})
 			}
 		}
 		for _, sourceChild := range delta.view.edges[source] {
@@ -832,6 +954,7 @@ func Apply(g, delta Graph) Graph {
 				delete(parent.removedChildren, child.key)
 				child.parents[parent] = struct{}{}
 				structureChanged[parent] = struct{}{}
+				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child, linked: true})
 			}
 		}
 	}
@@ -847,7 +970,10 @@ func Apply(g, delta Graph) Graph {
 		target.selfRev = rev
 	}
 	for index := range structuralIndexes {
-		index.reconcileStructureLocked()
+		for i := len(structuralChanges) - 1; i >= 0; i-- {
+			change := structuralChanges[i]
+			index.updateStructureLocked(change.parent, change.child, change.linked)
+		}
 	}
 	roots := make([]*node, 0, len(selected(delta)))
 	for _, source := range selected(delta) {
@@ -885,7 +1011,12 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 		panic("graph: ordinary patch requires match attributes")
 	}
 	targetRoots := selected(g)
-	targets := newCompositeIndex(keyTypes, reachableLocked(targetRoots))
+	var targets *compositeIndex
+	if len(targetRoots) == 1 && validSearchIndex(targetRoots[0]) {
+		targets = targetRoots[0].index.compositeIndexLocked(keyTypes)
+	} else {
+		targets = newCompositeIndex(keyTypes, reachableLocked(targetRoots))
+	}
 	pairs := make([]mergePair, 0)
 	mapped := make(map[*node]*node)
 	patchNodes := &compositeIndex{types: keyTypes}
@@ -915,6 +1046,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 	attributeChanged := make(map[*node]struct{})
 	structureChanged := make(map[*node]struct{})
 	structuralIndexes := make(map[*searchIndex]struct{})
+	structuralChanges := make([]structuralChange, 0)
 	for _, pair := range pairs {
 		if _, isNew := created[pair.target]; isNew {
 			continue
@@ -943,6 +1075,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			delete(pair.target.removedChildren, targetChild.key)
 			targetChild.parents[pair.target] = struct{}{}
 			structureChanged[pair.target] = struct{}{}
+			structuralChanges = append(structuralChanges, structuralChange{parent: pair.target, child: targetChild, linked: true})
 		}
 	}
 	for target := range attributeChanged {
@@ -957,7 +1090,10 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 		target.selfRev = rev
 	}
 	for index := range structuralIndexes {
-		index.reconcileStructureLocked()
+		for i := len(structuralChanges) - 1; i >= 0; i-- {
+			change := structuralChanges[i]
+			index.updateStructureLocked(change.parent, change.child, change.linked)
+		}
 	}
 	roots := make([]*node, 0, len(selected(patch)))
 	for _, source := range selected(patch) {
@@ -1314,6 +1450,7 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			x.treeRev = rev
 		}
 		if x.index != nil {
+			x.index.invalidateCompositeIndexesLocked(n, rev)
 			if ordinal, exists := x.index.ordinal[n]; exists {
 				if x.index.attributesCommitted(n, ordinal) {
 					delete(x.index.dirty, ordinal)
@@ -1323,6 +1460,7 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			} else if _, exists := x.index.addedOrdinal[n]; exists && x.index.addedIndexed {
 				x.index.rebuildAddedPostingsLocked()
 			}
+			x.index.dirtyOrdinals = postingFromSet(x.index.dirtyOrdinals, x.index.dirty)
 		}
 		for p := range x.parents {
 			visit(p)
@@ -1407,55 +1545,8 @@ func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) 
 	visit(n)
 }
 
-func (index *searchIndex) reconcileStructureLocked() {
-	current := reachableLocked([]*node{index.root})
-	index.support = make(map[*node]uint32, len(current))
-	index.active = make(map[*node]struct{}, len(current))
-	index.removed = make(map[uint32]struct{})
-	index.addedEdges = make(map[graphEdge]struct{})
-	index.removedEdges = make(map[graphEdge]struct{})
-	index.support[index.root] = 1
-	for _, n := range current {
-		index.active[n] = struct{}{}
-		if _, committed := index.ordinal[n]; !committed {
-			if _, known := index.addedOrdinal[n]; !known {
-				ordinal := uint32(len(index.nodes) + len(index.added))
-				index.addedOrdinal[n] = ordinal
-				index.added = append(index.added, n)
-				index.addedAll = append(index.addedAll, ordinal)
-			}
-		}
-		for _, child := range n.childOrder {
-			index.support[child]++
-			if !index.hasCommittedEdge(n, child) {
-				index.addedEdges[graphEdge{parent: n, child: child}] = struct{}{}
-			}
-		}
-	}
-	for ordinal, n := range index.nodes {
-		if _, active := index.active[n]; !active {
-			index.removed[uint32(ordinal)] = struct{}{}
-		}
-		for _, parentOrdinal := range index.parents[ordinal] {
-			parent := index.nodes[parentOrdinal]
-			if _, exists := parent.children[n]; !exists {
-				index.removedEdges[graphEdge{parent: parent, child: n}] = struct{}{}
-			}
-		}
-	}
-	if len(index.added) > addedPostingThreshold {
-		index.rebuildAddedPostingsLocked()
-	}
-	index.rebuildAffectedLocked()
-	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
-		index.resetCommittedOrderLocked()
-	} else {
-		index.orderDirty = true
-	}
-	index.overlayRevision = index.root.structureRev
-}
-
 func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool) {
+	index.compositeIndexes = nil
 	if _, parentActive := index.active[parent]; !parentActive {
 		index.overlayRevision = index.root.structureRev
 		return
@@ -1477,6 +1568,7 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 		}
 	}
 	index.rebuildAffectedLocked()
+	index.removedOrdinals = postingFromSet(index.removedOrdinals, index.removed)
 	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
 		index.resetCommittedOrderLocked()
 	} else {
@@ -1522,24 +1614,20 @@ func (index *searchIndex) rebuildAffectedLocked() {
 	for edge := range index.removedEdges {
 		index.markAffectedAncestorsLocked(edge.parent)
 	}
+	index.affectedOrdinals = postingFromSet(index.affectedOrdinals, index.affected)
 }
 
 func (index *searchIndex) hasActiveAddedNodes() bool {
-	for _, n := range index.added {
-		if _, active := index.active[n]; active {
-			return true
-		}
-	}
-	return false
+	return index.activeAdded != 0
 }
 
 func (index *searchIndex) resetCommittedOrderLocked() {
 	if index.orderOverlayBuilt {
-		index.order = make(map[*node]uint32, len(index.nodes))
-		for ordinal, n := range index.nodes {
-			index.order[n] = uint32(ordinal)
+		for ordinal := range index.nodes {
+			index.orderByOrdinal[ordinal] = uint32(ordinal)
 		}
 	}
+	index.orderIdentity = true
 	index.orderDirty = false
 	index.orderOverlayBuilt = false
 }
@@ -1551,16 +1639,25 @@ func (index *searchIndex) activateLocked(n *node) {
 	index.active[n] = struct{}{}
 	if ordinal, committed := index.ordinal[n]; committed {
 		delete(index.removed, ordinal)
-	} else if _, known := index.addedOrdinal[n]; !known {
-		ordinal := uint32(len(index.nodes) + len(index.added))
-		index.addedOrdinal[n] = ordinal
-		index.added = append(index.added, n)
-		index.addedAll = append(index.addedAll, ordinal)
-		if index.addedIndexed {
-			index.indexAddedNodeLocked(n, ordinal)
-		} else if len(index.added) > addedPostingThreshold {
-			index.rebuildAddedPostingsLocked()
+		index.activeByOrdinal[ordinal] = true
+	} else {
+		ordinal, known := index.addedOrdinal[n]
+		if !known {
+			ordinal = uint32(len(index.nodes) + len(index.added))
+			index.addedOrdinal[n] = ordinal
+			index.added = append(index.added, n)
+			index.addedAll = append(index.addedAll, ordinal)
+			index.activeByOrdinal = append(index.activeByOrdinal, false)
+			index.orderByOrdinal = append(index.orderByOrdinal, 0)
+			index.addKeyNode(n)
+			if index.addedIndexed {
+				index.indexAddedNodeLocked(n, ordinal)
+			} else if len(index.added) > addedPostingThreshold {
+				index.rebuildAddedPostingsLocked()
+			}
 		}
+		index.activeByOrdinal[ordinal] = true
+		index.activeAdded++
 	}
 	for _, child := range n.childOrder {
 		wasInactive := index.support[child] == 0
@@ -1592,6 +1689,71 @@ func (index *searchIndex) indexAddedNodeLocked(n *node, ordinal uint32) {
 	}
 }
 
+func (index *searchIndex) addKeyNode(n *node) {
+	if previous := index.byKey[n.key]; previous != nil {
+		index.sameKey[n] = previous
+	}
+	index.byKey[n.key] = n
+}
+
+func (index *searchIndex) activeNodeByKey(key uint64) *node {
+	var match *node
+	for n := index.byKey[key]; n != nil; n = index.sameKey[n] {
+		ordinal, exists := index.nodeOrdinal(n)
+		if !exists || !index.activeByOrdinal[ordinal] {
+			continue
+		}
+		if match != nil && match != n {
+			panic("graph: replica contains duplicate node identity")
+		}
+		match = n
+	}
+	return match
+}
+
+func (index *searchIndex) compositeIndexLocked(types []reflect.Type) *compositeIndex {
+	for _, cached := range index.compositeIndexes {
+		if sameTypes(cached.types, types) {
+			return cached.index
+		}
+	}
+	result := &compositeIndex{types: append([]reflect.Type(nil), types...)}
+	for n := range index.active {
+		result.add(n)
+	}
+	index.compositeIndexes = append(index.compositeIndexes, cachedCompositeIndex{types: result.types, index: result})
+	return result
+}
+
+func sameTypes(left, right []reflect.Type) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (index *searchIndex) invalidateCompositeIndexesLocked(n *node, rev uint64) {
+	kept := index.compositeIndexes[:0]
+	for _, cached := range index.compositeIndexes {
+		invalid := false
+		for _, typ := range cached.types {
+			if n.attrRev[typ] == rev || n.removedAttrs[typ] == rev {
+				invalid = true
+				break
+			}
+		}
+		if !invalid {
+			kept = append(kept, cached)
+		}
+	}
+	index.compositeIndexes = kept
+}
+
 func (index *searchIndex) deactivateLocked(n *node) {
 	if _, active := index.active[n]; !active {
 		return
@@ -1599,6 +1761,10 @@ func (index *searchIndex) deactivateLocked(n *node) {
 	delete(index.active, n)
 	if ordinal, committed := index.ordinal[n]; committed {
 		index.removed[ordinal] = struct{}{}
+		index.activeByOrdinal[ordinal] = false
+	} else if ordinal, known := index.addedOrdinal[n]; known {
+		index.activeByOrdinal[ordinal] = false
+		index.activeAdded--
 	}
 	for _, child := range n.childOrder {
 		if index.support[child] == 0 {
@@ -1633,9 +1799,21 @@ func (index *searchIndex) markAffectedAncestorsLocked(start *node) {
 
 func (index *searchIndex) rebuildOrderLocked() {
 	current := reachableLocked([]*node{index.root})
-	index.order = make(map[*node]uint32, len(current))
+	index.orderByOrdinal = make([]uint32, len(index.activeByOrdinal))
+	index.orderIdentity = true
+	var previousOrdinal uint32
+	havePreviousOrdinal := false
 	for position, n := range current {
-		index.order[n] = uint32(position)
+		order := uint32(position)
+		ordinal, exists := index.nodeOrdinal(n)
+		if exists {
+			index.orderByOrdinal[ordinal] = order
+			if havePreviousOrdinal && ordinal <= previousOrdinal {
+				index.orderIdentity = false
+			}
+			previousOrdinal = ordinal
+			havePreviousOrdinal = true
+		}
 	}
 	index.orderDirty = false
 	index.orderOverlayBuilt = true
@@ -1735,14 +1913,18 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		all:               make(posting, len(nodes)),
 		byType:            make(map[reflect.Type]posting),
 		byValue:           make(map[reflect.Type]map[any]posting),
+		byKey:             make(map[uint64]*node, len(nodes)),
+		sameKey:           make(map[*node]*node),
 		dirty:             make(map[uint32]struct{}),
 		overlayRevision:   root.structureRev,
 		removed:           make(map[uint32]struct{}),
 		affected:          make(map[uint32]struct{}),
 		addedOrdinal:      make(map[*node]uint32),
-		order:             make(map[*node]uint32, len(nodes)),
+		orderByOrdinal:    make([]uint32, len(nodes)),
+		orderIdentity:     true,
 		support:           make(map[*node]uint32, len(nodes)),
 		active:            make(map[*node]struct{}, len(nodes)),
+		activeByOrdinal:   make([]bool, len(nodes)),
 		addedEdges:        make(map[graphEdge]struct{}),
 		removedEdges:      make(map[graphEdge]struct{}),
 	}
@@ -1753,8 +1935,10 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		id := uint32(ordinal)
 		index.ordinal[n] = id
 		index.all[ordinal] = id
-		index.order[n] = id
+		index.orderByOrdinal[ordinal] = id
 		index.active[n] = struct{}{}
+		index.activeByOrdinal[ordinal] = true
+		index.addKeyNode(n)
 	}
 	for ordinal, n := range nodes {
 		id := uint32(ordinal)
@@ -1775,7 +1959,7 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 				parents = append(parents, id)
 			}
 		}
-		sort.Slice(parents, func(i, j int) bool { return parents[i] < parents[j] })
+		slices.Sort(parents)
 		index.parents[ordinal] = parents
 	}
 	index.support[root] = 1
@@ -1841,7 +2025,7 @@ func (index *searchIndex) match(condition *predicate) posting {
 	case predicatePath:
 		current := index.match(condition.children[len(condition.children)-1])
 		for step := len(condition.children) - 2; step >= 0 && len(current) != 0; step-- {
-			current = intersectPostings(index.parentPosting(current), index.match(condition.children[step]))
+			current = index.parentPostingMatching(current, index.match(condition.children[step]))
 		}
 		return index.parentPosting(current)
 	default:
@@ -1856,11 +2040,21 @@ func (index *searchIndex) matchCurrent(condition *predicate) posting {
 		return base
 	}
 	path := containsPath(condition)
-	affected := index.dirtyPosting(path)
 	if path {
-		affected = unionPostings(affected, postingFromSet(index.affected))
+		if structural {
+			return index.matchOverlay(condition)
+		}
+		affected := index.dirtyPosting(true)
+		current := make(posting, 0, len(affected))
+		for _, ordinal := range affected {
+			if matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
+				current = append(current, ordinal)
+			}
+		}
+		return mergePostingOverlay(base, affected, current)
 	}
-	removed := postingFromSet(index.removed)
+	affected := index.dirtyPosting(path)
+	removed := index.removedOrdinals
 	excluded := unionPostings(affected, removed)
 	current := make(posting, 0, len(affected))
 	for _, ordinal := range affected {
@@ -1872,22 +2066,85 @@ func (index *searchIndex) matchCurrent(condition *predicate) posting {
 		current = index.appendActiveAdded(current, index.matchAdded(condition))
 	} else {
 		for offset, n := range index.added {
-			if _, active := index.active[n]; active && matchesPredicateLocked(n, condition, nil) {
-				current = append(current, uint32(len(index.nodes)+offset))
+			ordinal := uint32(len(index.nodes) + offset)
+			if index.activeByOrdinal[ordinal] && matchesPredicateLocked(n, condition, nil) {
+				current = append(current, ordinal)
 			}
 		}
 	}
 	return mergePostingOverlay(base, excluded, current)
 }
 
+func (index *searchIndex) matchOverlay(condition *predicate) posting {
+	switch condition.op {
+	case predicateMatch, predicateAny:
+		return index.matchAtomicOverlay(condition)
+	case predicateAnd:
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.matchOverlay(child)
+			if len(operands[i]) == 0 {
+				return nil
+			}
+		}
+		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		result := operands[0]
+		for _, operand := range operands[1:] {
+			result = intersectPostings(result, operand)
+		}
+		return result
+	case predicateOr:
+		var result posting
+		for _, child := range condition.children {
+			result = unionPostings(result, index.matchOverlay(child))
+		}
+		return result
+	case predicatePath:
+		current := index.matchOverlay(condition.children[len(condition.children)-1])
+		for step := len(condition.children) - 2; step >= 0 && len(current) != 0; step-- {
+			current = index.currentParentPostingMatching(current, index.matchOverlay(condition.children[step]))
+		}
+		return index.currentParentPostingMatching(current, nil)
+	default:
+		panic("graph: invalid predicate")
+	}
+}
+
+func (index *searchIndex) matchAtomicOverlay(condition *predicate) posting {
+	base := index.match(condition)
+	dirty := index.dirtyOrdinals
+	removed := index.removedOrdinals
+	excluded := unionPostings(dirty, removed)
+	replacements := make(posting, 0, len(dirty))
+	for _, ordinal := range dirty {
+		if index.activeByOrdinal[ordinal] && matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
+			replacements = append(replacements, ordinal)
+		}
+	}
+	if index.addedIndexed {
+		replacements = index.appendActiveAdded(replacements, index.matchAdded(condition))
+	} else {
+		for offset, n := range index.added {
+			ordinal := uint32(len(index.nodes) + offset)
+			if index.activeByOrdinal[ordinal] && matchesPredicateLocked(n, condition, nil) {
+				replacements = append(replacements, ordinal)
+			}
+		}
+	}
+	return mergePostingOverlay(base, excluded, replacements)
+}
+
 func (index *searchIndex) appendActiveAdded(result, values posting) posting {
+	if len(result) == 0 && index.activeAdded == len(index.added) {
+		return values
+	}
 	if available := cap(result) - len(result); available < len(values) {
 		grown := make(posting, len(result), len(result)+len(values))
 		copy(grown, result)
 		result = grown
 	}
 	for _, ordinal := range values {
-		if _, active := index.active[index.nodeAt(ordinal)]; active {
+		if index.activeByOrdinal[ordinal] {
 			result = append(result, ordinal)
 		}
 	}
@@ -1938,23 +2195,18 @@ func (index *searchIndex) matchAdded(condition *predicate) posting {
 	}
 }
 
-func postingFromSet(values map[uint32]struct{}) posting {
-	result := make(posting, 0, len(values))
+func postingFromSet(result posting, values map[uint32]struct{}) posting {
+	result = result[:0]
 	for value := range values {
 		result = append(result, value)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	slices.Sort(result)
 	return result
 }
 
 func (index *searchIndex) dirtyPosting(includeAncestors bool) posting {
 	if !includeAncestors {
-		result := make(posting, 0, len(index.dirty))
-		for ordinal := range index.dirty {
-			result = append(result, ordinal)
-		}
-		sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
-		return result
+		return index.dirtyOrdinals
 	}
 	words := make([]uint64, (len(index.nodes)+63)/64)
 	queue := make([]uint32, 0, len(index.dirty))
@@ -1999,15 +2251,20 @@ func graphSearchIndex(g Graph) *searchIndex {
 }
 
 func (index *searchIndex) postingContains(values posting, n *node) bool {
-	ordinal, exists := index.ordinal[n]
-	if !exists {
-		ordinal, exists = index.addedOrdinal[n]
-	}
+	ordinal, exists := index.nodeOrdinal(n)
 	if !exists {
 		return false
 	}
 	position := sort.Search(len(values), func(i int) bool { return values[i] >= ordinal })
 	return position < len(values) && values[position] == ordinal
+}
+
+func (index *searchIndex) nodeOrdinal(n *node) (uint32, bool) {
+	ordinal, exists := index.ordinal[n]
+	if !exists {
+		ordinal, exists = index.addedOrdinal[n]
+	}
+	return ordinal, exists
 }
 
 func (index *searchIndex) nodeAt(ordinal uint32) *node {
@@ -2021,9 +2278,12 @@ func (index *searchIndex) orderMatches(values posting) posting {
 	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
 		return values
 	}
+	if index.orderIdentity {
+		return values
+	}
 	ordered := true
 	for i := 1; i < len(values); i++ {
-		if index.order[index.nodeAt(values[i-1])] > index.order[index.nodeAt(values[i])] {
+		if index.orderByOrdinal[values[i-1]] > index.orderByOrdinal[values[i]] {
 			ordered = false
 			break
 		}
@@ -2033,14 +2293,41 @@ func (index *searchIndex) orderMatches(values posting) posting {
 	}
 	result := append(posting(nil), values...)
 	sort.Slice(result, func(i, j int) bool {
-		return index.order[index.nodeAt(result[i])] < index.order[index.nodeAt(result[j])]
+		return index.orderByOrdinal[result[i]] < index.orderByOrdinal[result[j]]
 	})
 	return result
 }
 
 func (index *searchIndex) parentPosting(children posting) posting {
+	return index.parentPostingMatching(children, nil)
+}
+
+func (index *searchIndex) parentPostingMatching(children, candidates posting) posting {
 	if len(children) == 0 {
 		return nil
+	}
+	parentCount := 0
+	for _, child := range children {
+		parentCount += len(index.parents[child])
+	}
+	if parentCount <= 64 {
+		result := make(posting, 0, parentCount)
+		for _, child := range children {
+			for _, parent := range index.parents[child] {
+				if candidates == nil || postingHas(candidates, parent) {
+					result = append(result, parent)
+				}
+			}
+		}
+		slices.Sort(result)
+		write := 0
+		for _, ordinal := range result {
+			if write == 0 || result[write-1] != ordinal {
+				result[write] = ordinal
+				write++
+			}
+		}
+		return result[:write]
 	}
 	words := make([]uint64, (len(index.nodes)+63)/64)
 	for _, child := range children {
@@ -2048,9 +2335,12 @@ func (index *searchIndex) parentPosting(children posting) posting {
 			words[parent/64] |= uint64(1) << (parent % 64)
 		}
 	}
-	result := make(posting, 0)
-	for ordinal := range index.nodes {
-		id := uint32(ordinal)
+	values := candidates
+	if values == nil {
+		values = index.all
+	}
+	result := make(posting, 0, min(parentCount, len(values)))
+	for _, id := range values {
 		if words[id/64]&(uint64(1)<<(id%64)) != 0 {
 			result = append(result, id)
 		}
@@ -2058,7 +2348,44 @@ func (index *searchIndex) parentPosting(children posting) posting {
 	return result
 }
 
+func (index *searchIndex) currentParentPostingMatching(children, candidates posting) posting {
+	if len(children) == 0 {
+		return nil
+	}
+	result := make(posting, 0)
+	for _, child := range children {
+		for parent := range index.nodeAt(child).parents {
+			ordinal, exists := index.nodeOrdinal(parent)
+			if !exists || !index.activeByOrdinal[ordinal] || candidates != nil && !postingHas(candidates, ordinal) {
+				continue
+			}
+			result = append(result, ordinal)
+		}
+	}
+	slices.Sort(result)
+	write := 0
+	for _, ordinal := range result {
+		if write == 0 || result[write-1] != ordinal {
+			result[write] = ordinal
+			write++
+		}
+	}
+	return result[:write]
+}
+
 func intersectPostings(left, right posting) posting {
+	if len(left) > len(right) {
+		left, right = right, left
+	}
+	if len(left)*16 < len(right) {
+		result := make(posting, 0, len(left))
+		for _, ordinal := range left {
+			if postingHas(right, ordinal) {
+				result = append(result, ordinal)
+			}
+		}
+		return result
+	}
 	result := make(posting, 0, min(len(left), len(right)))
 	for i, j := 0, 0; i < len(left) && j < len(right); {
 		switch {
@@ -2105,6 +2432,12 @@ func mergePostingOverlay(base, excluded, replacements posting) posting {
 }
 
 func unionPostings(left, right posting) posting {
+	if len(left) == 0 {
+		return right
+	}
+	if len(right) == 0 {
+		return left
+	}
 	result := make(posting, 0, len(left)+len(right))
 	for i, j := 0, 0; i < len(left) || j < len(right); {
 		switch {

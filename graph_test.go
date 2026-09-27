@@ -1,6 +1,9 @@
 package graph
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 type name string
 type kind string
@@ -418,9 +421,6 @@ func TestAddedNodePostingsTrackAttributesAndReachability(t *testing.T) {
 	if Len(Search(root, Or(kind("branch"), ident("a")))) != 2 {
 		t.Fatal("added union postings")
 	}
-	state.Lock()
-	index.reconcileStructureLocked()
-	state.Unlock()
 	func() {
 		defer expectPanic(t)
 		index.matchAdded(predicateFromValue(Path(kind("actor"))))
@@ -444,6 +444,59 @@ func TestAddedNodePostingsTrackAttributesAndReachability(t *testing.T) {
 	Link(root, branch)
 	if Len(Search(root, kind("actor"))) != len(added)-2 {
 		t.Fatal("reactivated added postings were not searchable")
+	}
+}
+
+func TestAddedPathOverlayUsesCurrentReverseEdges(t *testing.T) {
+	root := New(kind("root"))
+	Commit(root)
+	locations := make([]Graph, addedPostingThreshold+1)
+	actors := make([]Graph, len(locations))
+	for i := range locations {
+		locations[i] = New(kind("location"), ident(string(rune('a'+i))))
+		relation := New(kind("contains"))
+		actors[i] = New(kind("actor"), name(string(rune('a'+i))))
+		Link(locations[i], relation)
+		Link(relation, actors[i])
+		Link(root, locations[i])
+	}
+	expression := Path(kind("contains"), And(kind("actor"), name("z")))
+	result := Search(root, kind("location"), expression)
+	if Len(result) != 1 || value[ident](t, result) != "z" {
+		t.Fatal("added path did not use current reverse edges")
+	}
+	relation := Follow(locations[25], Path(kind("contains")))
+	Unlink(relation, actors[25])
+	if !Empty(Search(root, kind("location"), expression)) {
+		t.Fatal("removed added path edge remained indexed")
+	}
+	Link(relation, actors[25])
+	if Len(Search(root, kind("location"), expression)) != 1 {
+		t.Fatal("restored added path edge was not indexed")
+	}
+	Set(root, kind("location"))
+	if Len(Search(root, Or(expression, Path(kind("contains"), And(kind("actor"), name("missing")))))) != 1 {
+		t.Fatal("added path alternatives")
+	}
+	func() {
+		defer expectPanic(t)
+		first(root).index.matchOverlay(&predicate{op: predicateOp(255)})
+	}()
+}
+
+func TestDenseCommittedPathExpansion(t *testing.T) {
+	root := New(kind("root"))
+	for i := 0; i < 100; i++ {
+		location := New(kind("location"))
+		relation := New(kind("contains"))
+		actor := New(kind("actor"))
+		Link(root, location)
+		Link(location, relation)
+		Link(relation, actor)
+	}
+	Commit(root)
+	if Len(Search(root, kind("location"), Path(kind("contains"), kind("actor")))) != 100 {
+		t.Fatal("dense committed path expansion")
 	}
 }
 
@@ -472,9 +525,6 @@ func TestApplyAndPatchKeepCommittedSearchIndex(t *testing.T) {
 	t.Run("patch", func(t *testing.T) {
 		root := New(kind("root"), ident("root"))
 		Commit(root)
-		state.Lock()
-		first(root).index.reconcileStructureLocked()
-		state.Unlock()
 		patch := New(ident("root"))
 		Link(patch, New(kind("actor"), ident("child")))
 		Patch(root, patch, Type[ident]())
@@ -561,6 +611,144 @@ func TestStructuralOverlayMatchesTraversalAcrossMutations(t *testing.T) {
 		assertIndexedSearchEqualsTraversal(t, root, kind("actor"))
 		assertIndexedSearchEqualsTraversal(t, root, Path(kind("actor")))
 	}
+}
+
+func TestAddedPathOverlayMatchesTraversalAcrossMutations(t *testing.T) {
+	root := New(kind("root"))
+	Commit(root)
+	locations := make([]Graph, 40)
+	actors := make([]Graph, len(locations))
+	linked := make([]bool, len(locations))
+	for i := range locations {
+		locations[i] = New(kind("location"), ident(string(rune('a'+i))))
+		relation := New(kind("contains"))
+		actors[i] = New(kind("actor"), name("other"))
+		Link(locations[i], relation)
+		Link(relation, actors[i])
+	}
+
+	seed := uint32(7)
+	for step := 0; step < 160; step++ {
+		seed = seed*1664525 + 1013904223
+		position := int(seed % uint32(len(locations)))
+		if step%3 == 0 {
+			if linked[position] {
+				Unlink(root, locations[position])
+			} else {
+				Link(root, locations[position])
+			}
+			linked[position] = !linked[position]
+		} else if step%2 == 0 {
+			Set(actors[position], name("target"))
+		} else {
+			Set(actors[position], name("other"))
+		}
+		assertIndexedSearchEqualsTraversal(t, root, Type[any]())
+		assertIndexedSearchEqualsTraversal(t, root, kind("location"), Path(kind("contains"), And(kind("actor"), name("target"))))
+	}
+}
+
+func TestPatchCompositeIndexTracksKeyChanges(t *testing.T) {
+	root := New(ident("root"))
+	child := New(ident("old"), name("before"))
+	Link(root, child)
+	Commit(root)
+	Patch(root, New(ident("root")), Type[ident]())
+	Patch(root, New(ident("root")), Type[ident]())
+	if !sameTypes([]reflect.Type{attributeType[ident]()}, []reflect.Type{attributeType[ident]()}) || sameTypes(nil, []reflect.Type{attributeType[ident]()}) || sameTypes([]reflect.Type{attributeType[ident]()}, []reflect.Type{attributeType[name]()}) {
+		t.Fatal("composite index type identity")
+	}
+	Set(child, ident("new"))
+	patch := New(ident("root"))
+	Link(patch, New(ident("new"), name("after")))
+	Patch(root, patch, Type[ident]())
+	if Len(Search(root, ident("new"))) != 1 || value[name](t, child) != "after" {
+		t.Fatal("cached composite index survived a key change")
+	}
+}
+
+func TestApplyUsesCommittedInternalIdentityIndex(t *testing.T) {
+	source := New(kind("root"))
+	child := New(kind("actor"), name("before"))
+	Link(source, child)
+	replica := Apply(Graph{}, Delta(source))
+	Commit(source)
+	Commit(replica)
+	Set(child, name("after"))
+	Apply(replica, Delta(source))
+	result := Search(replica, kind("actor"))
+	if Len(result) != 1 || value[name](t, result) != "after" {
+		t.Fatal("apply did not use committed internal identity")
+	}
+}
+
+func TestIndexedApplyMatchesSourceAcrossMutations(t *testing.T) {
+	source := New(kind("root"), ident("root"))
+	nodes := make([]Graph, 24)
+	linked := make([]bool, len(nodes))
+	for i := range nodes {
+		nodes[i] = New(kind("actor"), ident(string(rune('a'+i))), name("initial"))
+		if i < 12 {
+			Link(source, nodes[i])
+			linked[i] = true
+		}
+	}
+	replica := Apply(Graph{}, Delta(source, Type[ident]()))
+	Commit(source)
+	Commit(replica)
+	seed := uint32(11)
+	for step := 0; step < 100; step++ {
+		seed = seed*1664525 + 1013904223
+		position := int(seed % uint32(len(nodes)))
+		if step%3 == 0 {
+			if linked[position] {
+				Unlink(source, nodes[position])
+			} else {
+				Link(source, nodes[position])
+			}
+			linked[position] = !linked[position]
+		} else {
+			Set(nodes[position], name(string(rune('a'+step%20))))
+		}
+		Apply(replica, Delta(source, Type[ident]()))
+		Commit(source)
+		expected := selected(Search(source, kind("actor")))
+		actual := selected(Search(replica, kind("actor")))
+		if len(expected) != len(actual) {
+			t.Fatalf("step %d: replica length %d, want %d", step, len(actual), len(expected))
+		}
+		expectedNames := make(map[ident]name, len(expected))
+		for _, n := range expected {
+			expectedNames[n.attrs[attributeType[ident]()].(ident)] = n.attrs[attributeType[name]()].(name)
+		}
+		for _, n := range actual {
+			id := n.attrs[attributeType[ident]()].(ident)
+			if expectedNames[id] != n.attrs[attributeType[name]()].(name) {
+				t.Fatalf("step %d: replica node %q differs", step, id)
+			}
+		}
+		if !validSearchIndex(first(replica)) {
+			t.Fatalf("step %d: apply invalidated search index", step)
+		}
+	}
+}
+
+func TestInternalIdentityIndexFiltersReachabilityAndDuplicates(t *testing.T) {
+	root := New(kind("root"))
+	firstChild := New(kind("first"))
+	secondChild := New(kind("second"))
+	first(secondChild).key = first(firstChild).key
+	Link(root, firstChild, secondChild)
+	Commit(root)
+	Unlink(root, secondChild)
+	if first(root).index.activeNodeByKey(first(firstChild).key) != first(firstChild) {
+		t.Fatal("internal identity index did not skip an inactive duplicate")
+	}
+	Link(root, secondChild)
+	func() {
+		defer expectPanic(t)
+		first(root).index.activeNodeByKey(first(firstChild).key)
+	}()
 }
 
 func assertIndexedSearchEqualsTraversal(t *testing.T, root Graph, predicates ...any) {

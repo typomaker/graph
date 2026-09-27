@@ -136,6 +136,21 @@ func BenchmarkPathSearchAttributeOverlay10K(b *testing.B) {
 	}
 }
 
+func BenchmarkPathSearchAdded10K(b *testing.B) {
+	root := New(benchmarkKind("root"))
+	Commit(root)
+	branch := benchmarkPathWorld(10000)
+	Link(root, branch)
+	expression := Path(benchmarkKind("contains"), And(benchmarkKind("actor"), benchmarkID("9999")))
+	Search(root, benchmarkKind("location"), expression)
+	b.ResetTimer()
+	for range b.N {
+		if Len(Search(root, benchmarkKind("location"), expression)) != 1 {
+			b.Fatal()
+		}
+	}
+}
+
 func BenchmarkPathFollowCommitted10K(b *testing.B) {
 	root := benchmarkPathWorld(10000)
 	Commit(root)
@@ -259,6 +274,43 @@ func BenchmarkSearchAfterPatch10K(b *testing.B) {
 		if Len(Search(root, benchmarkKind("actor"))) != 10001 {
 			b.Fatal()
 		}
+	}
+}
+
+func BenchmarkApplyDeltaToCommitted10K(b *testing.B) {
+	source := benchmarkWorld(10000)
+	replica := Apply(Graph{}, Delta(source))
+	Commit(source)
+	Commit(replica)
+	leaf := New(benchmarkKind("actor"), benchmarkID("toggle"))
+	linked := false
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		if linked {
+			Unlink(source, leaf)
+		} else {
+			Link(source, leaf)
+		}
+		changes := Delta(source)
+		Commit(source)
+		linked = !linked
+		b.StartTimer()
+		Apply(replica, changes)
+	}
+}
+
+func BenchmarkPatchAttributeCommitted10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	Set(root, benchmarkID("root"))
+	Commit(root)
+	patches := [2]Graph{
+		New(benchmarkID("root"), benchmarkKind("first")),
+		New(benchmarkID("root"), benchmarkKind("second")),
+	}
+	b.ResetTimer()
+	for i := range b.N {
+		Patch(root, patches[i%2], Type[benchmarkID]())
 	}
 }
 
