@@ -47,6 +47,23 @@ func TestAsRequiresEveryAttributeBeforeWritingDestinations(t *testing.T) {
 	}
 }
 
+func TestAsFiltersSelectionAndReadsFirstResult(t *testing.T) {
+	firstActor := New(actor{}, health{10, 10})
+	secondActor := New(actor{}, health{20, 20})
+	actorWithoutHealth := New(actor{})
+	nonActor := New(health{30, 30})
+	selection := Union(nonActor, firstActor, actorWithoutHealth, secondActor)
+
+	var got health
+	result := As(selection, Type[actor](), &got)
+	if Len(result) != 2 {
+		t.Fatalf("filtered selection length=%d", Len(result))
+	}
+	if first(result) != first(firstActor) || got != (health{10, 10}) {
+		t.Fatal("destination was not read from the first matching node")
+	}
+}
+
 func TestQueryComposesAndAndOr(t *testing.T) {
 	root := New(name("root"))
 	red := New(actor{}, faction("red"))

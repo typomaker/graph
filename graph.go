@@ -185,9 +185,9 @@ func New(value any, values ...any) Graph {
 	return Graph{nodes: []*node{n}}
 }
 
-// As returns the first node when every requested attribute predicate matches.
-// Pointer arguments require the attribute and receive its stored value only
-// after the complete match succeeds.
+// As filters every selected node by the requested attribute predicates.
+// Pointer arguments require the attribute on every result and receive the
+// stored value from the first result only after matching completes.
 //
 // For example, this retrieves a Position attribute and reports whether it was
 // present:
@@ -216,24 +216,39 @@ func As(g Graph, values ...any) Graph {
 	}
 	state.RLock()
 	defer state.RUnlock()
-	n := first(g)
-	if n == nil {
-		return Graph{}
+	var condition *predicate
+	if len(predicates) != 0 {
+		condition = combinePredicates(predicateAnd, predicates)
 	}
-	for i, destination := range destinations {
-		value, ok := n.attrs[destination.typ]
-		if !ok {
-			return Graph{}
+	out := make([]*node, 0, len(selected(g)))
+	hasFirst := false
+	for _, n := range selected(g) {
+		if condition != nil && !matchesPredicateLocked(n, condition) {
+			continue
 		}
-		destinations[i].value = value
+		matches := true
+		for i, destination := range destinations {
+			value, ok := n.attrs[destination.typ]
+			if !ok {
+				matches = false
+				break
+			}
+			if !hasFirst {
+				destinations[i].value = value
+			}
+		}
+		if !matches {
+			continue
+		}
+		out = append(out, n)
+		hasFirst = true
 	}
-	if len(predicates) != 0 && !matchesPredicateLocked(n, combinePredicates(predicateAnd, predicates)) {
-		return Graph{}
+	if hasFirst {
+		for _, destination := range destinations {
+			destination.dest.Elem().Set(reflect.ValueOf(destination.value))
+		}
 	}
-	for _, destination := range destinations {
-		destination.dest.Elem().Set(reflect.ValueOf(destination.value))
-	}
-	return singleton(n, g.view)
+	return Graph{nodes: out, view: g.view}
 }
 
 type request struct {

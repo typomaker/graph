@@ -94,9 +94,10 @@ if !graph.Empty(graph.As(actor, &health)) {
 }
 ```
 
-With multiple arguments, `As` returns the node only when every argument
-matches. Pointer destinations are written only after the complete match
-succeeds, so a failed operation never leaves partial output.
+`As` filters every node in its input selection and returns all nodes for which
+every argument matches. Pointer destinations are required on every returned
+node and receive values from the first result only after matching completes,
+so a failed operation never leaves partial output.
 
 ### Set and remove
 
@@ -189,7 +190,9 @@ both := graph.Intersect(visible, selectable)
 active := graph.Difference(all, disconnected)
 ```
 
-Attribute and structural operations use only the first node of their `Graph` arguments. Use `Each` for explicit bulk updates.
+`As` filters every node in a selection. Mutations and structural operations
+use only the first node of their `Graph` arguments; use `Each` for explicit
+bulk updates.
 
 ## Reactive queries
 
