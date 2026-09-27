@@ -1812,6 +1812,16 @@ func (index *searchIndex) orderMatches(values posting) posting {
 	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
 		return values
 	}
+	ordered := true
+	for i := 1; i < len(values); i++ {
+		if index.order[index.nodeAt(values[i-1])] > index.order[index.nodeAt(values[i])] {
+			ordered = false
+			break
+		}
+	}
+	if ordered {
+		return values
+	}
 	result := append(posting(nil), values...)
 	sort.Slice(result, func(i, j int) bool {
 		return index.order[index.nodeAt(result[i])] < index.order[index.nodeAt(result[j])]
