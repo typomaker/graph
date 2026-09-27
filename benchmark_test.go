@@ -130,6 +130,68 @@ func BenchmarkCommit10K(b *testing.B) {
 	}
 }
 
+func BenchmarkStructuralToggleLeaf10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	leaf := New(benchmarkKind("leaf"))
+	Commit(root)
+	b.ResetTimer()
+	for range b.N {
+		Link(root, leaf)
+		Unlink(root, leaf)
+	}
+}
+
+func BenchmarkStructuralToggleShared10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	parents := Follow(root, Path(Type[any]()))
+	firstParent := Graph{nodes: []*node{selected(parents)[0]}}
+	secondParent := Graph{nodes: []*node{selected(parents)[1]}}
+	shared := New(benchmarkKind("shared"))
+	Link(firstParent, shared)
+	Commit(root)
+	b.ResetTimer()
+	for range b.N {
+		Link(secondParent, shared)
+		Unlink(secondParent, shared)
+	}
+}
+
+func BenchmarkStructuralToggleBranch100Of10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	branch := New(benchmarkKind("branch"))
+	current := branch
+	for range 99 {
+		next := New(benchmarkKind("branch"))
+		Link(current, next)
+		current = next
+	}
+	Commit(root)
+	b.ResetTimer()
+	for range b.N {
+		Link(root, branch)
+		Unlink(root, branch)
+	}
+}
+
+func BenchmarkSearchFirstAfterStructuralChange10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	leaf := New(benchmarkKind("leaf"))
+	Commit(root)
+	linked := false
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		if linked {
+			Unlink(root, leaf)
+		} else {
+			Link(root, leaf)
+		}
+		linked = !linked
+		b.StartTimer()
+		Search(root, benchmarkKind("actor"))
+	}
+}
+
 func benchmarkPathWorld(size int) Graph {
 	root := New(benchmarkKind("world"))
 	for i := 0; i < size; i++ {

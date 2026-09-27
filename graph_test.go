@@ -379,6 +379,30 @@ func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	}
 }
 
+func TestStructuralOverlayCountsReachableParents(t *testing.T) {
+	root := New(kind("root"))
+	left := New(kind("parent"), name("left"))
+	right := New(kind("parent"), name("right"))
+	shared := New(kind("shared"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Commit(root)
+
+	Unlink(left, shared)
+	if Len(Search(root, kind("shared"))) != 1 || first(root).index.support[first(shared)] != 1 {
+		t.Fatal("shared node was removed while it still had an active parent")
+	}
+	Unlink(right, shared)
+	if !Empty(Search(root, kind("shared"))) || first(root).index.support[first(shared)] != 0 {
+		t.Fatal("shared node remained after losing its last active parent")
+	}
+	Link(left, shared)
+	if Len(Search(root, kind("shared"))) != 1 {
+		t.Fatal("shared node was not reactivated")
+	}
+}
+
 func TestSearchCombinesIndexedAndUncommittedRoots(t *testing.T) {
 	committed := New(kind("root"))
 	committedActor := New(kind("actor"), ident("committed"))
@@ -396,5 +420,63 @@ func TestSearchCombinesIndexedAndUncommittedRoots(t *testing.T) {
 	result := Search(Union(committed, uncommitted), kind("actor"))
 	if Len(result) != 3 {
 		t.Fatal("mixed indexed and traversal roots")
+	}
+}
+
+func TestStructuralOverlayMatchesTraversalAcrossMutations(t *testing.T) {
+	root := New(kind("root"))
+	nodes := make([]Graph, 24)
+	for i := range nodes {
+		nodeKind := kind("other")
+		if i%3 == 0 {
+			nodeKind = "actor"
+		}
+		nodes[i] = New(nodeKind, ident(string(rune('a'+i))))
+		if i < 6 {
+			Link(root, nodes[i])
+		}
+	}
+	for i := 0; i < 18; i++ {
+		Link(nodes[i%6], nodes[i+6])
+	}
+	Commit(root)
+
+	seed := uint32(1)
+	for step := 0; step < 80; step++ {
+		seed = seed*1664525 + 1013904223
+		from := int(seed % uint32(len(nodes)-1))
+		seed = seed*1664525 + 1013904223
+		to := from + 1 + int(seed%uint32(len(nodes)-from-1))
+		if step%2 == 0 {
+			Link(nodes[from], nodes[to])
+		} else {
+			Unlink(nodes[from], nodes[to])
+		}
+		assertIndexedSearchEqualsTraversal(t, root, Type[any]())
+		assertIndexedSearchEqualsTraversal(t, root, kind("actor"))
+		assertIndexedSearchEqualsTraversal(t, root, Path(kind("actor")))
+	}
+}
+
+func assertIndexedSearchEqualsTraversal(t *testing.T, root Graph, predicates ...any) {
+	t.Helper()
+	indexed := Search(root, predicates...)
+	state.Lock()
+	n := first(root)
+	saved := n.index
+	n.index = nil
+	state.Unlock()
+	traversed := Search(root, predicates...)
+	state.Lock()
+	n.index = saved
+	state.Unlock()
+	if Len(indexed) != Len(traversed) {
+		t.Fatalf("indexed length %d differs from traversal %d", Len(indexed), Len(traversed))
+	}
+	indexedNodes, traversalNodes := selected(indexed), selected(traversed)
+	for i := range indexedNodes {
+		if indexedNodes[i] != traversalNodes[i] {
+			t.Fatalf("indexed order differs from traversal at %d", i)
+		}
 	}
 }
