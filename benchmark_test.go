@@ -118,7 +118,7 @@ func BenchmarkPathQueryBootstrap10K(b *testing.B) {
 	for range b.N {
 		result, closeQuery := Query(
 			root,
-			Path(Type[benchmarkLocation](), Type[benchmarkContains](), Match(Type[benchmarkKind](), benchmarkID(5_000))),
+			Path(Type[benchmarkLocation](), Type[benchmarkContains](), And(Type[benchmarkKind](), benchmarkID(5_000))),
 		)
 		if Len(result) != 1 {
 			b.Fatal("unexpected path query result")
@@ -131,7 +131,7 @@ func BenchmarkPathQueryAttributeUpdate10K(b *testing.B) {
 	root, _, _, actors := benchmarkPathWorld(10_000)
 	result, closeQuery := Query(
 		root,
-		Path(Type[benchmarkLocation](), Type[benchmarkContains](), Match(Type[benchmarkKind](), benchmarkID(5_000))),
+		Path(Type[benchmarkLocation](), Type[benchmarkContains](), And(Type[benchmarkKind](), benchmarkID(5_000))),
 	)
 	defer closeQuery()
 	target := actors[5_000]
@@ -149,7 +149,7 @@ func BenchmarkPathQueryLinkUpdate10K(b *testing.B) {
 	root, _, contains, actors := benchmarkPathWorld(10_000)
 	result, closeQuery := Query(
 		root,
-		Path(Type[benchmarkLocation](), Type[benchmarkContains](), Match(Type[benchmarkKind](), benchmarkID(5_000))),
+		Path(Type[benchmarkLocation](), Type[benchmarkContains](), And(Type[benchmarkKind](), benchmarkID(5_000))),
 	)
 	defer closeQuery()
 	parent := contains[5_000]

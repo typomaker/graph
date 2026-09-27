@@ -234,7 +234,7 @@ defer closePlayer()
 ### Structural path queries
 
 `Path` matches a chain of nodes connected by immediate outgoing relations and
-returns the node matching its first step. Use `Match` to require multiple
+returns the node matching its first step. Use `And` to require multiple
 attributes on one step:
 
 ```go
@@ -246,7 +246,7 @@ locations, closeLocations := graph.Query(
 	graph.Path(
 		graph.Type[Location](),
 		graph.Type[Contains](),
-		graph.Match(
+		graph.And(
 			graph.Type[Actor](),
 			ID("actor-1"),
 		),

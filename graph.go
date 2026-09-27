@@ -76,7 +76,7 @@ type matcher struct {
 	any   bool
 }
 
-type matchExpression struct {
+type andExpression struct {
 	matchers []matcher
 }
 
@@ -118,13 +118,13 @@ func Type[T any]() any {
 	return typeMatcher{typ: normalizeType(t)}
 }
 
-// Match groups attribute matchers that must all match the same node in a Path.
+// And groups attribute matchers that must all match the same node in a Path.
 //
 // For example, this path step matches an Actor having a specific ID:
 //
-//	Match(Type[Actor](), ID("actor-1"))
-func Match(values ...any) any {
-	return matchExpression{matchers: queryMatchers(values)}
+//	And(Type[Actor](), ID("actor-1"))
+func And(values ...any) any {
+	return andExpression{matchers: queryMatchers(values)}
 }
 
 // Path creates a structural matcher whose steps must be connected by
@@ -137,7 +137,7 @@ func Match(values ...any) any {
 //	Path(
 //		Type[Location](),
 //		Type[Contains](),
-//		Match(Type[Actor](), ID("actor-1")),
+//		And(Type[Actor](), ID("actor-1")),
 //	)
 func Path(values ...any) any {
 	if len(values) == 0 {
@@ -145,7 +145,7 @@ func Path(values ...any) any {
 	}
 	steps := make([][]matcher, len(values))
 	for i, value := range values {
-		if group, ok := value.(matchExpression); ok {
+		if group, ok := value.(andExpression); ok {
 			steps[i] = append([]matcher(nil), group.matchers...)
 			continue
 		}
@@ -1200,7 +1200,7 @@ func queryMatchers(values []any) []matcher {
 func queryCriteria(values []any) ([]matcher, [][]matcher) {
 	if len(values) == 1 {
 		switch expression := values[0].(type) {
-		case matchExpression:
+		case andExpression:
 			return append([]matcher(nil), expression.matchers...), nil
 		case pathExpression:
 			path := make([][]matcher, len(expression.steps))
@@ -1212,8 +1212,8 @@ func queryCriteria(values []any) ([]matcher, [][]matcher) {
 	}
 	for _, value := range values {
 		switch value.(type) {
-		case matchExpression, pathExpression:
-			panic("graph: Match and Path must be a single query expression")
+		case andExpression, pathExpression:
+			panic("graph: And and Path must be a single query expression")
 		}
 	}
 	return queryMatchers(values), nil

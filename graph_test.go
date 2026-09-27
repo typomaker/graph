@@ -133,7 +133,7 @@ func TestPathQueryMatchesImmediateStructuralChain(t *testing.T) {
 		Path(
 			Type[location](),
 			Type[contains](),
-			Match(Type[actor](), entityID("actor-1")),
+			And(Type[actor](), entityID("actor-1")),
 		),
 	)
 	defer closeLocations()
@@ -162,7 +162,7 @@ func TestPathQueryTracksAttributeAndRelationChanges(t *testing.T) {
 
 	locations, closeLocations := Query(
 		world,
-		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
 	)
 	if !Empty(locations) {
 		t.Fatal("path query matched the wrong endpoint")
@@ -200,12 +200,12 @@ func TestPathQueryTracksAttributeAndRelationChanges(t *testing.T) {
 	}
 }
 
-func TestPathAndMatchValidationPanics(t *testing.T) {
+func TestPathExpressionValidationPanics(t *testing.T) {
 	tests := []struct {
 		name string
 		fn   func()
 	}{
-		{"empty match", func() { Match() }},
+		{"empty and", func() { And() }},
 		{"empty path", func() { Path() }},
 		{"nested path", func() { Path(Path(Type[actor]())) }},
 		{"mixed query expression", func() { Query(New(actor{}), Path(Type[actor]()), Type[actor]()) }},
@@ -222,15 +222,15 @@ func TestPathAndMatchValidationPanics(t *testing.T) {
 	}
 }
 
-func TestMatchCanGroupAWholeQuery(t *testing.T) {
+func TestAndCanGroupAWholeQuery(t *testing.T) {
 	root := New(name("root"))
 	target := New(actor{}, entityID("actor-1"))
 	Link(root, target)
 
-	result, closeResult := Query(root, Match(Type[actor](), entityID("actor-1")))
+	result, closeResult := Query(root, And(Type[actor](), entityID("actor-1")))
 	defer closeResult()
 	if Len(result) != 1 || first(result) != first(target) {
-		t.Fatal("top-level match did not preserve query semantics")
+		t.Fatal("top-level and did not preserve query semantics")
 	}
 
 	Set(target, health{Current: 1, Max: 1})
@@ -292,7 +292,7 @@ func TestPathQueryCountsMultipleSupportingChildren(t *testing.T) {
 
 	locations, closeLocations := Query(
 		world,
-		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
 	)
 	defer closeLocations()
 	if Len(locations) != 1 {
@@ -319,7 +319,7 @@ func TestPathQueryIndexesNewlyReachableSubtree(t *testing.T) {
 
 	locations, closeLocations := Query(
 		world,
-		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
 	)
 	defer closeLocations()
 	if !Empty(locations) {
@@ -345,7 +345,7 @@ func TestPathQueryLinksAlreadyReachableNodes(t *testing.T) {
 
 	locations, closeLocations := Query(
 		world,
-		Path(Type[location](), Type[contains](), Match(Type[actor](), entityID("actor-1"))),
+		Path(Type[location](), Type[contains](), And(Type[actor](), entityID("actor-1"))),
 	)
 	defer closeLocations()
 
