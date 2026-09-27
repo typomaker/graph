@@ -7,6 +7,7 @@ type health struct{ Current, Max int }
 type name string
 type entityID string
 type entityKind string
+type faction string
 
 type location struct{}
 type contains struct{}
@@ -14,11 +15,11 @@ type contains struct{}
 func TestAttributesAndSelections(t *testing.T) {
 	a := New(actor{}, health{10, 10})
 	b := New(actor{}, health{5, 10})
-	if Len(Merge(a, b, a)) != 2 {
+	if Len(Union(a, b, a)) != 2 {
 		t.Fatal("merge")
 	}
 	var h health
-	if Empty(Get(a, &h)) || h.Current != 10 {
+	if Empty(As(a, &h)) || h.Current != 10 {
 		t.Fatal("get")
 	}
 	if !Empty(Set(a, health{10, 10})) {
@@ -27,8 +28,45 @@ func TestAttributesAndSelections(t *testing.T) {
 	if Empty(Set(a, health{9, 10})) {
 		t.Fatal("set did not change")
 	}
-	if Empty(Unset(a, Type[health]())) || !Empty(Get(a, Type[health]())) {
+	if Empty(Unset(a, Type[health]())) || !Empty(As(a, Type[health]())) {
 		t.Fatal("unset")
+	}
+}
+
+func TestAsRequiresEveryAttributeBeforeWritingDestinations(t *testing.T) {
+	n := New(actor{}, health{10, 10})
+	got := health{99, 99}
+	if !Empty(As(n, Type[actor](), name("missing"), &got)) {
+		t.Fatal("as matched when one predicate failed")
+	}
+	if got != (health{99, 99}) {
+		t.Fatal("failed as partially wrote a destination")
+	}
+	if Empty(As(n, Type[actor](), health{10, 10}, &got)) || got != (health{10, 10}) {
+		t.Fatal("successful as did not write its destination")
+	}
+}
+
+func TestQueryComposesAndAndOr(t *testing.T) {
+	root := New(name("root"))
+	red := New(actor{}, faction("red"))
+	blue := New(actor{}, faction("blue"))
+	neutral := New(actor{}, faction("neutral"))
+	nonActor := New(faction("red"))
+	Link(root, red, blue, neutral, nonActor)
+
+	result, closeResult := Query(root, And(
+		Type[actor](),
+		Or(faction("red"), faction("blue")),
+	))
+	defer closeResult()
+	if Len(result) != 2 {
+		t.Fatalf("nested and/or length=%d", Len(result))
+	}
+
+	Set(neutral, faction("red"))
+	if Len(result) != 3 {
+		t.Fatal("nested or did not react to an attribute update")
 	}
 }
 
@@ -141,6 +179,18 @@ func TestPathQueryMatchesImmediateStructuralChain(t *testing.T) {
 	if Len(locations) != 1 || first(locations) != first(firstLocation) {
 		t.Fatal("path query did not return the matching path start")
 	}
+	eitherLocations, closeEitherLocations := Query(
+		world,
+		Path(
+			Type[location](),
+			Type[contains](),
+			And(Type[actor](), Or(entityID("actor-1"), entityID("actor-2"))),
+		),
+	)
+	defer closeEitherLocations()
+	if Len(eitherLocations) != 2 {
+		t.Fatal("path query did not compose and/or at one level")
+	}
 
 	intermediate := New(name("intermediate"))
 	Unlink(firstContains, target)
@@ -206,6 +256,7 @@ func TestPathExpressionValidationPanics(t *testing.T) {
 		fn   func()
 	}{
 		{"empty and", func() { And() }},
+		{"empty or", func() { Or() }},
 		{"empty path", func() { Path() }},
 		{"nested path", func() { Path(Path(Type[actor]())) }},
 		{"mixed query expression", func() { Query(New(actor{}), Path(Type[actor]()), Type[actor]()) }},
@@ -371,7 +422,7 @@ func TestDetachedNodeRemainsUsableAndCanBeRelinked(t *testing.T) {
 	if !Empty(result) {
 		t.Fatal("detached node remained in parent query")
 	}
-	if Empty(Get(child, Type[actor]())) {
+	if Empty(As(child, Type[actor]())) {
 		t.Fatal("user-held detached node became invalid")
 	}
 	detachedResult, closeDetached := Query(child, Type[actor]())
@@ -399,7 +450,7 @@ func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
 		t.Fatal("initial delta did not reproduce the graph")
 	}
 	var got health
-	if Empty(Get(replica, &got)) || got != (health{10, 10}) {
+	if Empty(As(replica, &got)) || got != (health{10, 10}) {
 		t.Fatal("initial attributes were not applied")
 	}
 
@@ -422,7 +473,7 @@ func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
 	if Len(updated) != 1 {
 		t.Fatal("updated roots")
 	}
-	if Empty(Get(replica, &got)) || got != (health{7, 10}) {
+	if Empty(As(replica, &got)) || got != (health{7, 10}) {
 		t.Fatal("changed attribute was not applied")
 	}
 	children := At(replica)
@@ -432,7 +483,7 @@ func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
 	var oldActor, replicatedNewActor Graph
 	for child := range Each(children) {
 		var childName name
-		Get(child, &childName)
+		As(child, &childName)
 		switch childName {
 		case "actor":
 			oldActor = child
@@ -440,10 +491,10 @@ func TestApplyBootstrapsAndUpdatesReplica(t *testing.T) {
 			replicatedNewActor = child
 		}
 	}
-	if !Empty(Get(oldActor, Type[actor]())) || !Empty(At(oldActor)) {
+	if !Empty(As(oldActor, Type[actor]())) || !Empty(At(oldActor)) {
 		t.Fatal("attribute or edge removal was not applied")
 	}
-	if Empty(Get(replicatedNewActor, Type[actor]())) || Len(At(replicatedNewActor)) != 1 {
+	if Empty(As(replicatedNewActor, Type[actor]())) || Len(At(replicatedNewActor)) != 1 {
 		t.Fatal("new subtree was not applied")
 	}
 	if Len(replicaActors) != 1 {
@@ -460,6 +511,16 @@ func TestApplyRejectsNonDelta(t *testing.T) {
 	Apply(New(name("target")), New(name("not a delta")))
 }
 
+func TestPatchRejectsDelta(t *testing.T) {
+	delta := Delta(New(name("source")))
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic")
+		}
+	}()
+	Patch(New(name("target")), delta, Type[name]())
+}
+
 func TestSelectionOperationsAndNavigation(t *testing.T) {
 	a := New(name("a"))
 	b := New(name("b"))
@@ -468,14 +529,14 @@ func TestSelectionOperationsAndNavigation(t *testing.T) {
 	if Len(At(a, c, b, c, Graph{})) != 2 {
 		t.Fatal("filtered children")
 	}
-	if Len(Include(Merge(a, b, c), Merge(c, a), Merge(a, c))) != 2 {
+	if Len(Intersect(Union(a, b, c), Union(c, a), Union(a, c))) != 2 {
 		t.Fatal("intersection")
 	}
-	if !Empty(Include()) || Len(Exclude(Merge(a, b, c), b, c)) != 1 || !Empty(Exclude()) {
+	if !Empty(Intersect()) || Len(Difference(Union(a, b, c), b, c)) != 1 || !Empty(Difference()) {
 		t.Fatal("empty or difference")
 	}
 	count := 0
-	for range Each(Merge(a, b)) {
+	for range Each(Union(a, b)) {
 		count++
 		break
 	}
@@ -500,11 +561,11 @@ func TestAttributeValidationPanics(t *testing.T) {
 		{"pointer attribute", func() { value := name("x"); New(&value) }},
 		{"non-comparable attribute", func() { New([]int{1}) }},
 		{"duplicate attribute", func() { New(name("x"), name("y")) }},
-		{"get without requests", func() { Get(New(name("x"))) }},
-		{"nil request", func() { Get(New(name("x")), nil) }},
-		{"nil destination", func() { var value *name; Get(New(name("x")), value) }},
-		{"non-comparable request", func() { Get(New(name("x")), []int{1}) }},
-		{"duplicate request", func() { Get(New(name("x")), name("x"), Type[name]()) }},
+		{"as without requests", func() { As(New(name("x"))) }},
+		{"nil request", func() { As(New(name("x")), nil) }},
+		{"nil destination", func() { var value *name; As(New(name("x")), value) }},
+		{"non-comparable request", func() { As(New(name("x")), []int{1}) }},
+		{"duplicate destination", func() { var first, second name; As(New(name("x")), &first, &second) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -525,7 +586,7 @@ func TestApplyEmptyDeltaIsNoOp(t *testing.T) {
 	}
 }
 
-func TestApplyDeepMergesOrdinaryGraphByCompositeKey(t *testing.T) {
+func TestPatchDeepMergesGraphByCompositeKey(t *testing.T) {
 	world := New(name("world"), health{100, 100})
 	actorOne := New(entityKind("actor"), entityID("one"), name("old"), health{10, 10})
 	itemOne := New(entityKind("item"), entityID("one"), name("sword"))
@@ -540,15 +601,15 @@ func TestApplyDeepMergesOrdinaryGraphByCompositeKey(t *testing.T) {
 	Link(newActorPatch, nestedItemPatch)
 	Link(patch, actorPatch, newActorPatch)
 
-	result := Apply(world, patch, Type[entityKind](), Type[entityID]())
+	result := Patch(world, patch, Type[entityKind](), Type[entityID]())
 	if Len(result) != 1 || Len(At(world)) != 3 {
 		t.Fatal("ordinary patch structure was not merged")
 	}
 	var worldName name
 	var actorName name
 	var retainedHealth health
-	Get(world, &worldName)
-	Get(actorOne, &actorName, &retainedHealth)
+	As(world, &worldName)
+	As(actorOne, &actorName, &retainedHealth)
 	if worldName != "patched world" || actorName != "new" || retainedHealth != (health{10, 10}) {
 		t.Fatal("attributes were not deeply merged")
 	}
@@ -562,7 +623,7 @@ func TestApplyDeepMergesOrdinaryGraphByCompositeKey(t *testing.T) {
 	for child := range Each(At(world)) {
 		var kind entityKind
 		var id entityID
-		Get(child, &kind, &id)
+		As(child, &kind, &id)
 		if kind == "actor" && id == "two" {
 			added = child
 		}
@@ -572,7 +633,7 @@ func TestApplyDeepMergesOrdinaryGraphByCompositeKey(t *testing.T) {
 	}
 }
 
-func TestApplyOrdinaryGraphMatchesNodesGlobally(t *testing.T) {
+func TestPatchMatchesNodesGlobally(t *testing.T) {
 	world := New(entityID("world"))
 	actor := New(entityID("actor"), entityKind("actor"))
 	skill := New(entityID("sprint"), entityKind("skill"), name("old"))
@@ -590,14 +651,14 @@ func TestApplyOrdinaryGraphMatchesNodesGlobally(t *testing.T) {
 	updatedSkills, closeUpdatedSkills := Query(world, name("updated"))
 	defer closeUpdatedSkills()
 
-	result := Apply(world, patchActor, Type[entityID]())
+	result := Patch(world, patchActor, Type[entityID]())
 	if first(result) != first(actor) {
 		t.Fatal("patch root was not matched globally")
 	}
 	var targetPerform Graph
 	for child := range Each(At(actor)) {
 		var id entityID
-		Get(child, &id)
+		As(child, &id)
 		if id == "perform" {
 			targetPerform = child
 		}
@@ -609,19 +670,19 @@ func TestApplyOrdinaryGraphMatchesNodesGlobally(t *testing.T) {
 		t.Fatal("patch created a duplicate node")
 	}
 	var skillName name
-	Get(skill, &skillName)
+	As(skill, &skillName)
 	if skillName != "updated" || Len(updatedSkills) != 1 {
 		t.Fatal("matched node attributes or live query were not updated")
 	}
 
 	Commit(world)
-	Apply(world, patchActor, Type[entityID]())
+	Patch(world, patchActor, Type[entityID]())
 	if !Empty(Delta(world)) || Len(At(actor)) != 2 || Len(At(targetPerform)) != 1 {
 		t.Fatal("reapplying the same patch was not a no-op")
 	}
 }
 
-func TestApplyOrdinaryGraphValidatesMatchKeys(t *testing.T) {
+func TestPatchValidatesMatchKeys(t *testing.T) {
 	tests := []struct {
 		name  string
 		world Graph
@@ -653,7 +714,7 @@ func TestApplyOrdinaryGraphValidatesMatchKeys(t *testing.T) {
 					t.Fatal("expected panic")
 				}
 			}()
-			Apply(tt.world, tt.patch, Type[entityID]())
+			Patch(tt.world, tt.patch, Type[entityID]())
 		})
 	}
 }
@@ -676,10 +737,10 @@ func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.
 	sourceAdded := New(entityKind("item"), entityID("new"), name("new item"))
 	Link(source, sourceAdded)
 	delta := Delta(source, keys...)
-	Apply(target, delta, keys...)
+	Apply(target, delta)
 
 	var got health
-	Get(targetActor, &got)
+	As(targetActor, &got)
 	if got != (health{8, 10}) {
 		t.Fatal("independent replica node was not matched")
 	}
@@ -689,23 +750,12 @@ func TestCommitAndApplyUseCompositeIdentityAcrossIndependentReplicas(t *testing.
 	var foundAdded bool
 	for child := range Each(At(target)) {
 		var id entityID
-		Get(child, &id)
+		As(child, &id)
 		foundAdded = foundAdded || id == "new"
 	}
 	if !foundAdded {
 		t.Fatal("keyed added node was not applied")
 	}
-}
-
-func TestApplyRejectsDeltaIdentityMismatch(t *testing.T) {
-	source := New(entityID("root"))
-	delta := Delta(source, Type[entityID]())
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-	Apply(New(entityID("root")), delta)
 }
 
 func TestCommitRecursivelyAdvancesNodeBaselines(t *testing.T) {
@@ -716,7 +766,7 @@ func TestCommitRecursivelyAdvancesNodeBaselines(t *testing.T) {
 	Link(root, branch)
 	Link(branch, shared)
 	Link(otherRoot, shared)
-	Commit(Merge(root, otherRoot))
+	Commit(Union(root, otherRoot))
 
 	Set(shared, health{9, 10})
 	if Empty(Delta(root)) || Empty(Delta(branch)) || Empty(Delta(otherRoot)) {

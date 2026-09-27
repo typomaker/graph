@@ -76,23 +76,33 @@ type matcher struct {
 	any   bool
 }
 
-type andExpression struct {
-	matchers []matcher
+type predicateOp uint8
+
+const (
+	predicateMatch predicateOp = iota
+	predicateAnd
+	predicateOr
+)
+
+type predicate struct {
+	op       predicateOp
+	matcher  matcher
+	children []*predicate
 }
 
-type pathExpression struct {
-	steps [][]matcher
-}
+type predicateExpression struct{ predicate *predicate }
+
+type pathExpression struct{ steps []*predicate }
 
 type pathLevel struct {
-	matchers []matcher
-	active   map[*node]struct{}
-	support  map[*node]uint32
+	predicate *predicate
+	active    map[*node]struct{}
+	support   map[*node]uint32
 }
 
 type query struct {
 	roots     []*node
-	matchers  []matcher
+	predicate *predicate
 	path      []pathLevel
 	result    *selection
 	listeners map[*selection]struct{}
@@ -118,13 +128,22 @@ func Type[T any]() any {
 	return typeMatcher{typ: normalizeType(t)}
 }
 
-// And groups attribute matchers that must all match the same node in a Path.
+// And groups predicates that must all match the same node.
 //
 // For example, this path step matches an Actor having a specific ID:
 //
 //	And(Type[Actor](), ID("actor-1"))
 func And(values ...any) any {
-	return andExpression{matchers: queryMatchers(values)}
+	return predicateExpression{predicate: buildPredicate(predicateAnd, values)}
+}
+
+// Or groups predicates when at least one must match the same node.
+//
+// For example, this matches either faction:
+//
+//	Or(Faction("red"), Faction("blue"))
+func Or(values ...any) any {
+	return predicateExpression{predicate: buildPredicate(predicateOr, values)}
 }
 
 // Path creates a structural matcher whose steps must be connected by
@@ -143,13 +162,9 @@ func Path(values ...any) any {
 	if len(values) == 0 {
 		panic("graph: path requires at least one step")
 	}
-	steps := make([][]matcher, len(values))
+	steps := make([]*predicate, len(values))
 	for i, value := range values {
-		if group, ok := value.(andExpression); ok {
-			steps[i] = append([]matcher(nil), group.matchers...)
-			continue
-		}
-		steps[i] = queryMatchers([]any{value})
+		steps[i] = predicateFromValue(value)
 	}
 	return pathExpression{steps: steps}
 }
@@ -170,39 +185,55 @@ func New(value any, values ...any) Graph {
 	return Graph{nodes: []*node{n}}
 }
 
-// Get returns the first node when at least one requested attribute matches.
-// Pointer arguments receive the stored value when present.
+// As returns the first node when every requested attribute predicate matches.
+// Pointer arguments require the attribute and receive its stored value only
+// after the complete match succeeds.
 //
 // For example, this retrieves a Position attribute and reports whether it was
 // present:
 //
 //	var position Position
-//	found := !Empty(Get(player, &position))
-func Get(g Graph, values ...any) Graph {
-	requests := inspectRequests(values, true)
+//	found := !Empty(As(player, Type[Player](), &position))
+func As(g Graph, values ...any) Graph {
+	if len(values) == 0 {
+		panic("graph: at least one attribute request is required")
+	}
+	predicates := make([]*predicate, 0, len(values))
+	destinations := make([]request, 0, len(values))
+	destinationTypes := make(map[reflect.Type]struct{})
+	for _, value := range values {
+		rv := reflect.ValueOf(value)
+		if value != nil && rv.Kind() == reflect.Pointer {
+			request := inspectRequests([]any{value}, true)[0]
+			if _, duplicate := destinationTypes[request.typ]; duplicate {
+				panic("graph: duplicate attribute destination " + request.typ.String())
+			}
+			destinationTypes[request.typ] = struct{}{}
+			destinations = append(destinations, request)
+			continue
+		}
+		predicates = append(predicates, predicateFromValue(value))
+	}
 	state.RLock()
 	defer state.RUnlock()
 	n := first(g)
 	if n == nil {
 		return Graph{}
 	}
-	matched := false
-	for _, r := range requests {
-		v, ok := n.attrs[r.typ]
+	for i, destination := range destinations {
+		value, ok := n.attrs[destination.typ]
 		if !ok {
-			continue
+			return Graph{}
 		}
-		if r.dest.IsValid() {
-			r.dest.Elem().Set(reflect.ValueOf(v))
-			matched = true
-		} else if r.any || v == r.value {
-			matched = true
-		}
+		destinations[i].value = value
 	}
-	if matched {
-		return singleton(n, g.view)
+	if len(predicates) != 0 && !matchesPredicateLocked(n, combinePredicates(predicateAnd, predicates)) {
+		return Graph{}
 	}
-	return Graph{}
+	for _, destination := range destinations {
+		destination.dest.Elem().Set(reflect.ValueOf(destination.value))
+	}
+	return singleton(n, g.view)
 }
 
 type request struct {
@@ -440,18 +471,18 @@ func Len(g Graph) int { state.RLock(); defer state.RUnlock(); return len(selecte
 //
 // For example:
 //
-//	if Empty(Get(player, Type[Position]())) {
+//	if Empty(As(player, Type[Position]())) {
 //		Set(player, Position{})
 //	}
 func Empty(g Graph) bool { return Len(g) == 0 }
 
-// Merge returns the ordered union of all selections.
+// Union returns the ordered union of all selections.
 //
 // For example, duplicates are removed while the first occurrence order is
 // retained:
 //
-//	all := Merge(firstSelection, secondSelection, firstSelection)
-func Merge(graphs ...Graph) Graph {
+//	all := Union(firstSelection, secondSelection, firstSelection)
+func Union(graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	out := []*node{}
@@ -467,12 +498,12 @@ func Merge(graphs ...Graph) Graph {
 	return Graph{nodes: out}
 }
 
-// Include returns the intersection of all selections in first-selection order.
+// Intersect returns the intersection of all selections in first-selection order.
 //
 // For example, this keeps nodes present in both selections:
 //
-//	visiblePlayers := Include(players, visible)
-func Include(graphs ...Graph) Graph {
+//	visiblePlayers := Intersect(players, visible)
+func Intersect(graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	if len(graphs) == 0 {
@@ -503,12 +534,12 @@ func Include(graphs ...Graph) Graph {
 	return Graph{nodes: out}
 }
 
-// Exclude subtracts every later selection from the first.
+// Difference subtracts every later selection from the first.
 //
 // For example, this selects players that are not hidden or disconnected:
 //
-//	activePlayers := Exclude(players, hidden, disconnected)
-func Exclude(graphs ...Graph) Graph {
+//	activePlayers := Difference(players, hidden, disconnected)
+func Difference(graphs ...Graph) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	if len(graphs) == 0 {
@@ -544,12 +575,12 @@ func Exclude(graphs ...Graph) Graph {
 //	players, closePlayers := Query(root, Type[Player](), Type[Position]())
 //	defer closePlayers()
 func Query(g Graph, values ...any) (Graph, func()) {
-	ms, pathMatchers := queryCriteria(values)
+	condition, pathPredicates := queryCriteria(values)
 	state.Lock()
 	roots := append([]*node(nil), selected(g)...)
-	q := findQueryLocked(roots, ms, pathMatchers)
+	q := findQueryLocked(roots, condition, pathPredicates)
 	if q == nil {
-		q = newQueryLocked(roots, ms, pathMatchers)
+		q = newQueryLocked(roots, condition, pathPredicates)
 	}
 	listener := &selection{nodes: append([]*node(nil), q.result.nodes...)}
 	q.listeners[listener] = struct{}{}
@@ -629,29 +660,24 @@ func Delta(g Graph, matchBy ...any) Graph {
 	return Graph{nodes: roots, view: view}
 }
 
-// Apply merges changes into g and returns the corresponding roots. Deltas use
-// their internal node identity unless matchBy attributes were supplied to
-// Delta. An ordinary graph is additively merged by the composite attribute
-// key, matching nodes across the entire target graph. For compatibility, a
-// patch root without the key attributes corresponds by selection order.
+// Apply merges a Delta result into g and returns the corresponding roots.
+// Deltas use their internal node identity unless identity attributes were
+// supplied to Delta.
 //
 // For example, this applies an EntityID-keyed delta to a replica:
 //
 //	changes := Delta(source, Type[EntityID]())
-//	replica = Apply(replica, changes, Type[EntityID]())
-func Apply(g, delta Graph, matchBy ...any) Graph {
+//	replica = Apply(replica, changes)
+func Apply(g, delta Graph) Graph {
 	state.Lock()
 	defer state.Unlock()
 	if len(selected(delta)) == 0 {
 		return g
 	}
 	if delta.view == nil {
-		return mergeGraphLocked(g, delta, matchTypes(matchBy))
+		panic("graph: apply requires a delta")
 	}
-	keyTypes := identityTypes(matchBy)
-	if !sameTypes(keyTypes, delta.view.matchTypes) {
-		panic("graph: apply match attributes differ from delta")
-	}
+	keyTypes := delta.view.matchTypes
 
 	targets := make(map[uint64]*node)
 	targetScope := reachableLocked(selected(g))
@@ -776,6 +802,25 @@ func Apply(g, delta Graph, matchBy ...any) Graph {
 	return Graph{nodes: roots}
 }
 
+// Patch additively merges an ordinary graph by a composite attribute key,
+// matching nodes across the entire target graph. A patch root without the key
+// attributes corresponds by selection order.
+//
+// For example:
+//
+//	Patch(world, changes, Type[EntityID]())
+func Patch(g, patch Graph, matchBy ...any) Graph {
+	state.Lock()
+	defer state.Unlock()
+	if len(selected(patch)) == 0 {
+		return g
+	}
+	if patch.view != nil {
+		panic("graph: patch requires an ordinary graph")
+	}
+	return mergeGraphLocked(g, patch, matchTypes(matchBy))
+}
+
 type mergePair struct {
 	source *node
 	target *node
@@ -894,18 +939,6 @@ func identityTypes(values []any) []reflect.Type {
 		types[i] = request.typ
 	}
 	return types
-}
-
-func sameTypes(a, b []reflect.Type) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func nodeMatchKey(n *node, types []reflect.Type) []any {
@@ -1188,60 +1221,72 @@ func inspectRequests(values []any, allowDestination bool) []request {
 	return out
 }
 
-func queryMatchers(values []any) []matcher {
-	rs := inspectRequests(values, false)
-	out := make([]matcher, len(rs))
-	for i, r := range rs {
-		out[i] = matcher{typ: r.typ, value: r.value, any: r.any}
+func buildPredicate(op predicateOp, values []any) *predicate {
+	if len(values) == 0 {
+		panic("graph: logical expression requires at least one predicate")
 	}
-	return out
+	children := make([]*predicate, len(values))
+	for i, value := range values {
+		children[i] = predicateFromValue(value)
+	}
+	return combinePredicates(op, children)
 }
 
-func queryCriteria(values []any) ([]matcher, [][]matcher) {
+func combinePredicates(op predicateOp, children []*predicate) *predicate {
+	if len(children) == 1 {
+		return children[0]
+	}
+	return &predicate{op: op, children: children}
+}
+
+func predicateFromValue(value any) *predicate {
+	if expression, ok := value.(predicateExpression); ok {
+		return expression.predicate
+	}
+	if _, ok := value.(pathExpression); ok {
+		panic("graph: Path cannot be nested in an attribute expression")
+	}
+	request := inspectRequests([]any{value}, false)[0]
+	return &predicate{op: predicateMatch, matcher: matcher{typ: request.typ, value: request.value, any: request.any}}
+}
+
+func queryCriteria(values []any) (*predicate, []*predicate) {
 	if len(values) == 1 {
-		switch expression := values[0].(type) {
-		case andExpression:
-			return append([]matcher(nil), expression.matchers...), nil
-		case pathExpression:
-			path := make([][]matcher, len(expression.steps))
-			for i, step := range expression.steps {
-				path[i] = append([]matcher(nil), step...)
-			}
-			return nil, path
+		if path, ok := values[0].(pathExpression); ok {
+			return nil, append([]*predicate(nil), path.steps...)
 		}
 	}
 	for _, value := range values {
-		switch value.(type) {
-		case andExpression, pathExpression:
-			panic("graph: And and Path must be a single query expression")
+		if _, ok := value.(pathExpression); ok {
+			panic("graph: Path must be the single query expression")
 		}
 	}
-	return queryMatchers(values), nil
+	return buildPredicate(predicateAnd, values), nil
 }
 
-func findQueryLocked(roots []*node, matchers []matcher, path [][]matcher) *query {
+func findQueryLocked(roots []*node, condition *predicate, path []*predicate) *query {
 	for q := range state.queries {
-		if sameNodes(q.roots, roots) && sameMatchers(q.matchers, matchers) && samePath(q.path, path) {
+		if sameNodes(q.roots, roots) && samePredicate(q.predicate, condition) && samePath(q.path, path) {
 			return q
 		}
 	}
 	return nil
 }
 
-func newQueryLocked(roots []*node, matchers []matcher, pathMatchers [][]matcher) *query {
+func newQueryLocked(roots []*node, condition *predicate, pathPredicates []*predicate) *query {
 	q := &query{
 		roots:     roots,
-		matchers:  matchers,
+		predicate: condition,
 		result:    &selection{},
 		listeners: make(map[*selection]struct{}),
 		root:      make(map[*node]struct{}),
 	}
-	q.path = make([]pathLevel, len(pathMatchers))
-	for i, pathMatchers := range pathMatchers {
+	q.path = make([]pathLevel, len(pathPredicates))
+	for i, pathPredicate := range pathPredicates {
 		q.path[i] = pathLevel{
-			matchers: pathMatchers,
-			active:   make(map[*node]struct{}),
-			support:  make(map[*node]uint32),
+			predicate: pathPredicate,
+			active:    make(map[*node]struct{}),
+			support:   make(map[*node]uint32),
 		}
 	}
 	recomputeQueryLocked(q)
@@ -1270,7 +1315,7 @@ func unregisterQueryLocked(q *query) {
 
 func releaseQueryIndexLocked(q *query) {
 	q.roots = nil
-	q.matchers = nil
+	q.predicate = nil
 	q.path = nil
 	q.result = nil
 	q.listeners = nil
@@ -1280,15 +1325,24 @@ func releaseQueryIndexLocked(q *query) {
 
 func queryTypes(q *query) map[reflect.Type]struct{} {
 	types := make(map[reflect.Type]struct{})
-	for _, matcher := range q.matchers {
-		types[matcher.typ] = struct{}{}
-	}
+	predicateTypes(q.predicate, types)
 	for _, level := range q.path {
-		for _, matcher := range level.matchers {
-			types[matcher.typ] = struct{}{}
-		}
+		predicateTypes(level.predicate, types)
 	}
 	return types
+}
+
+func predicateTypes(condition *predicate, types map[reflect.Type]struct{}) {
+	if condition == nil {
+		return
+	}
+	if condition.op == predicateMatch {
+		types[condition.matcher.typ] = struct{}{}
+		return
+	}
+	for _, child := range condition.children {
+		predicateTypes(child, types)
+	}
 }
 
 func sameNodes(left, right []*node) bool {
@@ -1303,24 +1357,27 @@ func sameNodes(left, right []*node) bool {
 	return true
 }
 
-func sameMatchers(left, right []matcher) bool {
-	if len(left) != len(right) {
+func samePredicate(left, right *predicate) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.op != right.op || left.matcher.typ != right.matcher.typ || left.matcher.any != right.matcher.any || left.matcher.value != right.matcher.value || len(left.children) != len(right.children) {
 		return false
 	}
-	for i := range left {
-		if left[i].typ != right[i].typ || left[i].any != right[i].any || left[i].value != right[i].value {
+	for i := range left.children {
+		if !samePredicate(left.children[i], right.children[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-func samePath(left []pathLevel, right [][]matcher) bool {
+func samePath(left []pathLevel, right []*predicate) bool {
 	if len(left) != len(right) {
 		return false
 	}
 	for i := range left {
-		if !sameMatchers(left[i].matchers, right[i]) {
+		if !samePredicate(left[i].predicate, right[i]) {
 			return false
 		}
 	}
@@ -1416,18 +1473,32 @@ func reachableLocked(roots []*node) []*node {
 	}
 	return out
 }
-func matchesLocked(n *node, ms []matcher) bool {
-	for _, m := range ms {
-		if !matchesMatcherLocked(n, m) {
-			return false
-		}
-	}
-	return true
-}
-
 func matchesMatcherLocked(n *node, m matcher) bool {
 	v, ok := n.attrs[m.typ]
 	return ok && (m.any || v == m.value)
+}
+
+func matchesPredicateLocked(n *node, condition *predicate) bool {
+	switch condition.op {
+	case predicateMatch:
+		return matchesMatcherLocked(n, condition.matcher)
+	case predicateAnd:
+		for _, child := range condition.children {
+			if !matchesPredicateLocked(n, child) {
+				return false
+			}
+		}
+		return true
+	case predicateOr:
+		for _, child := range condition.children {
+			if matchesPredicateLocked(n, child) {
+				return true
+			}
+		}
+		return false
+	default:
+		panic("graph: invalid predicate")
+	}
 }
 
 func queryMatchesLocked(q *query, n *node) bool {
@@ -1435,7 +1506,7 @@ func queryMatchesLocked(q *query, n *node) bool {
 		_, ok := q.path[0].active[n]
 		return ok
 	}
-	return matchesLocked(n, q.matchers)
+	return matchesPredicateLocked(n, q.predicate)
 }
 
 func recomputeQueryLocked(q *query) {
@@ -1492,7 +1563,7 @@ func buildPathIndexLocked(q *query, nodes []*node) {
 					}
 				}
 			}
-			if matchesLocked(n, level.matchers) && (step == len(q.path)-1 || level.support[n] != 0) {
+			if matchesPredicateLocked(n, level.predicate) && (step == len(q.path)-1 || level.support[n] != 0) {
 				level.active[n] = struct{}{}
 			}
 		}
@@ -1509,7 +1580,7 @@ func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 			if len(q.path) != 0 {
 				if q.scope[n] != 0 {
 					for step := len(q.path) - 1; step >= 0; step-- {
-						if matchersUseTypes(q.path[step].matchers, changed) {
+						if predicateUsesTypes(q.path[step].predicate, changed) {
 							refreshPathNodeLocked(q, n, step)
 						}
 					}
@@ -1523,9 +1594,13 @@ func updateAttributeQueriesLocked(n *node, changed map[reflect.Type]struct{}) {
 	}
 }
 
-func matchersUseTypes(matchers []matcher, changed map[reflect.Type]struct{}) bool {
-	for _, matcher := range matchers {
-		if _, ok := changed[matcher.typ]; ok {
+func predicateUsesTypes(condition *predicate, changed map[reflect.Type]struct{}) bool {
+	if condition.op == predicateMatch {
+		_, ok := changed[condition.matcher.typ]
+		return ok
+	}
+	for _, child := range condition.children {
+		if predicateUsesTypes(child, changed) {
 			return true
 		}
 	}
@@ -1535,7 +1610,7 @@ func matchersUseTypes(matchers []matcher, changed map[reflect.Type]struct{}) boo
 func refreshPathNodeLocked(q *query, n *node, step int) {
 	level := &q.path[step]
 	_, wasActive := level.active[n]
-	isActive := matchesLocked(n, level.matchers) && (step == len(q.path)-1 || level.support[n] != 0)
+	isActive := matchesPredicateLocked(n, level.predicate) && (step == len(q.path)-1 || level.support[n] != 0)
 	if wasActive == isActive {
 		return
 	}
@@ -1690,7 +1765,7 @@ func initializeAddedPathNodesLocked(q *query, added map[*node]struct{}) {
 					}
 				}
 			}
-			if matchesLocked(n, level.matchers) && (step == len(q.path)-1 || level.support[n] != 0) {
+			if matchesPredicateLocked(n, level.predicate) && (step == len(q.path)-1 || level.support[n] != 0) {
 				level.active[n] = struct{}{}
 			}
 		}

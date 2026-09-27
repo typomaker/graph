@@ -56,7 +56,7 @@ func main() {
 	graph.Link(world, player)
 
 	var health Health
-	if !graph.Empty(graph.Get(player, &health)) {
+	if !graph.Empty(graph.As(player, &health)) {
 		fmt.Println(health.Current) // 100
 	}
 }
@@ -82,19 +82,21 @@ Attributes must be comparable Go values, such as numbers, strings, named types, 
 
 ### Check and read
 
-`Type[T]()` matches any value of type `T`. A value of type `T` performs an exact comparison. A `*T` argument reads the stored value.
+`Type[T]()` matches any value of type `T`. A value of type `T` performs an exact comparison. A `*T` argument requires and reads the stored value.
 
 ```go
-hasHealth := graph.Get(actor, graph.Type[Health]())
-isAlive := graph.Get(actor, Alive(true))
+hasHealth := graph.As(actor, graph.Type[Health]())
+isAlive := graph.As(actor, Alive(true))
 
 var health Health
-if !graph.Empty(graph.Get(actor, &health)) {
+if !graph.Empty(graph.As(actor, &health)) {
 	health.Current -= 10
 }
 ```
 
-With multiple arguments, `Get` returns the node if at least one argument matches. A destination remains unchanged when its attribute is absent.
+With multiple arguments, `As` returns the node only when every argument
+matches. Pointer destinations are written only after the complete match
+succeeds, so a failed operation never leaves partial output.
 
 ### Set and remove
 
@@ -182,9 +184,9 @@ fmt.Println(graph.Empty(actors))
 Set operations remove duplicates and preserve first appearance:
 
 ```go
-all := graph.Merge(players, enemies)        // union
-both := graph.Include(visible, selectable)  // intersection
-active := graph.Exclude(all, disconnected)  // difference
+all := graph.Union(players, enemies)
+both := graph.Intersect(visible, selectable)
+active := graph.Difference(all, disconnected)
 ```
 
 Attribute and structural operations use only the first node of their `Graph` arguments. Use `Each` for explicit bulk updates.
@@ -210,6 +212,20 @@ graph.Link(world, jack)
 
 // It automatically leaves the result after this update.
 graph.Set(jack, Alive(false))
+```
+
+`And` and `Or` compose nested predicates when a query needs explicit logical
+grouping:
+
+```go
+actors, closeActors := graph.Query(
+	world,
+	graph.And(
+		graph.Type[Actor](),
+		graph.Or(Faction("pirates"), Faction("guards")),
+	),
+)
+defer closeActors()
 ```
 
 Call the returned close function when the live result is no longer needed. It is idempotent. After closing, the returned `Graph` remains available as a snapshot but no longer updates.
@@ -343,8 +359,8 @@ its deltas are in-memory values; encoding and transport across processes are
 outside this package's current API.
 
 Two independently constructed replicas can instead use the same stable
-application attributes as a composite identity. Pass the attributes to both
-operations in the same order:
+application attributes as a composite identity. Store the identity definition
+in the delta:
 
 ```go
 delta := graph.Delta(
@@ -353,17 +369,12 @@ delta := graph.Delta(
 	graph.Type[ID](),
 )
 
-graph.Apply(
-	replica,
-	delta,
-	graph.Type[EntityKind](),
-	graph.Type[ID](),
-)
+graph.Apply(replica, delta)
 ```
 
 Every node in this mode must contain every identity attribute. Their values
 must remain stable and uniquely identify a node within the replica. `Apply`
-panics if its identity attributes differ from those used by `Delta`.
+reads the identity definition from the delta.
 
 `Apply` builds a temporary composite index of the reachable target nodes before
 processing a keyed delta. Matching therefore scales linearly with the target
@@ -379,7 +390,7 @@ that two separately created nodes represent the same entity.
 
 ### Merge a programmatic patch
 
-`Apply` can also deeply merge an ordinary graph that was built without
+`Patch` deeply merges an ordinary graph that was built without
 revision metadata. Supply one or more attribute types that form the composite
 identity of every non-root node:
 
@@ -390,7 +401,7 @@ newItem := graph.New(EntityKind("item"), ID("shield"), Armor(20))
 graph.Link(changedPlayer, newItem)
 graph.Link(patch, changedPlayer)
 
-graph.Apply(
+graph.Patch(
 	world,
 	patch,
 	graph.Type[EntityKind](),
@@ -410,7 +421,7 @@ every patch descendant and unique among siblings.
 The library panics when an invariant is violated:
 
 - A `nil`, pointer, or non-comparable stored attribute
-- Duplicate attribute types in one call
+- Duplicate stored attribute types or duplicate `As` destinations in one call
 - A relation that creates a cycle
 
 `T` and `*T` refer to the same attribute type. An empty `Graph` is valid; reads and mutations on it return an empty result.
@@ -429,19 +440,19 @@ Indicative results for a 10,000-node graph on an Apple M1 Max:
 
 | Operation | Time | Allocations |
 |---|---:|---:|
-| Exact-query bootstrap | ~2.0 ms | 139 |
-| Reuse active exact query | ~0.31 us | 9 |
+| Exact-query bootstrap | ~2.0 ms | 147 |
+| Reuse active exact query | ~0.41 us | 13 |
 | Reactive result `Len` | ~14 ns | 0 |
-| Relevant attribute update | ~0.53 us | 4 |
-| Unrelated attribute update | ~0.41 us | 3 |
+| Relevant attribute update | ~0.51 us | 4 |
+| Unrelated attribute update | ~0.40 us | 3 |
 
 For a three-step path over 10,000 independent branches, indicative results on
 the same machine are:
 
 | Operation | Time | Allocations |
 |---|---:|---:|
-| Path-query bootstrap | ~14.4 ms | ~20,356 |
+| Path-query bootstrap | ~14.8 ms | ~20,371 |
 | Relevant endpoint update | ~0.83 us | 3-4 |
-| Path `Unlink` and `Link` pair | ~1.47 us | 6 |
+| Path `Unlink` and `Link` pair | ~1.45 us | 6 |
 
 Actual results depend on the processor, graph shape, number of active queries, and result size.

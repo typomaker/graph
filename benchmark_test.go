@@ -184,6 +184,6 @@ func BenchmarkApplyDelta10K(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		Apply(target, delta, Type[benchmarkKind](), Type[benchmarkID]())
+		Apply(target, delta)
 	}
 }
