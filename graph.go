@@ -125,10 +125,8 @@ type typeMatcher struct{ typ reflect.Type }
 
 var state struct {
 	sync.RWMutex
-	nextID        uint64
-	revision      uint64
-	queries       map[*reactiveQuery]struct{}
-	reactiveDirty map[*node]struct{}
+	nextID   uint64
+	revision uint64
 }
 
 type matcher struct {
@@ -267,7 +265,6 @@ func Set[T any](g Graph, value T) bool {
 	attrs := storedAttributes([]any{value})
 	state.Lock()
 	defer state.Unlock()
-	defer refreshQueriesLocked()
 	n := first(g)
 	if n == nil {
 		return false
@@ -301,7 +298,6 @@ func Unset[T any](g Graph) (T, bool) {
 	typ := attributeType[T]()
 	state.Lock()
 	defer state.Unlock()
-	defer refreshQueriesLocked()
 	n := first(g)
 	if n == nil {
 		return zero, false
@@ -328,7 +324,6 @@ func Unset[T any](g Graph) (T, bool) {
 func Link(g Graph, graphs ...Graph) bool {
 	state.Lock()
 	defer state.Unlock()
-	defer refreshQueriesLocked()
 	parent := first(g)
 	if parent == nil {
 		return false
@@ -368,7 +363,6 @@ func Link(g Graph, graphs ...Graph) bool {
 func Unlink(g Graph, graphs ...Graph) bool {
 	state.Lock()
 	defer state.Unlock()
-	defer refreshQueriesLocked()
 	parent := first(g)
 	if parent == nil {
 		return false
@@ -413,8 +407,8 @@ func Each(g Graph) iter.Seq[Graph] {
 }
 
 // Query returns a reusable materialized iterator over the nodes matching
-// Search. It evaluates the search immediately, then graph mutations keep its
-// result up to date. Iteration only reads the current materialized result.
+// Search. It evaluates the search immediately, then refreshes the result lazily
+// at the beginning of an iteration when the reachable graph has changed.
 //
 // For example, this query always iterates over the currently visible nodes:
 //
@@ -424,106 +418,83 @@ func Each(g Graph) iter.Seq[Graph] {
 //		// ...
 //	}
 func Query(g Graph, values ...any) (iter.Seq[Graph], func()) {
-	condition := buildPredicate(predicateAnd, values)
-	query := &reactiveQuery{source: g, condition: condition}
-	conditions := append([]any(nil), values...)
-	for {
-		state.RLock()
-		before := graphRevisionsLocked(g)
-		state.RUnlock()
-		result := Search(g, conditions...)
-
-		state.Lock()
-		after := graphRevisionsLocked(g)
-		if slices.Equal(before, after) {
-			query.result = result
-			query.members = nodeSet(result.nodes)
-			query.revisions = after
-			if state.queries == nil {
-				state.queries = make(map[*reactiveQuery]struct{})
-			}
-			state.queries[query] = struct{}{}
-			state.Unlock()
-			break
-		}
-		state.Unlock()
-	}
-
+	query := newReactiveQuery(g, values)
 	sequence := func(yield func(Graph) bool) {
-		state.RLock()
-		result := Graph{
-			nodes: append([]*node(nil), query.result.nodes...),
-			view:  query.result.view,
-			index: query.result.index,
-		}
-		state.RUnlock()
+		result := query.snapshot()
 		for node := range Each(result) {
 			if !yield(node) {
 				return
 			}
 		}
 	}
-	close := func() {
-		state.Lock()
-		defer state.Unlock()
-		if query.closed {
-			return
-		}
-		delete(state.queries, query)
-		query.source = Graph{}
-		query.condition = nil
-		query.result = Graph{}
-		query.revisions = nil
-		query.members = nil
-		query.closed = true
-	}
-	return sequence, close
+	return sequence, query.close
 }
 
 type reactiveQuery struct {
-	source    Graph
-	condition *predicate
-	result    Graph
-	revisions []uint64
-	members   map[*node]struct{}
-	closed    bool
+	sync.Mutex
+	source      Graph
+	conditions  []any
+	result      Graph
+	revisions   []uint64
+	searchCount uint64
+	closed      bool
 }
 
-func refreshQueriesLocked() {
-	for query := range state.queries {
-		revisions := graphRevisionsLocked(query.source)
-		if slices.Equal(query.revisions, revisions) {
-			continue
-		}
-		var reachable []*node
-		if query.source.view == nil {
-			reachable = reachableLocked(selected(query.source))
-		} else {
-			reachable = reachableViewLocked(selected(query.source), query.source.view)
-		}
-		reachableSet := nodeSet(reachable)
-		for candidate := range state.reactiveDirty {
-			_, active := reachableSet[candidate]
-			matches := active && matchesPredicateLocked(candidate, query.condition, query.source.view)
-			if matches {
-				query.members[candidate] = struct{}{}
-			} else {
-				delete(query.members, candidate)
-			}
-		}
-		result := make([]*node, 0, len(query.members))
-		for _, candidate := range reachable {
-			if _, matches := query.members[candidate]; matches {
-				result = append(result, candidate)
-			}
-		}
-		query.result = Graph{nodes: result, view: query.source.view}
-		query.revisions = revisions
+func newReactiveQuery(g Graph, values []any) *reactiveQuery {
+	conditions := append([]any(nil), values...)
+	query := &reactiveQuery{source: g, conditions: conditions}
+	query.Lock()
+	query.refreshLocked()
+	query.Unlock()
+	return query
+}
+
+func (query *reactiveQuery) snapshot() Graph {
+	query.Lock()
+	defer query.Unlock()
+	if query.closed {
+		return Graph{}
 	}
-	clear(state.reactiveDirty)
+	if revisions := graphRevisions(query.source); !slices.Equal(query.revisions, revisions) {
+		query.refreshLocked()
+	}
+	return Graph{
+		nodes: append([]*node(nil), query.result.nodes...),
+		view:  query.result.view,
+		index: query.result.index,
+	}
 }
 
-func graphRevisionsLocked(g Graph) []uint64 {
+func (query *reactiveQuery) refreshLocked() {
+	for {
+		before := graphRevisions(query.source)
+		query.searchCount++
+		result := Search(query.source, query.conditions...)
+		after := graphRevisions(query.source)
+		if slices.Equal(before, after) {
+			query.result = result
+			query.revisions = after
+			return
+		}
+	}
+}
+
+func (query *reactiveQuery) close() {
+	query.Lock()
+	defer query.Unlock()
+	if query.closed {
+		return
+	}
+	query.source = Graph{}
+	query.conditions = nil
+	query.result = Graph{}
+	query.revisions = nil
+	query.closed = true
+}
+
+func graphRevisions(g Graph) []uint64 {
+	state.RLock()
+	defer state.RUnlock()
 	revisions := make([]uint64, len(g.nodes))
 	for i, root := range g.nodes {
 		revisions[i] = root.treeRev
@@ -993,7 +964,6 @@ func Delta(g Graph, matchBy ...any) Graph {
 func Apply(g, delta Graph) Graph {
 	state.Lock()
 	defer state.Unlock()
-	defer refreshQueriesLocked()
 	if len(selected(delta)) == 0 {
 		return g
 	}
@@ -1169,7 +1139,6 @@ func Apply(g, delta Graph) Graph {
 func Patch(g, patch Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
-	defer refreshQueriesLocked()
 	if len(selected(patch)) == 0 {
 		return g
 	}
@@ -1670,7 +1639,6 @@ func propagateAttributeLocked(n *node, rev uint64) {
 	seen := map[*node]struct{}{}
 	var visit func(*node, *node)
 	visit = func(x, changedChild *node) {
-		markReactiveDirtyLocked(x)
 		if changedChild != nil {
 			markDirtyChildLocked(x, changedChild)
 		}
@@ -2156,7 +2124,6 @@ func orderedChildren(n *node) []*node {
 }
 
 func addChildLocked(parent, child *node, revision uint64) {
-	markReactiveStructureLocked(parent, child)
 	parent.children[child] = revision
 	index := sort.Search(len(parent.childOrder), func(i int) bool {
 		return parent.childOrder[i].id >= child.id
@@ -2167,7 +2134,6 @@ func addChildLocked(parent, child *node, revision uint64) {
 }
 
 func removeChildLocked(parent, child *node) {
-	markReactiveStructureLocked(parent, child)
 	delete(parent.children, child)
 	for index, current := range parent.childOrder {
 		if current != child {
@@ -2180,46 +2146,6 @@ func removeChildLocked(parent, child *node) {
 	}
 }
 
-func markReactiveDirtyLocked(n *node) {
-	if len(state.queries) == 0 {
-		return
-	}
-	if state.reactiveDirty == nil {
-		state.reactiveDirty = make(map[*node]struct{})
-	}
-	state.reactiveDirty[n] = struct{}{}
-}
-
-func markReactiveStructureLocked(parent, child *node) {
-	if len(state.queries) == 0 {
-		return
-	}
-	seen := make(map[*node]struct{})
-	var descendants func(*node)
-	descendants = func(n *node) {
-		if _, exists := seen[n]; exists {
-			return
-		}
-		seen[n] = struct{}{}
-		markReactiveDirtyLocked(n)
-		for current := range n.children {
-			descendants(current)
-		}
-	}
-	descendants(child)
-	var ancestors func(*node)
-	ancestors = func(n *node) {
-		if _, exists := seen[n]; exists {
-			return
-		}
-		seen[n] = struct{}{}
-		markReactiveDirtyLocked(n)
-		for current := range n.parents {
-			ancestors(current)
-		}
-	}
-	ancestors(parent)
-}
 func reachableLocked(roots []*node) []*node {
 	seen := map[*node]struct{}{}
 	out := []*node{}

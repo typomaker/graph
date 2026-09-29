@@ -2,6 +2,7 @@ package graph
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -166,7 +167,7 @@ func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	}
 }
 
-func TestQueryReflectsMutationsBetweenIterations(t *testing.T) {
+func TestQueryBootstrapAndAttributeChanges(t *testing.T) {
 	root := New(name("root"))
 	firstChild := New(kind("actor"), name("first"))
 	secondChild := New(kind("item"), name("second"))
@@ -183,13 +184,125 @@ func TestQueryReflectsMutationsBetweenIterations(t *testing.T) {
 	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"second"}) {
 		t.Fatalf("query after attribute changes = %v", got)
 	}
-
-	thirdChild := New(kind("actor"), name("third"))
-	Link(root, thirdChild)
-	Unlink(root, secondChild)
-	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"third"}) {
-		t.Fatalf("query after structural changes = %v", got)
+	Unset[kind](secondChild)
+	if got := collectNames(t, query); len(got) != 0 {
+		t.Fatalf("query after unset = %v", got)
 	}
+}
+
+func TestQueryReflectsLinkChangesBeforeCommit(t *testing.T) {
+	root := New(name("root"))
+	firstChild := New(kind("actor"), name("first"))
+	secondChild := New(kind("actor"), name("second"))
+	Link(root, firstChild)
+
+	query, closeQuery := Query(root, kind("actor"))
+	defer closeQuery()
+	Link(root, secondChild)
+	Unlink(root, firstChild)
+	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"second"}) {
+		t.Fatalf("query after link changes = %v", got)
+	}
+}
+
+func TestQueryRefreshesOnceAfterMutations(t *testing.T) {
+	root := New(kind("world"))
+	child := New(kind("item"))
+	Link(root, child)
+	query := newReactiveQuery(root, []any{kind("actor")})
+	if query.searchCount != 1 {
+		t.Fatalf("bootstrap searches = %d", query.searchCount)
+	}
+
+	for i := 0; i < 100; i++ {
+		Set(child, kind("actor"))
+		Set(child, kind("item"))
+	}
+	Set(child, kind("actor"))
+	if query.searchCount != 1 {
+		t.Fatalf("searches during mutations = %d", query.searchCount)
+	}
+	if Len(query.snapshot()) != 1 || query.searchCount != 2 {
+		t.Fatalf("first iteration searches = %d", query.searchCount)
+	}
+	if Len(query.snapshot()) != 1 || query.searchCount != 2 {
+		t.Fatalf("unchanged iteration searches = %d", query.searchCount)
+	}
+	query.close()
+}
+
+func TestQueryMutationDuringIterationAppearsNextTime(t *testing.T) {
+	root := New(name("root"))
+	firstChild := New(kind("actor"), name("first"))
+	secondChild := New(kind("actor"), name("second"))
+	Link(root, firstChild, secondChild)
+	query, closeQuery := Query(root, kind("actor"))
+	defer closeQuery()
+
+	var current []name
+	for node := range query {
+		current = append(current, value[name](t, node))
+		if len(current) == 1 {
+			Set(secondChild, kind("item"))
+		}
+	}
+	if !reflect.DeepEqual(current, []name{"first", "second"}) {
+		t.Fatalf("current iteration = %v", current)
+	}
+	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"first"}) {
+		t.Fatalf("next iteration = %v", got)
+	}
+}
+
+func TestQueryConcurrentMutationAndIteration(t *testing.T) {
+	root := New(kind("world"))
+	child := New(kind("item"))
+	Link(root, child)
+	query, closeQuery := Query(root, kind("actor"))
+	defer closeQuery()
+
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		for i := 0; i < 100; i++ {
+			Set(child, kind("actor"))
+			Set(child, kind("item"))
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for i := 0; i < 100; i++ {
+			for range query {
+			}
+		}
+	}()
+	workers.Wait()
+	Set(child, kind("actor"))
+	if count := len(collectGraphs(query)); count != 1 {
+		t.Fatalf("final query length = %d", count)
+	}
+}
+
+func TestQueryCloseReleasesState(t *testing.T) {
+	root := New(kind("world"))
+	query := newReactiveQuery(root, []any{kind("world")})
+	query.close()
+	query.close()
+	if !query.closed || len(query.source.nodes) != 0 || query.conditions != nil || len(query.result.nodes) != 0 || query.revisions != nil {
+		t.Fatal("close retained query state")
+	}
+	if !Empty(query.snapshot()) {
+		t.Fatal("closed query is not empty")
+	}
+}
+
+func collectGraphs(sequence func(func(Graph) bool)) []Graph {
+	var graphs []Graph
+	for node := range sequence {
+		graphs = append(graphs, node)
+	}
+	return graphs
 }
 
 func TestQueryIsMaterializedAndSupportsEarlyStop(t *testing.T) {
@@ -199,14 +312,8 @@ func TestQueryIsMaterializedAndSupportsEarlyStop(t *testing.T) {
 	Link(root, firstChild, secondChild)
 
 	query, closeQuery := Query(root, kind("actor"))
-	if got := materializedQueryLen(root); got != 0 {
-		t.Fatalf("initial materialized length = %d", got)
-	}
 	Set(firstChild, kind("actor"))
 	Set(secondChild, kind("actor"))
-	if got := materializedQueryLen(root); got != 2 {
-		t.Fatalf("updated materialized length = %d", got)
-	}
 
 	count := 0
 	for range query {
@@ -219,9 +326,6 @@ func TestQueryIsMaterializedAndSupportsEarlyStop(t *testing.T) {
 
 	closeQuery()
 	closeQuery()
-	if got := materializedQueryLen(root); got != -1 {
-		t.Fatalf("materialized length after close = %d", got)
-	}
 	if got := collectNames(t, query); len(got) != 0 {
 		t.Fatalf("closed query = %v", got)
 	}
@@ -251,17 +355,6 @@ func TestQueryUpdatesPathMatches(t *testing.T) {
 	if got := collectNames(t, query); len(got) != 0 {
 		t.Fatalf("path query after removal = %v", got)
 	}
-}
-
-func materializedQueryLen(root Graph) int {
-	state.RLock()
-	defer state.RUnlock()
-	for query := range state.queries {
-		if first(query.source) == first(root) {
-			return len(query.result.nodes)
-		}
-	}
-	return -1
 }
 
 func collectNames(t *testing.T, sequence func(func(Graph) bool)) []name {

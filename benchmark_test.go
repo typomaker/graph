@@ -90,6 +90,34 @@ func BenchmarkSearchCancelledEdge10K(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryBatchedMutations(b *testing.B) {
+	for _, mutations := range []int{1000, 10000} {
+		b.Run(fmt.Sprint(mutations), func(b *testing.B) {
+			root := benchmarkWorld(10000)
+			child := New(benchmarkKind("item"))
+			Link(root, child)
+			Commit(root)
+			query, closeQuery := Query(root, Type[benchmarkVersion]())
+			defer closeQuery()
+			b.ResetTimer()
+			for range b.N {
+				for i := 0; i < mutations; i++ {
+					Set(child, benchmarkVersion(i))
+					Unset[benchmarkVersion](child)
+				}
+				Set(child, benchmarkVersion(mutations))
+				count := 0
+				for range query {
+					count++
+				}
+				if count != 1 {
+					b.Fatalf("query length = %d", count)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkSelect10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	all := Search(root, Type[any]())
