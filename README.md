@@ -61,6 +61,25 @@ visiblePlayers := graph.Search(
 
 Selections do not update after graph mutations. Run the selector again when a fresh result is needed.
 
+`Query` accepts the same predicates as `Search` and returns a reusable iterator.
+It runs `Search` when iteration begins, so mutations made between iterations are
+visible without rebuilding the query. One iteration uses one stable snapshot;
+mutations during that iteration appear on the next iteration.
+
+```go
+visibleActors := graph.Query(world, graph.Type[Actor](), Visible(true))
+
+for actor := range visibleActors {
+    // Current matches.
+}
+
+graph.Set(player, Visible(true))
+
+for actor := range visibleActors {
+    // The updated matches.
+}
+```
+
 ## Structural paths
 
 `Path` starts with the immediate children of each candidate. Every subsequent step follows one outgoing edge. Ordinary predicates never search descendants implicitly.

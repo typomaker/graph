@@ -166,6 +166,60 @@ func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	}
 }
 
+func TestQueryReflectsMutationsBetweenIterations(t *testing.T) {
+	root := New(name("root"))
+	firstChild := New(kind("actor"), name("first"))
+	secondChild := New(kind("item"), name("second"))
+	Link(root, firstChild, secondChild)
+
+	query := Query(root, kind("actor"))
+	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"first"}) {
+		t.Fatalf("initial query = %v", got)
+	}
+
+	Set(firstChild, kind("item"))
+	Set(secondChild, kind("actor"))
+	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"second"}) {
+		t.Fatalf("query after attribute changes = %v", got)
+	}
+
+	thirdChild := New(kind("actor"), name("third"))
+	Link(root, thirdChild)
+	Unlink(root, secondChild)
+	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"third"}) {
+		t.Fatalf("query after structural changes = %v", got)
+	}
+}
+
+func TestQueryIsLazyAndSupportsEarlyStop(t *testing.T) {
+	root := New(name("root"))
+	firstChild := New(kind("item"), name("first"))
+	secondChild := New(kind("item"), name("second"))
+	Link(root, firstChild, secondChild)
+
+	query := Query(root, kind("actor"))
+	Set(firstChild, kind("actor"))
+	Set(secondChild, kind("actor"))
+
+	count := 0
+	for range query {
+		count++
+		break
+	}
+	if count != 1 {
+		t.Fatalf("early-stop count = %d", count)
+	}
+}
+
+func collectNames(t *testing.T, sequence func(func(Graph) bool)) []name {
+	t.Helper()
+	var names []name
+	for node := range sequence {
+		names = append(names, value[name](t, node))
+	}
+	return names
+}
+
 func TestDeltaApplyAndCommit(t *testing.T) {
 	source := New(kind("world"), ident("main"), health{10, 10})
 	actor := New(kind("actor"), ident("one"), name("old"))

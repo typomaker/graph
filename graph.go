@@ -406,6 +406,27 @@ func Each(g Graph) iter.Seq[Graph] {
 	}
 }
 
+// Query returns a reusable iterator over the nodes matching Search. Each
+// iteration evaluates the query again, so graph mutations made between
+// iterations are reflected in the next result.
+//
+// For example, this query always iterates over the currently visible nodes:
+//
+//	visible := Query(world, Visible(true))
+//	for node := range visible {
+//		// ...
+//	}
+func Query(g Graph, values ...any) iter.Seq[Graph] {
+	conditions := append([]any(nil), values...)
+	return func(yield func(Graph) bool) {
+		for node := range Each(Search(g, conditions...)) {
+			if !yield(node) {
+				return
+			}
+		}
+	}
+}
+
 // Len returns the number of nodes in the selection.
 //
 // For example:
