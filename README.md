@@ -62,12 +62,21 @@ visiblePlayers := graph.Search(
 Selections do not update after graph mutations. Run the selector again when a fresh result is needed.
 
 `Query` accepts the same predicates as `Search` and returns a reusable iterator.
-It runs `Search` when iteration begins, so mutations made between iterations are
-visible without rebuilding the query. One iteration uses one stable snapshot;
-mutations during that iteration appear on the next iteration.
+Creating it runs `Search` and materializes the result. Graph mutations then keep
+that result up to date by adding and removing matches. Iteration only reads the
+already materialized nodes and does not run another search. One iteration uses
+one stable snapshot; mutations during that iteration appear on the next
+iteration. Call the returned close function when the query is no longer needed;
+it releases the materialized result and unregisters the query. Closing is
+idempotent.
 
 ```go
-visibleActors := graph.Query(world, graph.Type[Actor](), Visible(true))
+visibleActors, closeVisibleActors := graph.Query(
+    world,
+    graph.Type[Actor](),
+    Visible(true),
+)
+defer closeVisibleActors()
 
 for actor := range visibleActors {
     // Current matches.

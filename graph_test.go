@@ -172,7 +172,8 @@ func TestQueryReflectsMutationsBetweenIterations(t *testing.T) {
 	secondChild := New(kind("item"), name("second"))
 	Link(root, firstChild, secondChild)
 
-	query := Query(root, kind("actor"))
+	query, closeQuery := Query(root, kind("actor"))
+	defer closeQuery()
 	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"first"}) {
 		t.Fatalf("initial query = %v", got)
 	}
@@ -191,15 +192,21 @@ func TestQueryReflectsMutationsBetweenIterations(t *testing.T) {
 	}
 }
 
-func TestQueryIsLazyAndSupportsEarlyStop(t *testing.T) {
+func TestQueryIsMaterializedAndSupportsEarlyStop(t *testing.T) {
 	root := New(name("root"))
 	firstChild := New(kind("item"), name("first"))
 	secondChild := New(kind("item"), name("second"))
 	Link(root, firstChild, secondChild)
 
-	query := Query(root, kind("actor"))
+	query, closeQuery := Query(root, kind("actor"))
+	if got := materializedQueryLen(root); got != 0 {
+		t.Fatalf("initial materialized length = %d", got)
+	}
 	Set(firstChild, kind("actor"))
 	Set(secondChild, kind("actor"))
+	if got := materializedQueryLen(root); got != 2 {
+		t.Fatalf("updated materialized length = %d", got)
+	}
 
 	count := 0
 	for range query {
@@ -209,6 +216,52 @@ func TestQueryIsLazyAndSupportsEarlyStop(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("early-stop count = %d", count)
 	}
+
+	closeQuery()
+	closeQuery()
+	if got := materializedQueryLen(root); got != -1 {
+		t.Fatalf("materialized length after close = %d", got)
+	}
+	if got := collectNames(t, query); len(got) != 0 {
+		t.Fatalf("closed query = %v", got)
+	}
+}
+
+func TestQueryUpdatesPathMatches(t *testing.T) {
+	root := New(name("root"))
+	location := New(kind("location"), name("location"))
+	contains := New(kind("contains"))
+	actor := New(kind("actor"), ident("old"))
+	Link(root, location)
+	Link(location, contains)
+	Link(contains, actor)
+
+	query, closeQuery := Query(root, kind("location"), Path(kind("contains"), ident("target")))
+	defer closeQuery()
+	if got := collectNames(t, query); len(got) != 0 {
+		t.Fatalf("initial path query = %v", got)
+	}
+
+	Set(actor, ident("target"))
+	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"location"}) {
+		t.Fatalf("path query after match = %v", got)
+	}
+
+	Set(actor, ident("old"))
+	if got := collectNames(t, query); len(got) != 0 {
+		t.Fatalf("path query after removal = %v", got)
+	}
+}
+
+func materializedQueryLen(root Graph) int {
+	state.RLock()
+	defer state.RUnlock()
+	for query := range state.queries {
+		if first(query.source) == first(root) {
+			return len(query.result.nodes)
+		}
+	}
+	return -1
 }
 
 func collectNames(t *testing.T, sequence func(func(Graph) bool)) []name {
