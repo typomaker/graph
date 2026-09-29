@@ -124,6 +124,45 @@ The first `Commit` of a root traverses its reachable graph and builds the search
 
 When a new edge points to an already committed node, `Delta` includes that node's identity but omits its unchanged descendants. `Apply` can therefore connect an existing replica node without retransmitting its committed subtree. Edges to new nodes still include their complete new subgraphs.
 
+## JSON
+
+The `graphjson` package encodes a graph as a flat, versioned document. Declare
+the stable JSON name of every attribute type in a schema:
+
+```go
+var schema = graph.Schema{
+	graph.Attribute[ID]("id"),
+	graph.Attribute[Name]("name"),
+}
+
+data, err := graphjson.Marshal(world, schema)
+
+var restored graph.Graph
+err = graphjson.Unmarshal(data, &restored, schema)
+```
+
+The document stores roots, nodes, and ordered links separately. Keys beginning
+with `@` belong to the format; node keys exist only within one document and do
+not expose the graph's internal identity. Shared children are encoded once and
+remain shared after decoding. `Unmarshal` replaces its destination only after
+the complete document has been decoded and validated.
+
+```json
+{
+  "@version": 1,
+  "@roots": ["1"],
+  "@nodes": [
+    {"@key": "1", "id": "world", "@links": ["2"]},
+    {"@key": "2", "id": "player", "name": "Player"}
+  ]
+}
+```
+
+Attribute values use `encoding/json`, including implementations of
+`json.Marshaler` and `json.Unmarshaler`. Unknown attributes, dangling links,
+duplicate keys, cycles, unreachable nodes, and unsupported format versions are
+rejected.
+
 ## Performance
 
 `Select`, `Follow`, and `Search` are snapshot operations. After `Commit`, `Search` can use immutable type and value postings and evaluate structural paths backwards through internal parent relations. Conjunctions start with their most selective posting and choose merge or binary intersections according to posting density. Results retain graph traversal order.
