@@ -153,6 +153,40 @@ The first `Commit` of a root traverses its reachable graph and builds the search
 
 When a new edge points to an already committed node, `Delta` includes that node's identity but omits its unchanged descendants. `Apply` can therefore connect an existing replica node without retransmitting its committed subtree. Edges to new nodes still include their complete new subgraphs.
 
+### Binary updates
+
+`Wire` provides a versioned, process-independent binary representation of the
+same changes tracked by `Commit`. Each definition associates a stable protocol
+label with a Go attribute type:
+
+```go
+wire := graph.NewWire(
+	graph.Define[Actor]("actor"),
+	graph.Define[Health]("health"),
+)
+
+update, err := wire.ExportUpdate(source)
+if err == nil {
+	err = wire.ImportUpdate(replica, update)
+}
+```
+
+The graph passed to `ExportUpdate` is the spatial scope; only changes reachable
+from that selection are included. Export is non-consuming and never performs
+an implicit `Commit`. Existing roots are paired by selection order, and other
+existing nodes are resolved from unchanged, uniquely matching defined
+attributes. A link to an unchanged node outside the encoded fragment is applied
+only when that node can be resolved in the replica scope; otherwise import
+fails instead of creating incomplete topology.
+
+Wire schemas evolve additively. An importer skips length-delimited attributes
+whose labels it does not define and continues decoding known data. If an
+unknown-only node is structural, its entire unreachable fragment is omitted
+rather than flattening its known descendants into the surrounding topology.
+Unknown data is not preserved for a later re-export by the older process.
+Adding a definition does not change the binary format version; incompatible
+changes to the binary protocol do.
+
 ## JSON
 
 The `graphjson` package encodes a graph as a flat, versioned document. Declare

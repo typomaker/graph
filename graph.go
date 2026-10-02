@@ -1071,6 +1071,10 @@ func Delta(g Graph, matchBy ...any) Graph {
 func Apply(g, delta Graph) Graph {
 	state.Lock()
 	defer state.Unlock()
+	return applyLocked(g, delta)
+}
+
+func applyLocked(g, delta Graph) Graph {
 	if len(selected(delta)) == 0 {
 		return g
 	}
