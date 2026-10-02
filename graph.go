@@ -123,6 +123,10 @@ type removedChildChange struct {
 
 type typeMatcher struct{ typ reflect.Type }
 
+const pooledVisitedLimit = 65536
+
+var visitedNodeSets sync.Pool
+
 var state struct {
 	sync.RWMutex
 	nextID   uint64
@@ -684,7 +688,8 @@ func Search(g Graph, values ...any) Graph {
 		}
 		return Graph{nodes: out, index: index}
 	}
-	visited := make(map[*node]struct{})
+	visited, releaseVisited := acquireVisitedNodeSet()
+	defer releaseVisited()
 	var emitted map[*node]struct{}
 	if len(roots) > 1 {
 		emitted = make(map[*node]struct{})
@@ -725,6 +730,20 @@ func Search(g Graph, values ...any) Graph {
 		visit(root)
 	}
 	return Graph{nodes: out, view: g.view}
+}
+
+func acquireVisitedNodeSet() (map[*node]struct{}, func()) {
+	visited, _ := visitedNodeSets.Get().(map[*node]struct{})
+	if visited == nil {
+		visited = make(map[*node]struct{})
+	}
+	return visited, func() {
+		size := len(visited)
+		clear(visited)
+		if size <= pooledVisitedLimit {
+			visitedNodeSets.Put(visited)
+		}
+	}
 }
 
 func (index *searchIndex) streamCurrentMatches(condition *predicate) ([]*node, bool) {
