@@ -28,7 +28,13 @@ type Definition struct {
 	typ   reflect.Type
 }
 
-// Define declares the stable wire label of graph attribute type T.
+// Define declares the stable wire label of graph attribute type T. Processes
+// that exchange updates must use the same label for compatible Go types.
+//
+// For example:
+//
+//	actor := graph.Define[Actor]("actor")
+//	health := graph.Define[Health]("health")
 func Define[T any](label string) Definition {
 	typ := reflect.TypeOf((*T)(nil)).Elem()
 	if typ.Kind() == reflect.Pointer {
@@ -51,6 +57,14 @@ type Wire struct {
 
 // NewWire creates a wire codec. Invalid, duplicate, or conflicting
 // definitions are programming errors and cause NewWire to panic.
+//
+// Independently constructed Wire values are compatible when their definitions
+// use the same labels and compatible Go representations:
+//
+//	wire := graph.NewWire(
+//		graph.Define[Actor]("actor"),
+//		graph.Define[Health]("health"),
+//	)
 func NewWire(definitions ...Definition) Wire {
 	w := Wire{
 		byType:  make(map[reflect.Type]Definition, len(definitions)),
@@ -86,7 +100,20 @@ type wireRemovedChild struct {
 }
 
 // ExportUpdate encodes changes in g since its Commit baseline. Exporting does
-// not advance or otherwise modify that baseline.
+// not advance or otherwise modify that baseline. If g is a Delta, ExportUpdate
+// encodes its already computed change view without recomputing the delta.
+//
+// Export a graph scope directly:
+//
+//	graph.Commit(source)
+//	graph.Set(actor, Health{Current: 80})
+//	update, err := wire.ExportUpdate(source)
+//
+// A precomputed delta can be inspected and then encoded as the same update:
+//
+//	delta := graph.Delta(source)
+//	// Inspect delta for application-specific purposes.
+//	update, err := wire.ExportUpdate(delta)
 func (w Wire) ExportUpdate(g Graph) ([]byte, error) {
 	if w.byType == nil || w.byLabel == nil {
 		return nil, errors.New("graph: zero Wire")
@@ -211,7 +238,14 @@ func writeWireRecord(out *bytes.Buffer, kind byte, writePayload func() error) er
 }
 
 // ImportUpdate decodes and applies an update to g. Unknown definitions are
-// skipped. Unknown data is not retained for a later re-export.
+// skipped. Unknown data is not retained for a later re-export. The destination
+// must be the replica scope corresponding to the exported source scope.
+//
+// For example:
+//
+//	if err := wire.ImportUpdate(replica, update); err != nil {
+//		return err
+//	}
 func (w Wire) ImportUpdate(g Graph, data []byte) (err error) {
 	if w.byType == nil || w.byLabel == nil {
 		return errors.New("graph: zero Wire")
