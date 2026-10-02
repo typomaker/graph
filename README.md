@@ -173,7 +173,10 @@ if err == nil {
 
 The graph passed to `ExportUpdate` is the spatial scope; only changes reachable
 from that selection are included. Export is non-consuming and never performs
-an implicit `Commit`. Existing roots are paired by selection order, and other
+an implicit `Commit`. A precomputed `Delta` may also be passed directly; Wire
+recognizes its private change view and encodes it without computing another
+delta. This is useful when the same delta is inspected locally before being
+sent over the network. Existing roots are paired by selection order, and other
 existing nodes are resolved from unchanged, uniquely matching defined
 attributes. A link to an unchanged node outside the encoded fragment is applied
 only when that node can be resolved in the replica scope; otherwise import

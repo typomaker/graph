@@ -91,10 +91,10 @@ func (w Wire) ExportUpdate(g Graph) ([]byte, error) {
 	if w.byType == nil || w.byLabel == nil {
 		return nil, errors.New("graph: zero Wire")
 	}
-	if g.view != nil {
-		return nil, errors.New("graph: cannot export a delta or view as an update scope")
+	delta := g
+	if delta.view == nil {
+		delta = Delta(g)
 	}
-	delta := Delta(g)
 
 	state.RLock()
 	defer state.RUnlock()

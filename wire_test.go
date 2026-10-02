@@ -228,11 +228,31 @@ func TestWireErrorsAndSchemaValidation(t *testing.T) {
 	if err := wire.ImportUpdate(replica, unsupported); err == nil {
 		t.Fatal("unsupported version was accepted")
 	}
-	if _, err := wire.ExportUpdate(Delta(source)); err == nil {
-		t.Fatal("delta scope was accepted")
-	}
 	if _, err := NewWire(Define[kind]("kind")).ExportUpdate(source); err == nil {
 		t.Fatal("incomplete schema was accepted")
+	}
+}
+
+func TestWireExportsPrecomputedDelta(t *testing.T) {
+	wire := testWire()
+	source := New(kind("root"), ident("root"), name("before"))
+	replica := wireReplica(source)
+	Commit(source)
+	Commit(replica)
+	Set(source, name("captured"))
+	delta := Delta(source)
+
+	// Later source mutations must not alter the already computed delta.
+	Set(source, name("later"))
+	update, err := wire.ExportUpdate(delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.ImportUpdate(replica, update); err != nil {
+		t.Fatal(err)
+	}
+	if value[name](t, replica) != "captured" {
+		t.Fatalf("imported %q instead of the precomputed delta", value[name](t, replica))
 	}
 }
 
