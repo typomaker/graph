@@ -31,6 +31,7 @@ type node struct {
 	parents         map[*node]struct{}
 	dirtyChildren   map[*node]struct{}
 	dirtyChildOrder []*node
+	queries         map[*reactiveQuery]struct{}
 	selfRev         uint64
 	treeRev         uint64
 	structureRev    uint64
@@ -125,18 +126,9 @@ type typeMatcher struct{ typ reflect.Type }
 
 var state struct {
 	sync.RWMutex
-	nextID         uint64
-	revision       uint64
-	mutationEvents []mutationEvent
+	nextID   uint64
+	revision uint64
 }
-
-type mutationEvent struct {
-	revision   uint64
-	node       *node
-	structural bool
-}
-
-const mutationEventLimit = 65536
 
 type matcher struct {
 	typ   reflect.Type
@@ -453,10 +445,11 @@ type reactiveQuery struct {
 	reachableEpoch  map[*node]uint64
 	epoch           uint64
 	changedInputs   []queryInputRevision
+	dirtyInputs     map[*node]struct{}
+	topologyDirty   bool
 	result          Graph
 	revisions       []uint64
 	evaluationCount uint64
-	eventRevision   uint64
 	closed          bool
 }
 
@@ -476,6 +469,7 @@ func newReactiveQuery(g Graph, selector func(Graph) Graph) *reactiveQuery {
 		references:     make(map[*node]uint64),
 		inputRevisions: make(map[*node]uint64),
 		reachableEpoch: make(map[*node]uint64),
+		dirtyInputs:    make(map[*node]struct{}),
 	}
 	query.Lock()
 	query.refreshLocked()
@@ -502,7 +496,7 @@ func (query *reactiveQuery) snapshot() Graph {
 func (query *reactiveQuery) refreshLocked() {
 	resultChanged := false
 	for {
-		before, full := query.changedInputsSinceLastRefresh()
+		before, full := query.takeInvalidations()
 		resultChanged = resultChanged || full
 		if full {
 			before = query.snapshotInputs()
@@ -514,6 +508,9 @@ func (query *reactiveQuery) refreshLocked() {
 			resultChanged = query.replaceResult(input, nil) || resultChanged
 			delete(query.results, input)
 			delete(query.inputRevisions, input)
+			state.Lock()
+			delete(input.queries, query)
+			state.Unlock()
 		}
 		for _, changed := range query.changedInputs {
 			input := changed.input
@@ -528,46 +525,26 @@ func (query *reactiveQuery) refreshLocked() {
 				query.rebuildResult()
 			}
 			query.revisions = after
-			state.RLock()
-			query.eventRevision = state.revision
-			state.RUnlock()
 			return
 		}
 	}
 }
 
-func (query *reactiveQuery) changedInputsSinceLastRefresh() ([]uint64, bool) {
+func (query *reactiveQuery) takeInvalidations() ([]uint64, bool) {
 	if len(query.inputRevisions) == 0 {
 		return nil, true
 	}
-	state.RLock()
-	defer state.RUnlock()
-	if len(state.mutationEvents) != 0 && query.eventRevision < state.mutationEvents[0].revision-1 {
-		return nil, true
-	}
+	state.Lock()
+	defer state.Unlock()
 	query.changedInputs = query.changedInputs[:0]
-	changed := make(map[*node]struct{})
-	structural := false
-	var visit func(*node)
-	visit = func(input *node) {
-		if _, duplicate := changed[input]; duplicate {
-			return
-		}
-		changed[input] = struct{}{}
+	for input := range query.dirtyInputs {
 		if _, active := query.inputRevisions[input]; active {
 			query.changedInputs = append(query.changedInputs, queryInputRevision{input: input, revision: input.treeRev})
 		}
-		for parent := range input.parents {
-			visit(parent)
-		}
 	}
-	for _, event := range state.mutationEvents {
-		if event.revision <= query.eventRevision {
-			continue
-		}
-		structural = structural || event.structural
-		visit(event.node)
-	}
+	clear(query.dirtyInputs)
+	structural := query.topologyDirty
+	query.topologyDirty = false
 	rootRevisions := make([]uint64, len(query.source.nodes))
 	for i, root := range query.source.nodes {
 		rootRevisions[i] = root.treeRev
@@ -576,8 +553,8 @@ func (query *reactiveQuery) changedInputsSinceLastRefresh() ([]uint64, bool) {
 }
 
 func (query *reactiveQuery) snapshotInputs() []uint64 {
-	state.RLock()
-	defer state.RUnlock()
+	state.Lock()
+	defer state.Unlock()
 	query.epoch++
 	query.inputOrder = query.inputOrder[:0]
 	query.changedInputs = query.changedInputs[:0]
@@ -587,6 +564,10 @@ func (query *reactiveQuery) snapshotInputs() []uint64 {
 			return
 		}
 		query.reachableEpoch[input] = query.epoch
+		if input.queries == nil {
+			input.queries = make(map[*reactiveQuery]struct{})
+		}
+		input.queries[query] = struct{}{}
 		query.inputOrder = append(query.inputOrder, input)
 		if revision, known := query.inputRevisions[input]; !known || revision != input.treeRev {
 			query.changedInputs = append(query.changedInputs, queryInputRevision{input: input, revision: input.treeRev})
@@ -663,6 +644,11 @@ func (query *reactiveQuery) close() {
 	if query.closed {
 		return
 	}
+	state.Lock()
+	for input := range query.inputRevisions {
+		delete(input.queries, query)
+	}
+	state.Unlock()
 	query.source = Graph{}
 	query.selector = nil
 	query.results = nil
@@ -671,6 +657,7 @@ func (query *reactiveQuery) close() {
 	query.inputOrder = nil
 	query.reachableEpoch = nil
 	query.changedInputs = nil
+	query.dirtyInputs = nil
 	query.result = Graph{}
 	query.revisions = nil
 	query.closed = true
@@ -1820,7 +1807,6 @@ func markDirtyChildLocked(parent, child *node) {
 }
 
 func propagateAttributeLocked(n *node, rev uint64) {
-	recordMutationEventLocked(n, rev, false)
 	seen := map[*node]struct{}{}
 	var visit func(*node, *node)
 	visit = func(x, changedChild *node) {
@@ -1831,6 +1817,7 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			return
 		}
 		seen[x] = struct{}{}
+		notifyQueriesLocked(x, false)
 		if x.treeRev < rev {
 			x.treeRev = rev
 		}
@@ -1874,7 +1861,6 @@ func postingHas(values posting, ordinal uint32) bool {
 }
 
 func propagateStructureLocked(n *node, rev uint64) {
-	recordMutationEventLocked(n, rev, true)
 	seen := map[*node]struct{}{}
 	var visit func(*node, *node)
 	visit = func(x, changedChild *node) {
@@ -1885,6 +1871,7 @@ func propagateStructureLocked(n *node, rev uint64) {
 			return
 		}
 		seen[x] = struct{}{}
+		notifyQueriesLocked(x, true)
 		if x.treeRev < rev {
 			x.treeRev = rev
 		}
@@ -1898,21 +1885,11 @@ func propagateStructureLocked(n *node, rev uint64) {
 	visit(n, nil)
 }
 
-func recordMutationEventLocked(n *node, revision uint64, structural bool) {
-	if len(state.mutationEvents) != 0 {
-		last := &state.mutationEvents[len(state.mutationEvents)-1]
-		if last.node == n {
-			last.revision = revision
-			last.structural = last.structural || structural
-			return
-		}
+func notifyQueriesLocked(n *node, structural bool) {
+	for query := range n.queries {
+		query.dirtyInputs[n] = struct{}{}
+		query.topologyDirty = query.topologyDirty || structural
 	}
-	if len(state.mutationEvents) == mutationEventLimit {
-		retained := mutationEventLimit / 2
-		copy(state.mutationEvents, state.mutationEvents[mutationEventLimit-retained:])
-		state.mutationEvents = state.mutationEvents[:retained]
-	}
-	state.mutationEvents = append(state.mutationEvents, mutationEvent{revision: revision, node: n, structural: structural})
 }
 
 func updateStructuralIndexesLocked(parent, child *node, linked bool) {
