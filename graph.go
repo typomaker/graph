@@ -406,19 +406,21 @@ func Each(g Graph) iter.Seq[Graph] {
 	}
 }
 
-// Query returns a reusable materialized iterator over the nodes matching
-// Search. It evaluates the search immediately, then refreshes the result lazily
-// at the beginning of an iteration when the reachable graph has changed.
+// Query returns a reusable materialized iterator over the union produced by
+// applying selector to each node in g. It evaluates selector immediately, then
+// refreshes only inputs whose reachable graph changed before an iteration.
 //
 // For example, this query always iterates over the currently visible nodes:
 //
-//	visible, close := Query(world, Visible(true))
+//	visible, close := Query(world, func(g Graph) Graph {
+//		return Search(g, Visible(true))
+//	})
 //	defer close()
 //	for node := range visible {
 //		// ...
 //	}
-func Query(g Graph, values ...any) (iter.Seq[Graph], func()) {
-	query := newReactiveQuery(g, values)
+func Query(g Graph, selector func(Graph) Graph) (iter.Seq[Graph], func()) {
+	query := newReactiveQuery(g, selector)
 	sequence := func(yield func(Graph) bool) {
 		result := query.snapshot()
 		for node := range Each(result) {
@@ -432,19 +434,28 @@ func Query(g Graph, values ...any) (iter.Seq[Graph], func()) {
 
 type reactiveQuery struct {
 	sync.Mutex
-	source      Graph
-	conditions  []any
-	result      Graph
-	revisions   []uint64
-	searchCount uint64
-	closed      bool
+	source          Graph
+	selector        func(Graph) Graph
+	results         map[*node][]*node
+	references      map[*node]uint64
+	result          Graph
+	revisions       []uint64
+	evaluationCount uint64
+	closed          bool
 }
 
-func newReactiveQuery(g Graph, values []any) *reactiveQuery {
-	conditions := append([]any(nil), values...)
-	query := &reactiveQuery{source: g, conditions: conditions}
+func newReactiveQuery(g Graph, selector func(Graph) Graph) *reactiveQuery {
+	if selector == nil {
+		panic("graph: nil query selector")
+	}
+	query := &reactiveQuery{
+		source:     g,
+		selector:   selector,
+		results:    make(map[*node][]*node, len(g.nodes)),
+		references: make(map[*node]uint64),
+	}
 	query.Lock()
-	query.refreshLocked()
+	query.refreshLocked(graphRevisions(g))
 	query.Unlock()
 	return query
 }
@@ -456,7 +467,7 @@ func (query *reactiveQuery) snapshot() Graph {
 		return Graph{}
 	}
 	if revisions := graphRevisions(query.source); !slices.Equal(query.revisions, revisions) {
-		query.refreshLocked()
+		query.refreshLocked(revisions)
 	}
 	return Graph{
 		nodes: append([]*node(nil), query.result.nodes...),
@@ -465,18 +476,70 @@ func (query *reactiveQuery) snapshot() Graph {
 	}
 }
 
-func (query *reactiveQuery) refreshLocked() {
+func (query *reactiveQuery) refreshLocked(before []uint64) {
 	for {
-		before := graphRevisions(query.source)
-		query.searchCount++
-		result := Search(query.source, query.conditions...)
+		for i, input := range query.source.nodes {
+			if i < len(query.revisions) && query.revisions[i] == before[i] {
+				continue
+			}
+			query.evaluationCount++
+			result := query.selector(Graph{nodes: []*node{input}, view: query.source.view, index: query.source.index})
+			query.replaceResult(input, result.nodes)
+		}
 		after := graphRevisions(query.source)
 		if slices.Equal(before, after) {
-			query.result = result
+			query.rebuildResult()
 			query.revisions = after
 			return
 		}
+		before = after
 	}
+}
+
+func (query *reactiveQuery) replaceResult(input *node, nodes []*node) {
+	for _, result := range query.results[input] {
+		query.references[result]--
+		if query.references[result] == 0 {
+			delete(query.references, result)
+		}
+	}
+	unique := make([]*node, 0, len(nodes))
+	var seen map[*node]struct{}
+	if len(nodes) > 1 {
+		seen = make(map[*node]struct{}, len(nodes))
+	}
+	for _, result := range nodes {
+		if result == nil {
+			continue
+		}
+		if seen != nil {
+			if _, duplicate := seen[result]; duplicate {
+				continue
+			}
+			seen[result] = struct{}{}
+		}
+		unique = append(unique, result)
+		query.references[result]++
+	}
+	query.results[input] = unique
+}
+
+func (query *reactiveQuery) rebuildResult() {
+	nodes := make([]*node, 0, len(query.references))
+	seen := make(map[*node]struct{}, len(query.references))
+	for _, input := range query.source.nodes {
+		for _, result := range query.results[input] {
+			if query.references[result] == 0 {
+				continue
+			}
+			if _, duplicate := seen[result]; duplicate {
+				continue
+			}
+			seen[result] = struct{}{}
+			nodes = append(nodes, result)
+		}
+	}
+	query.result = Graph{nodes: nodes}
 }
 
 func (query *reactiveQuery) close() {
@@ -486,7 +549,9 @@ func (query *reactiveQuery) close() {
 		return
 	}
 	query.source = Graph{}
-	query.conditions = nil
+	query.selector = nil
+	query.results = nil
+	query.references = nil
 	query.result = Graph{}
 	query.revisions = nil
 	query.closed = true
