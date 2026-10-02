@@ -673,6 +673,11 @@ func Follow(g Graph, values ...any) Graph {
 // Search recursively filters every node reachable from the current selection
 // and returns matching starts.
 func Search(g Graph, values ...any) Graph {
+	if len(values) == 1 {
+		if result, ok := searchAtomicIndexed(g, values[0]); ok {
+			return result
+		}
+	}
 	condition := buildPredicate(predicateAnd, values)
 	if result, rebuilt := searchWhileRebuildingOrder(g, condition); rebuilt {
 		return result
@@ -738,6 +743,55 @@ func Search(g Graph, values ...any) Graph {
 		visit(root)
 	}
 	return Graph{nodes: out, view: g.view}
+}
+
+func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
+	m, ok := atomicMatcher(value)
+	if !ok {
+		return Graph{}, false
+	}
+	state.RLock()
+	defer state.RUnlock()
+	if len(g.nodes) != 1 || g.view != nil {
+		return Graph{}, false
+	}
+	root := g.nodes[0]
+	if !validSearchIndex(root) {
+		return Graph{}, false
+	}
+	index := root.index
+	if index.orderDirty || len(index.dirty) != 0 || len(index.addedEdges) != 0 || len(index.removedEdges) != 0 ||
+		len(index.removed) != 0 || index.hasActiveAddedNodes() {
+		return Graph{}, false
+	}
+	var matches posting
+	if m.any {
+		matches = index.byType[m.typ]
+	} else {
+		matches = index.byValue[m.typ][m.value]
+	}
+	nodes := make([]*node, len(matches))
+	for i, ordinal := range matches {
+		nodes[i] = index.nodes[ordinal]
+	}
+	return Graph{nodes: nodes, index: index}, true
+}
+
+func atomicMatcher(value any) (matcher, bool) {
+	if typed, ok := value.(typeMatcher); ok {
+		return matcher{typ: typed.typ, any: true}, true
+	}
+	if value == nil {
+		return matcher{}, false
+	}
+	if _, expression := value.(predicateExpression); expression {
+		return matcher{}, false
+	}
+	typ := reflect.TypeOf(value)
+	if typ.Kind() == reflect.Pointer || typ.Kind() == reflect.Interface || !typ.Comparable() {
+		return matcher{}, false
+	}
+	return matcher{typ: typ, value: value}, true
 }
 
 func (index *searchIndex) streamCleanOrMatches(condition *predicate) ([]*node, bool) {

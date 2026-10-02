@@ -94,6 +94,25 @@ func TestSelectFollowAndSearch(t *testing.T) {
 	}
 }
 
+func TestAtomicMatcherValidation(t *testing.T) {
+	if _, ok := atomicMatcher(nil); ok {
+		t.Fatal("nil matcher accepted")
+	}
+	if _, ok := atomicMatcher(Path(kind("actor"))); ok {
+		t.Fatal("predicate expression accepted as atomic")
+	}
+	value := kind("actor")
+	if _, ok := atomicMatcher(&value); ok {
+		t.Fatal("pointer matcher accepted")
+	}
+	if _, ok := atomicMatcher([]int{1}); ok {
+		t.Fatal("non-comparable matcher accepted")
+	}
+	if m, ok := atomicMatcher(Type[kind]()); !ok || !m.any || m.typ != reflect.TypeOf(kind("")) {
+		t.Fatal("type matcher rejected")
+	}
+}
+
 func TestFollowCombinesStructuralExpressions(t *testing.T) {
 	root := New(name("root"), marker{})
 	a := New(kind("a"))
