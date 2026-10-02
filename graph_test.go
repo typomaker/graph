@@ -492,6 +492,35 @@ func TestQueryRejectsNilSelector(t *testing.T) {
 	Query(New(kind("root")), nil)
 }
 
+func TestMutationEventJournalCoalescesAndCompacts(t *testing.T) {
+	firstNode := first(New(kind("first")))
+	secondNode := first(New(kind("second")))
+	state.Lock()
+	saved := state.mutationEvents
+	state.mutationEvents = nil
+	defer func() {
+		state.mutationEvents = saved
+		state.Unlock()
+	}()
+
+	recordMutationEventLocked(firstNode, 1, false)
+	recordMutationEventLocked(firstNode, 2, true)
+	if len(state.mutationEvents) != 1 || state.mutationEvents[0].revision != 2 || !state.mutationEvents[0].structural {
+		t.Fatal("consecutive mutation events were not coalesced")
+	}
+	state.mutationEvents = nil
+	for i := uint64(0); i <= mutationEventLimit; i++ {
+		n := firstNode
+		if i%2 != 0 {
+			n = secondNode
+		}
+		recordMutationEventLocked(n, i+1, false)
+	}
+	if len(state.mutationEvents) != mutationEventLimit/2+1 {
+		t.Fatalf("compacted journal length = %d", len(state.mutationEvents))
+	}
+}
+
 func collectNames(t *testing.T, sequence func(func(Graph) bool)) []name {
 	t.Helper()
 	var names []name
