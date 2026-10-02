@@ -141,6 +141,26 @@ target = graph.Apply(target, changes)
 graph.Commit(source)
 ```
 
+`Materialize` resolves a sparse view, such as a delta, back to the current
+nodes in its source. The view determines which nodes and links remain visible;
+the source supplies their current attributes. Nodes removed from the source
+are omitted, and unchanged siblings or descendants are not added. `Unnest`
+turns that reachable view into a flat, duplicate-free selection, while `Each`
+remains the iteration operation:
+
+```go
+delta := graph.Delta(source, graph.Type[ID]())
+current := graph.Materialize(source, delta)
+for node := range graph.Each(graph.Unnest(current)) {
+	// Inspect current state.
+}
+```
+
+`Materialize` automatically uses identity recorded by `Delta`. For another
+view, pass the same optional identity matchers used by `Delta` and `Apply`.
+An ordinary (non-structural) selection is materialized as a flat selection;
+the operation never infers additional topology from `source`.
+
 `Patch` additively merges an ordinary graph by a required composite key:
 
 ```go

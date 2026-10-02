@@ -415,6 +415,19 @@ func Each(g Graph) iter.Seq[Graph] {
 	}
 }
 
+// Unnest returns a flat selection containing every node reachable through g's
+// current view. Roots are included and shared nodes occur only once. Each is
+// the iteration primitive for the returned selection.
+//
+// For example:
+//
+//	for node := range Each(Unnest(root)) {
+//		// Inspect node.
+//	}
+func Unnest(g Graph) Graph {
+	return Search(g, Type[any]())
+}
+
 // Query returns a reusable materialized iterator over the nodes matching
 // Search. It evaluates the search immediately, then refreshes the result lazily
 // at the beginning of an iteration when the reachable graph has changed.
@@ -1058,6 +1071,134 @@ func Delta(g Graph, matchBy ...any) Graph {
 		return Graph{}
 	}
 	return Graph{nodes: roots, view: view}
+}
+
+// Materialize resolves the nodes in view against source and returns their
+// current source state while preserving view's roots and restricted topology.
+// It does not add source descendants or siblings that are absent from view.
+// Nodes that are no longer reachable from source are omitted. Optional
+// identity attributes use the same composite identity semantics as Delta and
+// Apply; a Delta's recorded identity is used automatically.
+//
+// For example:
+//
+//	delta := Delta(source, Type[EntityID]())
+//	current := Materialize(source, delta)
+func Materialize(source, view Graph, matchBy ...any) Graph {
+	state.Lock()
+	defer state.Unlock()
+
+	viewNodes := selected(view)
+	if view.view != nil {
+		viewNodes = reachableViewLocked(viewNodes, view.view)
+	}
+	if len(viewNodes) == 0 || len(selected(source)) == 0 {
+		return Graph{}
+	}
+
+	keyTypes := identityTypes(matchBy)
+	if len(keyTypes) == 0 && view.view != nil {
+		keyTypes = view.view.matchTypes
+	}
+	indexed := make([]*searchIndex, 0, len(selected(source)))
+	allIndexed := true
+	for _, root := range selected(source) {
+		if !validSearchIndex(root) {
+			allIndexed = false
+			break
+		}
+		indexed = append(indexed, root.index)
+	}
+
+	var scope []*node
+	var scopeSet map[*node]struct{}
+	var targets map[uint64]*node
+	var keyedTargets *compositeIndex
+	if !allIndexed {
+		scope = reachableLocked(selected(source))
+		scopeSet = nodeSet(scope)
+		if len(keyTypes) == 0 {
+			targets = make(map[uint64]*node, len(scope))
+			for _, n := range scope {
+				if previous := targets[n.key]; previous != nil && previous != n {
+					panic("graph: source contains duplicate node identity")
+				}
+				targets[n.key] = n
+			}
+		} else {
+			keyedTargets = newCompositeIndex(keyTypes, scope)
+		}
+	}
+
+	attrsFor := func(n *node) map[reflect.Type]any {
+		if view.view != nil {
+			if change, ok := view.view.changes[n]; ok && change.snapshot != nil {
+				return change.snapshot
+			}
+		}
+		return n.attrs
+	}
+	resolve := func(n *node) *node {
+		var match *node
+		accept := func(candidate *node) {
+			if candidate == nil {
+				return
+			}
+			if match != nil && match != candidate {
+				panic("graph: multiple source nodes match identity")
+			}
+			match = candidate
+		}
+		if allIndexed {
+			for _, index := range indexed {
+				if len(keyTypes) == 0 {
+					if _, active := index.active[n]; active {
+						accept(n)
+					} else {
+						accept(index.activeNodeByKey(n.key))
+					}
+				} else {
+					accept(index.compositeIndexLocked(keyTypes).find(attrsFor(n)))
+				}
+			}
+			return match
+		}
+		if len(keyTypes) == 0 {
+			if _, active := scopeSet[n]; active {
+				return n
+			}
+			return targets[n.key]
+		}
+		return keyedTargets.find(attrsFor(n))
+	}
+
+	mapped := make(map[*node]*node, len(viewNodes))
+	for _, n := range viewNodes {
+		if target := resolve(n); target != nil {
+			mapped[n] = target
+		}
+	}
+	materializedView := &subgraph{edges: make(map[*node][]*node)}
+	if view.view != nil {
+		for _, parent := range viewNodes {
+			targetParent := mapped[parent]
+			if targetParent == nil {
+				continue
+			}
+			for _, child := range view.view.edges[parent] {
+				if targetChild := mapped[child]; targetChild != nil {
+					materializedView.edges[targetParent] = append(materializedView.edges[targetParent], targetChild)
+				}
+			}
+		}
+	}
+	roots := make([]*node, 0, len(selected(view)))
+	for _, root := range selected(view) {
+		if target := mapped[root]; target != nil {
+			roots = append(roots, target)
+		}
+	}
+	return Graph{nodes: roots, view: materializedView}
 }
 
 // Apply merges a Delta result into g and returns the corresponding roots.

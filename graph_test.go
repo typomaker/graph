@@ -164,6 +164,233 @@ func TestSelectionAndRelations(t *testing.T) {
 	}
 }
 
+func TestUnnest(t *testing.T) {
+	if !Empty(Unnest(Graph{})) {
+		t.Fatal("empty graph produced nodes")
+	}
+
+	a := New(name("a"))
+	b := New(name("b"))
+	c := New(name("c"))
+	d := New(name("d"))
+	e := New(name("e"))
+	Link(a, b, c)
+	Link(b, d)
+	Link(c, d)
+	Link(d, e)
+
+	flat := Unnest(a)
+	if Len(flat) != 5 {
+		t.Fatalf("unnest length = %d, want 5", Len(flat))
+	}
+	got := make(map[name]int)
+	for node := range Each(flat) {
+		got[value[name](t, node)]++
+	}
+	for _, want := range []name{"a", "b", "c", "d", "e"} {
+		if got[want] != 1 {
+			t.Fatalf("node %q occurred %d times", want, got[want])
+		}
+	}
+	if Len(Unnest(Union(b, c))) != 4 {
+		t.Fatal("multiple roots or shared descendant not deduplicated")
+	}
+	if Len(Unnest(Search(a, name("b")))) != 3 {
+		t.Fatal("subgraph root was not respected")
+	}
+	if Len(children(a)) != 2 || Len(children(b)) != 1 {
+		t.Fatal("unnest changed its input")
+	}
+}
+
+func TestMaterializePreservesDeltaView(t *testing.T) {
+	root := New(name("root"), health{100, 100})
+	left := New(name("left"), health{80, 100})
+	right := New(name("right"))
+	leaf := New(name("leaf"))
+	Link(root, left, right)
+	Link(left, leaf)
+	Commit(root)
+
+	Set(left, health{70, 100})
+	delta := Delta(root)
+	Set(left, health{60, 100})
+	current := Materialize(root, delta)
+	if Len(Unnest(current)) != 2 {
+		t.Fatalf("materialized nodes = %d, want root and left", Len(Unnest(current)))
+	}
+	if Len(children(current)) != 1 || value[name](t, children(current)) != "left" {
+		t.Fatal("delta topology was not preserved")
+	}
+	materializedLeft := children(current)
+	if got := value[health](t, materializedLeft); got != (health{60, 100}) {
+		t.Fatalf("health = %#v", got)
+	}
+	if !Empty(children(materializedLeft)) {
+		t.Fatal("unchanged descendant was added")
+	}
+	if !Empty(Search(current, name("right"))) {
+		t.Fatal("unchanged sibling was added")
+	}
+}
+
+func TestMaterializeAttributesLinksAndRemovals(t *testing.T) {
+	root := New(name("root"))
+	child := New(name("child"), health{10, 10}, marker{})
+	added := New(name("added"))
+	Link(root, child)
+	Commit(root)
+
+	Set(child, health{5, 10})
+	Unset[marker](child)
+	Link(child, added)
+	current := Materialize(root, Delta(root))
+	materializedChild := Search(current, name("child"))
+	if value[health](t, materializedChild) != (health{5, 10}) {
+		t.Fatal("changed attribute was not materialized")
+	}
+	if _, ok := Get[marker](materializedChild); ok {
+		t.Fatal("removed attribute was restored")
+	}
+	if Len(children(materializedChild)) != 1 || value[name](t, children(materializedChild)) != "added" {
+		t.Fatal("added link was not materialized")
+	}
+
+	Commit(root)
+	Unlink(child, added)
+	current = Materialize(root, Delta(root))
+	materializedChild = Search(current, name("child"))
+	if !Empty(children(materializedChild)) || !Empty(Search(current, name("added"))) {
+		t.Fatal("removed link or node was restored")
+	}
+
+	Commit(root)
+	Unlink(root, child)
+	current = Materialize(root, Delta(root))
+	if Len(Unnest(current)) != 1 || !Empty(Search(current, name("child"))) {
+		t.Fatal("removed node was restored")
+	}
+}
+
+func TestMaterializeSharedNodesRootsAndIdentity(t *testing.T) {
+	firstRoot := New(name("first-root"), ident("first-root"))
+	secondRoot := New(name("second-root"), ident("second-root"))
+	left := New(name("left"), ident("left"))
+	right := New(name("right"), ident("right"))
+	shared := New(name("shared"), ident("shared"), health{1, 2})
+	Link(firstRoot, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Link(secondRoot, shared)
+	Commit(Union(firstRoot, secondRoot))
+
+	Set(shared, health{2, 2})
+	current := Materialize(Union(firstRoot, secondRoot), Delta(Union(firstRoot, secondRoot), Type[ident]()))
+	if Len(Unnest(current)) != 5 {
+		t.Fatalf("shared multi-root materialization has %d nodes", Len(Unnest(current)))
+	}
+	if Len(Search(current, ident("shared"))) != 1 {
+		t.Fatal("shared node was duplicated")
+	}
+	if value[health](t, Search(current, ident("shared"))) != (health{2, 2}) {
+		t.Fatal("shared node is stale")
+	}
+
+	detachedReference := New(ident("shared"))
+	resolved := Materialize(firstRoot, detachedReference, Type[ident]())
+	if Len(resolved) != 1 || value[name](t, resolved) != "shared" {
+		t.Fatal("unchanged reference did not resolve through identity")
+	}
+	missing := Materialize(firstRoot, New(ident("missing")), Type[ident]())
+	if !Empty(missing) {
+		t.Fatal("node absent from source was materialized")
+	}
+}
+
+func TestMaterializeDeltaUnnestEachIntegration(t *testing.T) {
+	root := New(name("root"), ident("root"))
+	changed := New(name("changed"), ident("changed"), health{10, 10})
+	untouched := New(name("untouched"), ident("untouched"))
+	descendant := New(name("descendant"), ident("descendant"))
+	Link(root, changed, untouched)
+	Link(changed, descendant)
+	Commit(root)
+	Set(changed, health{7, 10})
+
+	delta := Delta(root, Type[ident]())
+	current := Materialize(root, delta)
+	seen := make(map[ident]struct{})
+	for node := range Each(Unnest(current)) {
+		seen[value[ident](t, node)] = struct{}{}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("materialized selection = %v", seen)
+	}
+	if _, ok := seen["root"]; !ok {
+		t.Fatal("changed path root missing")
+	}
+	if _, ok := seen["changed"]; !ok {
+		t.Fatal("changed node missing")
+	}
+	if _, ok := seen["untouched"]; ok {
+		t.Fatal("untouched sibling appeared")
+	}
+	if _, ok := seen["descendant"]; ok {
+		t.Fatal("untouched descendant appeared")
+	}
+}
+
+func TestMaterializeResolutionPaths(t *testing.T) {
+	if !Empty(Materialize(Graph{}, Graph{})) {
+		t.Fatal("empty materialization produced nodes")
+	}
+
+	source := New(name("source"), ident("source"))
+	child := New(name("child"), ident("child"))
+	Link(source, child)
+	if got := Materialize(source, child); Len(got) != 1 || value[name](t, got) != "child" {
+		t.Fatal("unindexed physical node did not resolve")
+	}
+	reference := New(ident("child"))
+	if got := Materialize(source, reference, Type[ident]()); Len(got) != 1 || value[name](t, got) != "child" {
+		t.Fatal("unindexed composite identity did not resolve")
+	}
+	if !Empty(Materialize(source, New(name("missing")))) {
+		t.Fatal("unindexed missing internal identity resolved")
+	}
+
+	Commit(source)
+	internalReference := &node{key: first(child).key}
+	if got := Materialize(source, Graph{nodes: []*node{internalReference}}); Len(got) != 1 || value[name](t, got) != "child" {
+		t.Fatal("indexed internal identity did not resolve")
+	}
+
+	missing := New(name("missing-view"))
+	restricted := &subgraph{
+		edges: map[*node][]*node{
+			first(source):  {first(missing)},
+			first(missing): {first(child)},
+		},
+		changes: map[*node]nodeChange{},
+	}
+	got := Materialize(source, Graph{nodes: []*node{first(source), first(missing)}, view: restricted})
+	if Len(got) != 1 || !Empty(children(got)) {
+		t.Fatal("unresolved structural nodes or edges were retained")
+	}
+}
+
+func TestMaterializeRejectsAmbiguousIdentity(t *testing.T) {
+	firstSource := New(name("first"), ident("duplicate"))
+	secondSource := New(name("second"), ident("duplicate"))
+	Commit(Union(firstSource, secondSource))
+	defer func() {
+		if recover() == nil {
+			t.Fatal("ambiguous identity did not panic")
+		}
+	}()
+	Materialize(Union(firstSource, secondSource), New(ident("duplicate")), Type[ident]())
+}
+
 func TestCyclePanics(t *testing.T) {
 	a := New(name("a"))
 	b := New(name("b"))
