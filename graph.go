@@ -52,6 +52,10 @@ type searchIndex struct {
 	compositeIndexes  []cachedCompositeIndex
 	dirty             map[uint32]struct{}
 	dirtyOrdinals     posting
+	dirtyByType       map[reflect.Type]posting
+	dirtyByValue      map[reflect.Type]map[any]posting
+	dirtySnapshots    map[uint32]map[reflect.Type]any
+	dirtyIndexed      bool
 	overlayRevision   uint64
 	removed           map[uint32]struct{}
 	removedOrdinals   posting
@@ -78,6 +82,7 @@ type searchIndex struct {
 }
 
 const addedPostingThreshold = 32
+const dirtyPostingThreshold = 32
 
 type posting []uint32
 
@@ -752,12 +757,7 @@ func (index *searchIndex) streamCurrentMatches(condition *predicate) ([]*node, b
 	}
 	base := index.match(condition)
 	excluded := unionPostings(index.dirtyOrdinals, index.removedOrdinals)
-	replacements := make(posting, 0, len(index.dirtyOrdinals))
-	for _, ordinal := range index.dirtyOrdinals {
-		if index.activeByOrdinal[ordinal] && matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
-			replacements = append(replacements, ordinal)
-		}
-	}
+	replacements := index.activePosting(index.matchDirty(condition))
 	if index.addedIndexed {
 		added := index.matchAdded(condition)
 		if len(base) == 0 && len(excluded) == 0 && len(replacements) == 0 {
@@ -1673,8 +1673,16 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			if ordinal, exists := x.index.ordinal[n]; exists {
 				if x.index.attributesCommitted(n, ordinal) {
 					delete(x.index.dirty, ordinal)
+					if x.index.dirtyIndexed {
+						x.index.updateDirtyPostingsLocked(ordinal, nil)
+					}
 				} else {
 					x.index.dirty[ordinal] = struct{}{}
+					if x.index.dirtyIndexed {
+						x.index.updateDirtyPostingsLocked(ordinal, n.attrs)
+					} else if len(x.index.dirty) >= dirtyPostingThreshold {
+						x.index.rebuildDirtyPostingsLocked()
+					}
 				}
 			} else if _, exists := x.index.addedOrdinal[n]; exists && x.index.addedIndexed {
 				x.index.rebuildAddedPostingsLocked()
@@ -1700,6 +1708,71 @@ func (index *searchIndex) attributesCommitted(n *node, ordinal uint32) bool {
 		}
 	}
 	return committedCount == len(n.attrs)
+}
+
+func (index *searchIndex) updateDirtyPostingsLocked(ordinal uint32, attrs map[reflect.Type]any) {
+	previous := index.dirtySnapshots[ordinal]
+	if previous != nil {
+		for typ, value := range previous {
+			index.dirtyByType[typ] = removePostingOrdinal(index.dirtyByType[typ], ordinal)
+			values := index.dirtyByValue[typ]
+			if values != nil {
+				values[value] = removePostingOrdinal(values[value], ordinal)
+				if len(values[value]) == 0 {
+					delete(values, value)
+				}
+			}
+		}
+		clear(previous)
+	}
+	if attrs == nil {
+		return
+	}
+	if previous == nil {
+		previous = make(map[reflect.Type]any, len(attrs))
+		index.dirtySnapshots[ordinal] = previous
+	}
+	for typ, value := range attrs {
+		index.dirtyByType[typ] = insertPostingOrdinal(index.dirtyByType[typ], ordinal)
+		if index.byValue[typ] != nil {
+			previous[typ] = value
+			values := index.dirtyByValue[typ]
+			if values == nil {
+				values = make(map[any]posting)
+				index.dirtyByValue[typ] = values
+			}
+			values[value] = insertPostingOrdinal(values[value], ordinal)
+		} else {
+			previous[typ] = nil
+		}
+	}
+}
+
+func (index *searchIndex) rebuildDirtyPostingsLocked() {
+	for ordinal := range index.dirty {
+		index.updateDirtyPostingsLocked(ordinal, index.nodes[ordinal].attrs)
+	}
+	index.dirtyIndexed = true
+}
+
+func insertPostingOrdinal(values posting, ordinal uint32) posting {
+	position, found := slices.BinarySearch(values, ordinal)
+	if found {
+		return values
+	}
+	values = append(values, 0)
+	copy(values[position+1:], values[position:])
+	values[position] = ordinal
+	return values
+}
+
+func removePostingOrdinal(values posting, ordinal uint32) posting {
+	position, found := slices.BinarySearch(values, ordinal)
+	if !found {
+		return values
+	}
+	copy(values[position:], values[position+1:])
+	return values[:len(values)-1]
 }
 
 func postingHas(values posting, ordinal uint32) bool {
@@ -2198,6 +2271,9 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		byKey:             make(map[uint64]*node, len(nodes)),
 		sameKey:           make(map[*node]*node),
 		dirty:             make(map[uint32]struct{}),
+		dirtyByType:       make(map[reflect.Type]posting),
+		dirtyByValue:      make(map[reflect.Type]map[any]posting),
+		dirtySnapshots:    make(map[uint32]map[reflect.Type]any),
 		overlayRevision:   root.structureRev,
 		removed:           make(map[uint32]struct{}),
 		affected:          make(map[uint32]struct{}),
@@ -2340,12 +2416,7 @@ func (index *searchIndex) matchCurrent(condition *predicate) posting {
 	affected := index.dirtyPosting(path)
 	removed := index.removedOrdinals
 	excluded := unionPostings(affected, removed)
-	current := make(posting, 0, len(affected))
-	for _, ordinal := range affected {
-		if _, unreachable := index.removed[ordinal]; !unreachable && matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
-			current = append(current, ordinal)
-		}
-	}
+	current := index.activePosting(index.matchDirty(condition))
 	if index.addedIndexed && !path {
 		current = index.appendActiveAdded(current, index.matchAdded(condition))
 	} else {
@@ -2394,17 +2465,69 @@ func (index *searchIndex) matchOverlay(condition *predicate) posting {
 	}
 }
 
+func (index *searchIndex) matchDirty(condition *predicate) posting {
+	if !index.dirtyIndexed {
+		result := make(posting, 0, len(index.dirtyOrdinals))
+		for _, ordinal := range index.dirtyOrdinals {
+			if matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
+				result = append(result, ordinal)
+			}
+		}
+		return result
+	}
+	switch condition.op {
+	case predicateMatch:
+		if condition.matcher.any {
+			return index.dirtyByType[condition.matcher.typ]
+		}
+		if index.byValue[condition.matcher.typ] == nil {
+			result := make(posting, 0)
+			for _, ordinal := range index.dirtyOrdinals {
+				if matchesMatcherLocked(index.nodes[ordinal], condition.matcher) {
+					result = append(result, ordinal)
+				}
+			}
+			return result
+		}
+		return index.dirtyByValue[condition.matcher.typ][condition.matcher.value]
+	case predicateAny:
+		return index.dirtyOrdinals
+	case predicateAnd:
+		result := index.dirtyOrdinals
+		for _, child := range condition.children {
+			result = intersectPostings(result, index.matchDirty(child))
+			if len(result) == 0 {
+				return nil
+			}
+		}
+		return result
+	case predicateOr:
+		var result posting
+		for _, child := range condition.children {
+			result = unionPostings(result, index.matchDirty(child))
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func (index *searchIndex) activePosting(values posting) posting {
+	result := make(posting, 0, len(values))
+	for _, ordinal := range values {
+		if index.activeByOrdinal[ordinal] {
+			result = append(result, ordinal)
+		}
+	}
+	return result
+}
+
 func (index *searchIndex) matchAtomicOverlay(condition *predicate) posting {
 	base := index.match(condition)
 	dirty := index.dirtyOrdinals
 	removed := index.removedOrdinals
 	excluded := unionPostings(dirty, removed)
-	replacements := make(posting, 0, len(dirty))
-	for _, ordinal := range dirty {
-		if index.activeByOrdinal[ordinal] && matchesPredicateLocked(index.nodes[ordinal], condition, nil) {
-			replacements = append(replacements, ordinal)
-		}
-	}
+	replacements := index.activePosting(index.matchDirty(condition))
 	if index.addedIndexed {
 		replacements = index.appendActiveAdded(replacements, index.matchAdded(condition))
 	} else {

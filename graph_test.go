@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -807,6 +808,47 @@ func TestAddedPathOverlayUsesCurrentReverseEdges(t *testing.T) {
 		defer expectPanic(t)
 		first(root).index.matchOverlay(&predicate{op: predicateOp(255)})
 	}()
+}
+
+func TestDirtyPostingIndexTracksLargeAttributeOverlay(t *testing.T) {
+	root := New(kind("root"))
+	nodes := make([]Graph, dirtyPostingThreshold)
+	for i := range nodes {
+		nodes[i] = New(kind("actor"), ident(fmt.Sprint(i)), benchmarkGroup(i%2))
+		Link(root, nodes[i])
+	}
+	Commit(root)
+	for _, node := range nodes {
+		Set(node, benchmarkGroup(3))
+	}
+	index := first(root).index
+	if !index.dirtyIndexed || Len(Search(root, benchmarkGroup(3))) != len(nodes) {
+		t.Fatal("large dirty overlay was not indexed")
+	}
+	if Len(Search(root, And(benchmarkGroup(3), ident("5")))) != 1 || Len(Search(root, Or(benchmarkGroup(0), benchmarkGroup(3)))) != len(nodes) {
+		t.Fatal("dirty logical postings")
+	}
+	Set(nodes[0], benchmarkGroup(0))
+	Set(nodes[1], benchmarkGroup(3))
+	Set(nodes[1], benchmarkVersion(7))
+	if Len(Search(root, benchmarkGroup(3))) != len(nodes)-1 || Len(Search(root, benchmarkVersion(7))) != 1 {
+		t.Fatal("dirty posting update")
+	}
+	Unset[benchmarkVersion](nodes[1])
+	if !Empty(Search(root, benchmarkVersion(7))) || Len(Search(root, Type[benchmarkGroup]())) != len(nodes) {
+		t.Fatal("dirty posting removal")
+	}
+	if Len(Search(root, Type[any]())) != len(nodes)+1 || index.matchDirty(predicateFromValue(Path(kind("actor")))) != nil {
+		t.Fatal("dirty wildcard posting")
+	}
+	values := insertPostingOrdinal(nil, 2)
+	values = insertPostingOrdinal(values, 2)
+	values = insertPostingOrdinal(values, 1)
+	values = removePostingOrdinal(values, 3)
+	values = removePostingOrdinal(values, 1)
+	if !reflect.DeepEqual(values, posting{2}) {
+		t.Fatalf("posting helpers = %v", values)
+	}
 }
 
 func TestDenseCommittedPathExpansion(t *testing.T) {
