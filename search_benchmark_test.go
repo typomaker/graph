@@ -93,6 +93,7 @@ func BenchmarkSearchPredicateDiagnostics(b *testing.B) {
 		{"AndCommonExact", And(benchmarkGroup(0), benchmarkID("5000")), 1},
 		{"AndCommonMissing", And(benchmarkGroup(0), benchmarkID("missing")), 0},
 		{"OrTwoCommon", Or(benchmarkGroup(0), benchmarkGroup(1)), 2000},
+		{"OrFiveCommon", Or(benchmarkGroup(0), benchmarkGroup(1), benchmarkGroup(2), benchmarkGroup(3), benchmarkGroup(4)), 5000},
 		{"TypeAll", Type[benchmarkKind](), 10001},
 	}
 	for _, benchmark := range cases {

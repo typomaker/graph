@@ -611,6 +611,12 @@ func TestCommitBuildsAndInvalidatesSearchIndex(t *testing.T) {
 	if got := Search(root, kind("actor"), ident("two")); Len(got) != 1 || value[ident](t, got) != "two" {
 		t.Fatal("indexed attribute search")
 	}
+	if Len(Search(root, Or(kind("world"), ident("one"), ident("two")))) != 3 {
+		t.Fatal("indexed multi-way or")
+	}
+	if Len(Search(root, Or(kind("actor"), ident("two")))) != 2 || Len(Search(root, Or(ident("two"), kind("actor")))) != 2 {
+		t.Fatal("indexed two-way or")
+	}
 
 	Set(secondActor, ident("changed"))
 	if !validSearchIndex(first(root)) || len(first(root).index.dirty) != 1 {

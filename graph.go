@@ -686,6 +686,9 @@ func Search(g Graph, values ...any) Graph {
 		if out, streamed := index.streamCurrentMatches(condition); streamed {
 			return Graph{nodes: out, index: index}
 		}
+		if out, streamed := index.streamCleanOrMatches(condition); streamed {
+			return Graph{nodes: out, index: index}
+		}
 		matches := index.orderMatches(index.matchCurrent(condition))
 		out := make([]*node, len(matches))
 		for i, ordinal := range matches {
@@ -735,6 +738,37 @@ func Search(g Graph, values ...any) Graph {
 		visit(root)
 	}
 	return Graph{nodes: out, view: g.view}
+}
+
+func (index *searchIndex) streamCleanOrMatches(condition *predicate) ([]*node, bool) {
+	if condition.op != predicateOr || len(condition.children) != 2 || len(index.dirty) != 0 ||
+		len(index.addedEdges) != 0 || len(index.removedEdges) != 0 || len(index.removed) != 0 ||
+		index.hasActiveAddedNodes() || !index.orderIdentity {
+		return nil, false
+	}
+	operands := make([]posting, len(condition.children))
+	total := 0
+	for i, child := range condition.children {
+		operands[i] = index.match(child)
+		total += len(operands[i])
+	}
+	result := make([]*node, 0, total)
+	left, right := operands[0], operands[1]
+	for i, j := 0, 0; i < len(left) || j < len(right); {
+		switch {
+		case j == len(right) || i < len(left) && left[i] < right[j]:
+			result = append(result, index.nodeAt(left[i]))
+			i++
+		case i == len(left) || right[j] < left[i]:
+			result = append(result, index.nodeAt(right[j]))
+			j++
+		default:
+			result = append(result, index.nodeAt(left[i]))
+			i++
+			j++
+		}
+	}
+	return result, true
 }
 
 func acquireVisitedNodeSet() (map[*node]struct{}, func()) {
