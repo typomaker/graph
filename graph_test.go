@@ -210,7 +210,7 @@ func TestQueryRefreshesOnceAfterMutations(t *testing.T) {
 	child := New(kind("item"))
 	Link(root, child)
 	query := newReactiveQuery(root, func(g Graph) Graph { return Search(g, kind("actor")) })
-	if query.evaluationCount != 1 {
+	if query.evaluationCount != 2 {
 		t.Fatalf("bootstrap evaluations = %d", query.evaluationCount)
 	}
 
@@ -219,13 +219,13 @@ func TestQueryRefreshesOnceAfterMutations(t *testing.T) {
 		Set(child, kind("item"))
 	}
 	Set(child, kind("actor"))
-	if query.evaluationCount != 1 {
+	if query.evaluationCount != 2 {
 		t.Fatalf("evaluations during mutations = %d", query.evaluationCount)
 	}
-	if Len(query.snapshot()) != 1 || query.evaluationCount != 2 {
+	if Len(query.snapshot()) != 1 || query.evaluationCount != 4 {
 		t.Fatalf("first iteration evaluations = %d", query.evaluationCount)
 	}
-	if Len(query.snapshot()) != 1 || query.evaluationCount != 2 {
+	if Len(query.snapshot()) != 1 || query.evaluationCount != 4 {
 		t.Fatalf("unchanged iteration evaluations = %d", query.evaluationCount)
 	}
 	query.close()
@@ -289,7 +289,7 @@ func TestQueryCloseReleasesState(t *testing.T) {
 	query := newReactiveQuery(root, func(g Graph) Graph { return Search(g, kind("world")) })
 	query.close()
 	query.close()
-	if !query.closed || len(query.source.nodes) != 0 || query.selector != nil || query.results != nil || query.references != nil || len(query.result.nodes) != 0 || query.revisions != nil {
+	if !query.closed || len(query.source.nodes) != 0 || query.selector != nil || query.results != nil || query.references != nil || query.inputRevisions != nil || query.inputOrder != nil || query.reachableEpoch != nil || query.changedInputs != nil || len(query.result.nodes) != 0 || query.revisions != nil {
 		t.Fatal("close retained query state")
 	}
 	if !Empty(query.snapshot()) {
@@ -455,6 +455,35 @@ func TestQuerySelectorReactsToDescendantTopology(t *testing.T) {
 	Set(actor, kind("actor"))
 	if got := collectGraphs(query); len(got) != 1 {
 		t.Fatalf("query after successive update has %d nodes", len(got))
+	}
+}
+
+func TestQueryReevaluatesOnlyChangedNodeAndAncestors(t *testing.T) {
+	root := New(name("root"))
+	left := New(name("left"))
+	leaf := New(name("leaf"))
+	right := New(name("right"))
+	Link(root, left, right)
+	Link(left, leaf)
+	evaluations := make(map[name]int)
+	query := newReactiveQuery(root, func(g Graph) Graph {
+		evaluations[value[name](t, g)]++
+		return g
+	})
+	defer query.close()
+	if query.evaluationCount != 4 {
+		t.Fatalf("initial evaluations = %d, want 4", query.evaluationCount)
+	}
+
+	Set(leaf, kind("changed"))
+	if Len(query.snapshot()) != 4 {
+		t.Fatal("query lost nodes after descendant update")
+	}
+	if query.evaluationCount != 7 {
+		t.Fatalf("evaluations after update = %d, want 7", query.evaluationCount)
+	}
+	if evaluations["root"] != 2 || evaluations["left"] != 2 || evaluations["leaf"] != 2 || evaluations["right"] != 1 {
+		t.Fatalf("evaluations by node = %v", evaluations)
 	}
 }
 

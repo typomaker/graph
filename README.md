@@ -62,10 +62,12 @@ visiblePlayers := graph.Search(
 Selections do not update after graph mutations. Run the selector again when a fresh result is needed.
 
 `Query` accepts a synchronous graph selector and returns a reusable iterator.
-It applies the selector to each input node and materializes the union of the
-returned nodes. Before an iteration, only inputs whose reachable graph changed
-are reevaluated. Repeated iterations without mutations reuse the materialized
-result, and shared results remain selected while any input still returns them.
+It applies the selector to each node reachable from the input and materializes
+the union of the returned nodes. Before an iteration, only changed nodes and
+their ancestors are reevaluated. Newly reachable nodes are added, while nodes
+made unreachable are removed. Repeated iterations without mutations reuse the
+materialized result, and shared results remain selected while any input still
+returns them.
 One iteration uses one stable snapshot; mutations during that iteration appear
 on the next iteration, even before `Commit`. Call the returned close function
 when the query is no longer needed. Closing is idempotent.

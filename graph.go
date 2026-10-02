@@ -407,8 +407,9 @@ func Each(g Graph) iter.Seq[Graph] {
 }
 
 // Query returns a reusable materialized iterator over the union produced by
-// applying selector to each node in g. It evaluates selector immediately, then
-// refreshes only inputs whose reachable graph changed before an iteration.
+// applying selector to each node reachable from g. It evaluates selector
+// immediately, then refreshes only changed nodes and their ancestors before an
+// iteration.
 //
 // For example, this query always iterates over the currently visible nodes:
 //
@@ -438,10 +439,20 @@ type reactiveQuery struct {
 	selector        func(Graph) Graph
 	results         map[*node][]*node
 	references      map[*node]uint64
+	inputRevisions  map[*node]uint64
+	inputOrder      []*node
+	reachableEpoch  map[*node]uint64
+	epoch           uint64
+	changedInputs   []queryInputRevision
 	result          Graph
 	revisions       []uint64
 	evaluationCount uint64
 	closed          bool
+}
+
+type queryInputRevision struct {
+	input    *node
+	revision uint64
 }
 
 func newReactiveQuery(g Graph, selector func(Graph) Graph) *reactiveQuery {
@@ -449,13 +460,15 @@ func newReactiveQuery(g Graph, selector func(Graph) Graph) *reactiveQuery {
 		panic("graph: nil query selector")
 	}
 	query := &reactiveQuery{
-		source:     g,
-		selector:   selector,
-		results:    make(map[*node][]*node, len(g.nodes)),
-		references: make(map[*node]uint64),
+		source:         g,
+		selector:       selector,
+		results:        make(map[*node][]*node, len(g.nodes)),
+		references:     make(map[*node]uint64),
+		inputRevisions: make(map[*node]uint64),
+		reachableEpoch: make(map[*node]uint64),
 	}
 	query.Lock()
-	query.refreshLocked(graphRevisions(g))
+	query.refreshLocked()
 	query.Unlock()
 	return query
 }
@@ -467,7 +480,7 @@ func (query *reactiveQuery) snapshot() Graph {
 		return Graph{}
 	}
 	if revisions := graphRevisions(query.source); !slices.Equal(query.revisions, revisions) {
-		query.refreshLocked(revisions)
+		query.refreshLocked()
 	}
 	return Graph{
 		nodes: append([]*node(nil), query.result.nodes...),
@@ -476,15 +489,23 @@ func (query *reactiveQuery) snapshot() Graph {
 	}
 }
 
-func (query *reactiveQuery) refreshLocked(before []uint64) {
+func (query *reactiveQuery) refreshLocked() {
 	for {
-		for i, input := range query.source.nodes {
-			if i < len(query.revisions) && query.revisions[i] == before[i] {
+		before := query.snapshotInputs()
+		for input := range query.results {
+			if query.reachableEpoch[input] == query.epoch {
 				continue
 			}
+			query.replaceResult(input, nil)
+			delete(query.results, input)
+			delete(query.inputRevisions, input)
+		}
+		for _, changed := range query.changedInputs {
+			input := changed.input
 			query.evaluationCount++
 			result := query.selector(Graph{nodes: []*node{input}, view: query.source.view, index: query.source.index})
 			query.replaceResult(input, result.nodes)
+			query.inputRevisions[input] = changed.revision
 		}
 		after := graphRevisions(query.source)
 		if slices.Equal(before, after) {
@@ -492,8 +513,41 @@ func (query *reactiveQuery) refreshLocked(before []uint64) {
 			query.revisions = after
 			return
 		}
-		before = after
 	}
+}
+
+func (query *reactiveQuery) snapshotInputs() []uint64 {
+	state.RLock()
+	defer state.RUnlock()
+	query.epoch++
+	query.inputOrder = query.inputOrder[:0]
+	query.changedInputs = query.changedInputs[:0]
+	var visit func(*node)
+	visit = func(input *node) {
+		if query.reachableEpoch[input] == query.epoch {
+			return
+		}
+		query.reachableEpoch[input] = query.epoch
+		query.inputOrder = append(query.inputOrder, input)
+		if revision, known := query.inputRevisions[input]; !known || revision != input.treeRev {
+			query.changedInputs = append(query.changedInputs, queryInputRevision{input: input, revision: input.treeRev})
+		}
+		children := orderedChildren(input)
+		if query.source.view != nil {
+			children = query.source.view.edges[input]
+		}
+		for _, child := range children {
+			visit(child)
+		}
+	}
+	for _, root := range query.source.nodes {
+		visit(root)
+	}
+	rootRevisions := make([]uint64, len(query.source.nodes))
+	for i, root := range query.source.nodes {
+		rootRevisions[i] = root.treeRev
+	}
+	return rootRevisions
 }
 
 func (query *reactiveQuery) replaceResult(input *node, nodes []*node) {
@@ -527,7 +581,7 @@ func (query *reactiveQuery) replaceResult(input *node, nodes []*node) {
 func (query *reactiveQuery) rebuildResult() {
 	nodes := make([]*node, 0, len(query.references))
 	seen := make(map[*node]struct{}, len(query.references))
-	for _, input := range query.source.nodes {
+	for _, input := range query.inputOrder {
 		for _, result := range query.results[input] {
 			if query.references[result] == 0 {
 				continue
@@ -552,6 +606,10 @@ func (query *reactiveQuery) close() {
 	query.selector = nil
 	query.results = nil
 	query.references = nil
+	query.inputRevisions = nil
+	query.inputOrder = nil
+	query.reachableEpoch = nil
+	query.changedInputs = nil
 	query.result = Graph{}
 	query.revisions = nil
 	query.closed = true
