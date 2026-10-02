@@ -416,13 +416,19 @@ func Each(g Graph) iter.Seq[Graph] {
 }
 
 // Unnest returns a flat selection containing every node reachable through g's
-// current view. Roots are included and shared nodes occur only once. Each is
-// the iteration primitive for the returned selection.
+// current view. Roots are included, and a shared node reachable through more
+// than one path occurs only once. Unnest does not modify g or expose graph
+// internals; use Each to iterate over the returned selection.
 //
 // For example:
 //
-//	for node := range Each(Unnest(root)) {
-//		// Inspect node.
+//	root := New(Name("root"))
+//	child := New(Name("child"))
+//	Link(root, child)
+//
+//	for node := range Each(Unnest(root)) { // root, child
+//		name, _ := Get[Name](node)
+//		fmt.Println(name)
 //	}
 func Unnest(g Graph) Graph {
 	return Search(g, Type[any]())
@@ -1075,15 +1081,25 @@ func Delta(g Graph, matchBy ...any) Graph {
 
 // Materialize resolves the nodes in view against source and returns their
 // current source state while preserving view's roots and restricted topology.
-// It does not add source descendants or siblings that are absent from view.
-// Nodes that are no longer reachable from source are omitted. Optional
-// identity attributes use the same composite identity semantics as Delta and
-// Apply; a Delta's recorded identity is used automatically.
+// The view determines which nodes and links are present; source supplies their
+// current attributes. Source descendants and siblings absent from view are not
+// added, and nodes no longer reachable from source are omitted.
+//
+// Optional identity attributes use the same composite identity semantics as
+// Delta and Apply. A Delta's recorded identity is used automatically, so the
+// usual Delta workflow does not need to repeat matchBy.
 //
 // For example:
 //
 //	delta := Delta(source, Type[EntityID]())
 //	current := Materialize(source, delta)
+//	for node := range Each(Unnest(current)) {
+//		// Inspect the current state of each node in the changed view.
+//	}
+//
+// To resolve an independently constructed view, provide its identity:
+//
+//	current := Materialize(source, view, Type[EntityID]())
 func Materialize(source, view Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()

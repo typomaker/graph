@@ -131,6 +131,24 @@ for actor := range graph.Each(actors) {
 }
 ```
 
+### Flattening a view
+
+`Unnest` transforms the current reachable view into a flat selection. It
+includes the selected roots and all descendants visible through that view.
+Shared nodes and nodes reached by several paths occur once. It does not mutate
+the input graph or introduce a separate iterator API:
+
+```go
+flat := graph.Unnest(world)
+for node := range graph.Each(flat) {
+	// Inspect one node from the reachable view.
+}
+```
+
+When the input is a restricted view, such as a delta or a materialized delta,
+`Unnest` follows only links present in that view. It does not expand omitted
+subtrees from the underlying graph.
+
 ## Synchronization
 
 `Commit` establishes a revision baseline for reachable nodes and publishes an immutable search index for each selected root. `Delta` creates a change graph since that baseline, and `Apply` applies such a delta. Optional type matchers define a composite identity for independent replicas.
@@ -141,12 +159,12 @@ target = graph.Apply(target, changes)
 graph.Commit(source)
 ```
 
+### Materializing a sparse view
+
 `Materialize` resolves a sparse view, such as a delta, back to the current
 nodes in its source. The view determines which nodes and links remain visible;
 the source supplies their current attributes. Nodes removed from the source
-are omitted, and unchanged siblings or descendants are not added. `Unnest`
-turns that reachable view into a flat, duplicate-free selection, while `Each`
-remains the iteration operation:
+are omitted, and unchanged siblings or descendants are not added:
 
 ```go
 delta := graph.Delta(source, graph.Type[ID]())
@@ -160,6 +178,14 @@ for node := range graph.Each(graph.Unnest(current)) {
 view, pass the same optional identity matchers used by `Delta` and `Apply`.
 An ordinary (non-structural) selection is materialized as a flat selection;
 the operation never infers additional topology from `source`.
+
+```go
+current := graph.Materialize(
+	source,
+	independentView,
+	graph.Type[ID](),
+)
+```
 
 `Patch` additively merges an ordinary graph by a required composite key:
 
