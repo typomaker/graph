@@ -173,7 +173,7 @@ func TestQueryBootstrapAndAttributeChanges(t *testing.T) {
 	secondChild := New(kind("item"), name("second"))
 	Link(root, firstChild, secondChild)
 
-	query, closeQuery := Query(root, func(g Graph) Graph { return Search(g, kind("actor")) })
+	query, closeQuery := Query(root, kind("actor"))
 	defer closeQuery()
 	if got := collectNames(t, query); !reflect.DeepEqual(got, []name{"first"}) {
 		t.Fatalf("initial query = %v", got)
@@ -196,7 +196,7 @@ func TestQueryReflectsLinkChangesBeforeCommit(t *testing.T) {
 	secondChild := New(kind("actor"), name("second"))
 	Link(root, firstChild)
 
-	query, closeQuery := Query(root, func(g Graph) Graph { return Search(g, kind("actor")) })
+	query, closeQuery := Query(root, kind("actor"))
 	defer closeQuery()
 	Link(root, secondChild)
 	Unlink(root, firstChild)
@@ -209,9 +209,9 @@ func TestQueryRefreshesOnceAfterMutations(t *testing.T) {
 	root := New(kind("world"))
 	child := New(kind("item"))
 	Link(root, child)
-	query := newReactiveQuery(root, func(g Graph) Graph { return Search(g, kind("actor")) })
-	if query.evaluationCount != 2 {
-		t.Fatalf("bootstrap evaluations = %d", query.evaluationCount)
+	query := newReactiveQuery(root, []any{kind("actor")})
+	if query.searchCount != 1 {
+		t.Fatalf("bootstrap searches = %d", query.searchCount)
 	}
 
 	for i := 0; i < 100; i++ {
@@ -219,14 +219,14 @@ func TestQueryRefreshesOnceAfterMutations(t *testing.T) {
 		Set(child, kind("item"))
 	}
 	Set(child, kind("actor"))
-	if query.evaluationCount != 2 {
-		t.Fatalf("evaluations during mutations = %d", query.evaluationCount)
+	if query.searchCount != 1 {
+		t.Fatalf("searches during mutations = %d", query.searchCount)
 	}
-	if Len(query.snapshot()) != 1 || query.evaluationCount != 4 {
-		t.Fatalf("first iteration evaluations = %d", query.evaluationCount)
+	if Len(query.snapshot()) != 1 || query.searchCount != 2 {
+		t.Fatalf("first iteration searches = %d", query.searchCount)
 	}
-	if Len(query.snapshot()) != 1 || query.evaluationCount != 4 {
-		t.Fatalf("unchanged iteration evaluations = %d", query.evaluationCount)
+	if Len(query.snapshot()) != 1 || query.searchCount != 2 {
+		t.Fatalf("unchanged iteration searches = %d", query.searchCount)
 	}
 	query.close()
 }
@@ -236,7 +236,7 @@ func TestQueryMutationDuringIterationAppearsNextTime(t *testing.T) {
 	firstChild := New(kind("actor"), name("first"))
 	secondChild := New(kind("actor"), name("second"))
 	Link(root, firstChild, secondChild)
-	query, closeQuery := Query(root, func(g Graph) Graph { return Search(g, kind("actor")) })
+	query, closeQuery := Query(root, kind("actor"))
 	defer closeQuery()
 
 	var current []name
@@ -258,7 +258,7 @@ func TestQueryConcurrentMutationAndIteration(t *testing.T) {
 	root := New(kind("world"))
 	child := New(kind("item"))
 	Link(root, child)
-	query, closeQuery := Query(root, func(g Graph) Graph { return Search(g, kind("actor")) })
+	query, closeQuery := Query(root, kind("actor"))
 	defer closeQuery()
 
 	var workers sync.WaitGroup
@@ -286,10 +286,10 @@ func TestQueryConcurrentMutationAndIteration(t *testing.T) {
 
 func TestQueryCloseReleasesState(t *testing.T) {
 	root := New(kind("world"))
-	query := newReactiveQuery(root, func(g Graph) Graph { return Search(g, kind("world")) })
+	query := newReactiveQuery(root, []any{kind("world")})
 	query.close()
 	query.close()
-	if !query.closed || len(query.source.nodes) != 0 || query.selector != nil || query.results != nil || query.references != nil || query.inputRevisions != nil || query.inputOrder != nil || query.reachableEpoch != nil || query.changedInputs != nil || len(query.result.nodes) != 0 || query.revisions != nil {
+	if !query.closed || len(query.source.nodes) != 0 || query.conditions != nil || len(query.result.nodes) != 0 || query.revisions != nil {
 		t.Fatal("close retained query state")
 	}
 	if !Empty(query.snapshot()) {
@@ -311,7 +311,7 @@ func TestQueryIsMaterializedAndSupportsEarlyStop(t *testing.T) {
 	secondChild := New(kind("item"), name("second"))
 	Link(root, firstChild, secondChild)
 
-	query, closeQuery := Query(root, func(g Graph) Graph { return Search(g, kind("actor")) })
+	query, closeQuery := Query(root, kind("actor"))
 	Set(firstChild, kind("actor"))
 	Set(secondChild, kind("actor"))
 
@@ -340,9 +340,7 @@ func TestQueryUpdatesPathMatches(t *testing.T) {
 	Link(location, contains)
 	Link(contains, actor)
 
-	query, closeQuery := Query(root, func(g Graph) Graph {
-		return Search(g, kind("location"), Path(kind("contains"), ident("target")))
-	})
+	query, closeQuery := Query(root, kind("location"), Path(kind("contains"), ident("target")))
 	defer closeQuery()
 	if got := collectNames(t, query); len(got) != 0 {
 		t.Fatalf("initial path query = %v", got)
@@ -357,139 +355,6 @@ func TestQueryUpdatesPathMatches(t *testing.T) {
 	if got := collectNames(t, query); len(got) != 0 {
 		t.Fatalf("path query after removal = %v", got)
 	}
-}
-
-func TestQuerySelectorTransitionsAndMultipleResults(t *testing.T) {
-	input := New(kind("empty"), name("input"))
-	firstResult := New(name("first"))
-	secondResult := New(name("second"))
-	query, closeQuery := Query(input, func(g Graph) Graph {
-		switch value[kind](t, g) {
-		case "first":
-			return firstResult
-		case "second":
-			return secondResult
-		case "both":
-			return Graph{nodes: []*node{first(firstResult), first(secondResult), first(firstResult)}}
-		default:
-			return Graph{}
-		}
-	})
-	defer closeQuery()
-
-	assertNames := func(want []name) {
-		t.Helper()
-		if got := collectNames(t, query); !reflect.DeepEqual(got, want) {
-			t.Fatalf("query result = %v, want %v", got, want)
-		}
-	}
-	assertNames(nil)
-	Set(input, kind("first"))
-	assertNames([]name{"first"})
-	Set(input, kind("empty"))
-	assertNames(nil)
-	Set(input, kind("first"))
-	assertNames([]name{"first"})
-	Set(input, kind("second"))
-	assertNames([]name{"second"})
-	Set(input, kind("both"))
-	assertNames([]name{"first", "second"})
-	Set(input, kind("empty"))
-	assertNames(nil)
-}
-
-func TestQueryKeepsResultsSharedByInputs(t *testing.T) {
-	firstInput := New(kind("active"))
-	secondInput := New(kind("active"))
-	shared := New(name("shared"))
-	query := newReactiveQuery(Union(firstInput, secondInput), func(g Graph) Graph {
-		if value[kind](t, g) == "active" {
-			return shared
-		}
-		return Graph{}
-	})
-	defer query.close()
-
-	if Len(query.snapshot()) != 1 || query.references[first(shared)] != 2 {
-		t.Fatal("shared result was not reference counted")
-	}
-	Set(firstInput, kind("inactive"))
-	if Len(query.snapshot()) != 1 || query.references[first(shared)] != 1 {
-		t.Fatal("shared result was removed with one active input")
-	}
-	if query.evaluationCount != 3 {
-		t.Fatalf("evaluations = %d, want 3", query.evaluationCount)
-	}
-	Set(secondInput, kind("inactive"))
-	if !Empty(query.snapshot()) {
-		t.Fatal("shared result remained without an active input")
-	}
-}
-
-func TestQuerySelectorReactsToDescendantTopology(t *testing.T) {
-	root := New(kind("root"))
-	branch := New(kind("branch"))
-	actor := New(kind("actor"), name("actor"))
-	Link(root, branch)
-	query, closeQuery := Query(root, func(g Graph) Graph {
-		return Search(g, kind("root"), Path(kind("branch"), kind("actor")))
-	})
-	defer closeQuery()
-
-	if got := collectNames(t, query); len(got) != 0 {
-		t.Fatalf("initial query = %v", got)
-	}
-	Link(branch, actor)
-	if got := collectGraphs(query); len(got) != 1 {
-		t.Fatalf("query after link has %d nodes", len(got))
-	}
-	Unlink(branch, actor)
-	if got := collectGraphs(query); len(got) != 0 {
-		t.Fatalf("query after unlink has %d nodes", len(got))
-	}
-	Link(branch, actor)
-	Set(actor, kind("item"))
-	if got := collectGraphs(query); len(got) != 0 {
-		t.Fatalf("query after descendant change has %d nodes", len(got))
-	}
-	Set(actor, kind("actor"))
-	if got := collectGraphs(query); len(got) != 1 {
-		t.Fatalf("query after successive update has %d nodes", len(got))
-	}
-}
-
-func TestQueryReevaluatesOnlyChangedNodeAndAncestors(t *testing.T) {
-	root := New(name("root"))
-	left := New(name("left"))
-	leaf := New(name("leaf"))
-	right := New(name("right"))
-	Link(root, left, right)
-	Link(left, leaf)
-	evaluations := make(map[name]int)
-	query := newReactiveQuery(root, func(g Graph) Graph {
-		evaluations[value[name](t, g)]++
-		return g
-	})
-	defer query.close()
-	if query.evaluationCount != 4 {
-		t.Fatalf("initial evaluations = %d, want 4", query.evaluationCount)
-	}
-
-	Set(leaf, kind("changed"))
-	if Len(query.snapshot()) != 4 {
-		t.Fatal("query lost nodes after descendant update")
-	}
-	if query.evaluationCount != 7 {
-		t.Fatalf("evaluations after update = %d, want 7", query.evaluationCount)
-	}
-	if evaluations["root"] != 2 || evaluations["left"] != 2 || evaluations["leaf"] != 2 || evaluations["right"] != 1 {
-		t.Fatalf("evaluations by node = %v", evaluations)
-	}
-}
-
-func TestQueryRejectsNilSelector(t *testing.T) {
-	defer expectPanic(t)
-	Query(New(kind("root")), nil)
 }
 
 func collectNames(t *testing.T, sequence func(func(Graph) bool)) []name {

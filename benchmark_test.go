@@ -97,9 +97,7 @@ func BenchmarkQueryBatchedMutations(b *testing.B) {
 			child := New(benchmarkKind("item"))
 			Link(root, child)
 			Commit(root)
-			query, closeQuery := Query(root, func(g Graph) Graph {
-				return Search(g, Type[benchmarkVersion]())
-			})
+			query, closeQuery := Query(root, Type[benchmarkVersion]())
 			defer closeQuery()
 			b.ResetTimer()
 			for range b.N {
