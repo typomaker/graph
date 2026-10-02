@@ -433,6 +433,64 @@ func BenchmarkApplyDeltaToCommitted10K(b *testing.B) {
 	}
 }
 
+func BenchmarkWireExport100Of10K(b *testing.B) {
+	wire := NewWire(Define[benchmarkKind]("kind"), Define[benchmarkID]("id"))
+	root := New(benchmarkKind("root"), benchmarkID("root"))
+	nodes := make([]Graph, 10_000)
+	for i := range nodes {
+		nodes[i] = New(benchmarkKind("node"), benchmarkID(fmt.Sprint(i)))
+		Link(root, nodes[i])
+	}
+	Commit(root)
+	for i := range 100 {
+		Set(nodes[i], benchmarkKind("changed"))
+	}
+	delta := Delta(root)
+	b.Run("Graph", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, err := wire.ExportUpdate(root); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("PrecomputedDelta", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, err := wire.ExportUpdate(delta); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkWireImport100Of10K(b *testing.B) {
+	wire := NewWire(Define[benchmarkKind]("kind"), Define[benchmarkID]("id"))
+	source := New(benchmarkKind("root"), benchmarkID("root"))
+	nodes := make([]Graph, 10_000)
+	for i := range nodes {
+		nodes[i] = New(benchmarkKind("node"), benchmarkID(fmt.Sprint(i)))
+		Link(source, nodes[i])
+	}
+	replica := Apply(Graph{}, Delta(source))
+	Commit(source)
+	Commit(replica)
+	for i := range 100 {
+		Set(nodes[i], benchmarkKind("changed"))
+	}
+	update, err := wire.ExportUpdate(source)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := wire.ImportUpdate(replica, update); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkPatchAttributeCommitted10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	Set(root, benchmarkID("root"))

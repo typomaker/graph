@@ -77,7 +77,7 @@ func NewWire(definitions ...Definition) Wire {
 
 type wireAttribute struct {
 	label string
-	data  []byte
+	value any
 }
 
 type wireRemovedChild struct {
@@ -99,48 +99,54 @@ func (w Wire) ExportUpdate(g Graph) ([]byte, error) {
 	state.RLock()
 	defer state.RUnlock()
 
-	var records [][]byte
+	recordCount := 0
 	if delta.view != nil {
 		nodes := reachableViewLocked(selected(delta), delta.view)
+		recordCount = len(nodes) + len(selected(delta))
+		var out bytes.Buffer
+		out.Grow(10 + recordCount*16)
+		out.Write(wireMagic[:])
+		_ = binary.Write(&out, binary.BigEndian, wireVersion)
+		_ = binary.Write(&out, binary.BigEndian, uint32(recordCount))
 		for _, n := range nodes {
 			change := delta.view.changes[n]
-			record, err := w.encodeNode(n.key, change, delta.view.edges[n])
-			if err != nil {
+			if err := writeWireRecord(&out, wireRecordNode, func() error {
+				return w.encodeNode(&out, n.key, change, delta.view.edges[n])
+			}); err != nil {
 				return nil, err
 			}
-			records = append(records, frameWireRecord(wireRecordNode, record))
 		}
 		for _, root := range selected(delta) {
-			var payload [8]byte
-			binary.BigEndian.PutUint64(payload[:], root.key)
-			records = append(records, frameWireRecord(wireRecordRoot, payload[:]))
+			if err := writeWireRecord(&out, wireRecordRoot, func() error {
+				return binary.Write(&out, binary.BigEndian, root.key)
+			}); err != nil {
+				return nil, err
+			}
 		}
+		return out.Bytes(), nil
 	}
 
 	var out bytes.Buffer
 	out.Write(wireMagic[:])
 	_ = binary.Write(&out, binary.BigEndian, wireVersion)
-	_ = binary.Write(&out, binary.BigEndian, uint32(len(records)))
-	for _, record := range records {
-		out.Write(record)
-	}
+	_ = binary.Write(&out, binary.BigEndian, uint32(0))
 	return out.Bytes(), nil
 }
 
-func (w Wire) encodeNode(key uint64, change nodeChange, children []*node) ([]byte, error) {
+func (w Wire) encodeNode(payload *bytes.Buffer, key uint64, change nodeChange, children []*node) error {
 	attrs, err := w.encodeAttributes(change.attrs)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	snapshot, err := w.encodeAttributes(change.snapshot)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	removedAttrs := make([]string, 0, len(change.removedAttrs))
 	for _, typ := range change.removedAttrs {
 		definition, ok := w.byType[typ]
 		if !ok {
-			return nil, fmt.Errorf("graph: attribute type %v is not in Wire schema", typ)
+			return fmt.Errorf("graph: attribute type %v is not in Wire schema", typ)
 		}
 		removedAttrs = append(removedAttrs, definition.label)
 	}
@@ -157,20 +163,22 @@ func (w Wire) encodeNode(key uint64, change nodeChange, children []*node) ([]byt
 	for _, child := range change.removedChildren {
 		encoded, encodeErr := w.encodeAttributes(child.attrs)
 		if encodeErr != nil {
-			return nil, encodeErr
+			return encodeErr
 		}
 		removed = append(removed, wireRemovedChild{key: child.key, attrs: encoded})
 	}
 
-	var payload bytes.Buffer
-	_ = binary.Write(&payload, binary.BigEndian, key)
-	writeWireAttributes(&payload, attrs)
-	writeWireStrings(&payload, removedAttrs)
-	writeWireAttributes(&payload, snapshot)
-	writeWireUint64s(&payload, linked)
-	writeWireUint64s(&payload, added)
-	writeWireRemovedChildren(&payload, removed)
-	return payload.Bytes(), nil
+	_ = binary.Write(payload, binary.BigEndian, key)
+	if err := writeWireAttributes(payload, attrs); err != nil {
+		return err
+	}
+	writeWireStrings(payload, removedAttrs)
+	if err := writeWireAttributes(payload, snapshot); err != nil {
+		return err
+	}
+	writeWireUint64s(payload, linked)
+	writeWireUint64s(payload, added)
+	return writeWireRemovedChildren(payload, removed)
 }
 
 func (w Wire) encodeAttributes(attrs map[reflect.Type]any) ([]wireAttribute, error) {
@@ -180,22 +188,26 @@ func (w Wire) encodeAttributes(attrs map[reflect.Type]any) ([]wireAttribute, err
 		if !ok {
 			return nil, fmt.Errorf("graph: attribute type %v is not in Wire schema", typ)
 		}
-		data, err := json.Marshal(value)
-		if err != nil {
-			return nil, fmt.Errorf("graph: encode wire attribute %q: %w", definition.label, err)
-		}
-		encoded = append(encoded, wireAttribute{label: definition.label, data: data})
+		encoded = append(encoded, wireAttribute{label: definition.label, value: value})
 	}
 	sort.Slice(encoded, func(i, j int) bool { return encoded[i].label < encoded[j].label })
 	return encoded, nil
 }
 
-func frameWireRecord(kind byte, payload []byte) []byte {
-	record := make([]byte, 5+len(payload))
-	record[0] = kind
-	binary.BigEndian.PutUint32(record[1:5], uint32(len(payload)))
-	copy(record[5:], payload)
-	return record
+func writeWireRecord(out *bytes.Buffer, kind byte, writePayload func() error) error {
+	out.WriteByte(kind)
+	lengthOffset := out.Len()
+	_ = binary.Write(out, binary.BigEndian, uint32(0))
+	payloadOffset := out.Len()
+	if err := writePayload(); err != nil {
+		return err
+	}
+	payloadLength := out.Len() - payloadOffset
+	if uint64(payloadLength) > uint64(^uint32(0)) {
+		return errors.New("graph: wire record is too large")
+	}
+	binary.BigEndian.PutUint32(out.Bytes()[lengthOffset:payloadOffset], uint32(payloadLength))
+	return nil
 }
 
 // ImportUpdate decodes and applies an update to g. Unknown definitions are
@@ -296,11 +308,7 @@ func resolveWireTargetsLocked(g Graph, decoded map[uint64]decodedWireNode, roots
 	for i, key := range roots {
 		resolved[key] = targetRoots[i].key
 	}
-	targets := reachableLocked(targetRoots)
-	for key, decodedNode := range decoded {
-		if _, ok := resolved[key]; ok {
-			continue
-		}
+	stableAttrs := func(decodedNode decodedWireNode) map[reflect.Type]any {
 		stable := cloneAttrs(decodedNode.snapshot)
 		for typ := range decodedNode.change.attrs {
 			delete(stable, typ)
@@ -308,20 +316,85 @@ func resolveWireTargetsLocked(g Graph, decoded map[uint64]decodedWireNode, roots
 		for _, typ := range decodedNode.change.removedAttrs {
 			delete(stable, typ)
 		}
-		if len(stable) == 0 {
-			continue
+		return stable
+	}
+	needed := make(map[reflect.Type]map[any]struct{})
+	addNeeded := func(attrs map[reflect.Type]any) {
+		for typ, value := range attrs {
+			values := needed[typ]
+			if values == nil {
+				values = make(map[any]struct{})
+				needed[typ] = values
+			}
+			values[value] = struct{}{}
+		}
+	}
+	for key, decodedNode := range decoded {
+		if _, root := resolved[key]; !root {
+			addNeeded(stableAttrs(decodedNode))
+		}
+		for _, removed := range decodedNode.change.removedChildren {
+			addNeeded(removed.attrs)
+		}
+	}
+	postings := make(map[reflect.Type]map[any][]*node)
+	indexTarget := func(target *node) {
+		for typ, value := range target.attrs {
+			if _, wanted := needed[typ][value]; !wanted {
+				continue
+			}
+			byValue := postings[typ]
+			if byValue == nil {
+				byValue = make(map[any][]*node)
+				postings[typ] = byValue
+			}
+			byValue[value] = append(byValue[value], target)
+		}
+	}
+	if len(targetRoots) == 1 && validSearchIndex(targetRoots[0]) {
+		index := targetRoots[0].index
+		for ordinal, active := range index.activeByOrdinal {
+			if active {
+				indexTarget(index.nodeAt(uint32(ordinal)))
+			}
+		}
+	} else {
+		for _, target := range reachableLocked(targetRoots) {
+			indexTarget(target)
+		}
+	}
+	resolveStable := func(stable map[reflect.Type]any) *node {
+		var candidates []*node
+		for typ, value := range stable {
+			posting := postings[typ][value]
+			if len(posting) == 0 {
+				return nil
+			}
+			if candidates == nil || len(posting) < len(candidates) {
+				candidates = posting
+			}
 		}
 		var match *node
-		for _, candidate := range targets {
+		for _, candidate := range candidates {
 			if !wireAttrsMatch(candidate.attrs, stable) {
 				continue
 			}
 			if match != nil {
-				match = nil
-				break
+				return nil
 			}
 			match = candidate
 		}
+		return match
+	}
+	for key, decodedNode := range decoded {
+		if _, ok := resolved[key]; ok {
+			continue
+		}
+		stable := stableAttrs(decodedNode)
+		if len(stable) == 0 {
+			continue
+		}
+		match := resolveStable(stable)
 		if match != nil {
 			resolved[key] = match.key
 		}
@@ -331,17 +404,7 @@ func resolveWireTargetsLocked(g Graph, decoded map[uint64]decodedWireNode, roots
 			if _, ok := resolved[removed.key]; ok || len(removed.attrs) == 0 {
 				continue
 			}
-			var match *node
-			for _, candidate := range targets {
-				if !wireAttrsMatch(candidate.attrs, removed.attrs) {
-					continue
-				}
-				if match != nil {
-					match = nil
-					break
-				}
-				match = candidate
-			}
+			match := resolveStable(removed.attrs)
 			if match != nil {
 				resolved[removed.key] = match.key
 			}
@@ -500,9 +563,9 @@ func (w Wire) readWireAttributes(r *bytes.Reader) (map[reflect.Type]any, error) 
 		if err != nil {
 			return nil, err
 		}
-		data, err := readWireBytes(r)
-		if err != nil {
-			return nil, err
+		var length uint32
+		if binary.Read(r, binary.BigEndian, &length) != nil || uint64(length) > uint64(r.Len()) {
+			return nil, errors.New("graph: truncated wire attribute")
 		}
 		labelString := string(label)
 		if _, duplicate := seen[labelString]; duplicate {
@@ -511,11 +574,21 @@ func (w Wire) readWireAttributes(r *bytes.Reader) (map[reflect.Type]any, error) 
 		seen[labelString] = struct{}{}
 		definition, known := w.byLabel[labelString]
 		if !known {
+			_, _ = r.Seek(int64(length), io.SeekCurrent)
 			continue
 		}
 		pointer := reflect.New(definition.typ)
-		if err := json.Unmarshal(data, pointer.Interface()); err != nil {
+		limited := &io.LimitedReader{R: r, N: int64(length)}
+		decoder := json.NewDecoder(limited)
+		if err := decoder.Decode(pointer.Interface()); err != nil {
 			return nil, fmt.Errorf("graph: decode wire attribute %q: %w", label, err)
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil, fmt.Errorf("graph: trailing data in wire attribute %q", label)
+		}
+		if limited.N != 0 {
+			_, _ = io.Copy(io.Discard, limited)
 		}
 		attrs[definition.typ] = pointer.Elem().Interface()
 	}
@@ -542,12 +615,23 @@ func (w Wire) readWireRemovedChildren(r *bytes.Reader) ([]removedChildChange, er
 	return children, nil
 }
 
-func writeWireAttributes(w io.Writer, attrs []wireAttribute) {
+func writeWireAttributes(w *bytes.Buffer, attrs []wireAttribute) error {
 	_ = binary.Write(w, binary.BigEndian, uint32(len(attrs)))
 	for _, attr := range attrs {
 		writeWireBytes(w, []byte(attr.label))
-		writeWireBytes(w, attr.data)
+		lengthOffset := w.Len()
+		_ = binary.Write(w, binary.BigEndian, uint32(0))
+		valueOffset := w.Len()
+		if err := json.NewEncoder(w).Encode(attr.value); err != nil {
+			return fmt.Errorf("graph: encode wire attribute %q: %w", attr.label, err)
+		}
+		valueLength := w.Len() - valueOffset
+		if uint64(valueLength) > uint64(^uint32(0)) {
+			return fmt.Errorf("graph: wire attribute %q is too large", attr.label)
+		}
+		binary.BigEndian.PutUint32(w.Bytes()[lengthOffset:valueOffset], uint32(valueLength))
 	}
+	return nil
 }
 
 func writeWireStrings(w io.Writer, values []string) {
@@ -564,12 +648,15 @@ func writeWireUint64s(w io.Writer, values []uint64) {
 	}
 }
 
-func writeWireRemovedChildren(w io.Writer, children []wireRemovedChild) {
+func writeWireRemovedChildren(w *bytes.Buffer, children []wireRemovedChild) error {
 	_ = binary.Write(w, binary.BigEndian, uint32(len(children)))
 	for _, child := range children {
 		_ = binary.Write(w, binary.BigEndian, child.key)
-		writeWireAttributes(w, child.attrs)
+		if err := writeWireAttributes(w, child.attrs); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func writeWireBytes(w io.Writer, data []byte) {
