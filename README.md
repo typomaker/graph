@@ -159,6 +159,26 @@ target = graph.Apply(target, changes)
 graph.Commit(source)
 ```
 
+`Changed` selects only nodes with their own attribute or link changes. It
+removes unchanged ancestors that `Delta` retains to preserve paths. Links in
+the result are direct links whose two endpoints are both selected; paths are
+never compressed through omitted nodes. `Detached` returns attribute snapshots
+of nodes that were reachable at the previous commit but have since lost their
+last reachable parent. Those snapshots remain available until the next commit.
+
+Both functions accept either the source graph or an already prepared delta.
+Passing a source graph computes the equivalent delta internally, while passing
+a delta reuses its recorded change view:
+
+```go
+changed := graph.Changed(source)
+detached := graph.Detached(source)
+
+delta := graph.Delta(source)
+changed = graph.Changed(delta)
+detached = graph.Detached(delta)
+```
+
 ### Materializing a sparse view
 
 `Materialize` resolves a sparse view, such as a delta, back to the current

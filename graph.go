@@ -74,6 +74,8 @@ type searchIndex struct {
 	active            map[*node]struct{}
 	activeByOrdinal   []bool
 	activeAdded       int
+	baselineNodes     map[*node]struct{}
+	detachedSnapshots map[*node]map[reflect.Type]any
 	orderDirty        bool
 	addedEdges        map[graphEdge]struct{}
 	removedEdges      map[graphEdge]struct{}
@@ -106,6 +108,8 @@ type subgraph struct {
 	edges      map[*node][]*node
 	changes    map[*node]nodeChange
 	matchTypes []reflect.Type
+	detached   []*node
+	delta      bool
 }
 
 type removedChild struct {
@@ -1051,8 +1055,9 @@ func Delta(g Graph, matchBy ...any) Graph {
 	state.Lock()
 	defer state.Unlock()
 	keyTypes := identityTypes(matchBy)
-	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange), matchTypes: keyTypes}
+	view := &subgraph{edges: make(map[*node][]*node), changes: make(map[*node]nodeChange), matchTypes: keyTypes, delta: true}
 	roots := []*node{}
+	detached := make(map[*node]*node)
 	for _, root := range selected(g) {
 		if root.treeRev <= root.baseline {
 			continue
@@ -1060,6 +1065,21 @@ func Delta(g Graph, matchBy ...any) Graph {
 		if buildDeltaLocked(root, view, make(map[*node]bool), false) {
 			roots = append(roots, root)
 		}
+		if validSearchIndex(root) {
+			for original, attrs := range root.index.detachedSnapshots {
+				if _, duplicate := detached[original]; !duplicate {
+					detached[original] = snapshotNodeLocked(original, attrs)
+				}
+			}
+		}
+	}
+	detachedNodes := make([]*node, 0, len(detached))
+	for original := range detached {
+		detachedNodes = append(detachedNodes, original)
+	}
+	sort.Slice(detachedNodes, func(i, j int) bool { return detachedNodes[i].id < detachedNodes[j].id })
+	for _, original := range detachedNodes {
+		view.detached = append(view.detached, detached[original])
 	}
 	if len(keyTypes) != 0 {
 		identities := &compositeIndex{types: keyTypes}
@@ -1073,10 +1093,70 @@ func Delta(g Graph, matchBy ...any) Graph {
 			}
 		}
 	}
-	if len(roots) == 0 {
-		return Graph{}
+	if len(roots) == 0 && len(view.detached) == 0 {
+		return Graph{view: view}
 	}
 	return Graph{nodes: roots, view: view}
+}
+
+// Changed returns only nodes with their own changes since the preceding
+// Commit. Nodes included in a Delta solely to preserve a path are omitted.
+// Direct links are retained only when both endpoints are selected.
+func Changed(g Graph) Graph {
+	if g.view == nil || !g.view.delta {
+		return Changed(Delta(g))
+	}
+	state.RLock()
+	defer state.RUnlock()
+
+	selectedNodes := make(map[*node]struct{})
+	for n, change := range g.view.changes {
+		if nodeChanged(change) {
+			selectedNodes[n] = struct{}{}
+		}
+	}
+	if len(selectedNodes) == 0 {
+		return Graph{}
+	}
+	view := &subgraph{edges: make(map[*node][]*node)}
+	hasParent := make(map[*node]struct{})
+	for parent, children := range g.view.edges {
+		if _, selected := selectedNodes[parent]; !selected {
+			continue
+		}
+		for _, child := range children {
+			if _, selected := selectedNodes[child]; !selected {
+				continue
+			}
+			view.edges[parent] = append(view.edges[parent], child)
+			hasParent[child] = struct{}{}
+		}
+	}
+	ordered := reachableViewLocked(selected(g), g.view)
+	roots := make([]*node, 0, len(selectedNodes))
+	for _, n := range ordered {
+		if _, selected := selectedNodes[n]; !selected {
+			continue
+		}
+		if _, child := hasParent[n]; !child {
+			roots = append(roots, n)
+		}
+	}
+	return Graph{nodes: roots, view: view}
+}
+
+// Detached returns attribute snapshots of nodes that were reachable at the
+// preceding Commit and are no longer reachable from the selected roots.
+func Detached(g Graph) Graph {
+	if g.view == nil || !g.view.delta {
+		return Detached(Delta(g))
+	}
+	return Graph{nodes: append([]*node(nil), g.view.detached...)}
+}
+
+func nodeChanged(change nodeChange) bool {
+	return len(change.attrs) != 0 || len(change.removedAttrs) != 0 ||
+		len(change.addedChildren) != 0 || len(change.removedChildren) != 0
 }
 
 // Materialize resolves the nodes in view against source and returns their
@@ -2177,6 +2257,11 @@ func (index *searchIndex) commitOverlayLocked() {
 	clear(index.removedEdges)
 	clear(index.affected)
 	index.affectedOrdinals = index.affectedOrdinals[:0]
+	clear(index.detachedSnapshots)
+	clear(index.baselineNodes)
+	for n := range index.active {
+		index.baselineNodes[n] = struct{}{}
+	}
 	index.structureRevision = index.root.structureRev
 	index.overlayRevision = index.root.structureRev
 }
@@ -2239,6 +2324,7 @@ func (index *searchIndex) activateLocked(n *node) {
 	if _, active := index.active[n]; active {
 		return
 	}
+	delete(index.detachedSnapshots, n)
 	index.active[n] = struct{}{}
 	if ordinal, committed := index.ordinal[n]; committed {
 		delete(index.removed, ordinal)
@@ -2362,6 +2448,11 @@ func (index *searchIndex) deactivateLocked(n *node) {
 		return
 	}
 	delete(index.active, n)
+	if _, committed := index.baselineNodes[n]; committed {
+		if _, recorded := index.detachedSnapshots[n]; !recorded {
+			index.detachedSnapshots[n] = cloneAttrs(n.attrs)
+		}
+	}
 	if ordinal, committed := index.ordinal[n]; committed {
 		index.removed[ordinal] = struct{}{}
 		index.activeByOrdinal[ordinal] = false
@@ -2460,6 +2551,21 @@ func nodeSet(ns []*node) map[*node]struct{} {
 	}
 	return s
 }
+
+func snapshotNodeLocked(original *node, attrs map[reflect.Type]any) *node {
+	return &node{
+		id:              original.id,
+		key:             original.key,
+		attrs:           cloneAttrs(attrs),
+		attrRev:         make(map[reflect.Type]uint64),
+		removedAttrs:    make(map[reflect.Type]uint64),
+		children:        make(map[*node]uint64),
+		removedChildren: make(map[uint64]removedChild),
+		parents:         make(map[*node]struct{}),
+		dirtyChildren:   make(map[*node]struct{}),
+	}
+}
+
 func orderedChildren(n *node) []*node {
 	return n.childOrder
 }
@@ -2532,6 +2638,8 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		support:           make(map[*node]uint32, len(nodes)),
 		active:            make(map[*node]struct{}, len(nodes)),
 		activeByOrdinal:   make([]bool, len(nodes)),
+		baselineNodes:     make(map[*node]struct{}, len(nodes)),
+		detachedSnapshots: make(map[*node]map[reflect.Type]any),
 		addedEdges:        make(map[graphEdge]struct{}),
 		removedEdges:      make(map[graphEdge]struct{}),
 		committedAdded:    make(map[graphEdge]struct{}),
@@ -2546,6 +2654,7 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		index.all[ordinal] = id
 		index.orderByOrdinal[ordinal] = id
 		index.active[n] = struct{}{}
+		index.baselineNodes[n] = struct{}{}
 		index.activeByOrdinal[ordinal] = true
 		index.addKeyNode(n)
 	}

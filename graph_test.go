@@ -783,6 +783,122 @@ func TestDeltaAndCommitUseChangedFrontier(t *testing.T) {
 	}
 }
 
+func TestChangedFiltersPropagationAndPreservesDirectLinks(t *testing.T) {
+	world := New(name("world"))
+	actor := New(name("actor"))
+	inventory := New(name("inventory"), health{10, 10})
+	rifle := New(name("rifle"), health{10, 10})
+	Link(world, actor)
+	Link(actor, inventory)
+	Link(inventory, rifle)
+	Commit(world)
+
+	Set(inventory, health{9, 10})
+	Set(rifle, health{8, 10})
+	changed := Changed(world)
+	if Len(Unnest(changed)) != 2 || value[name](t, changed) != "inventory" {
+		t.Fatal("changed nodes or roots are incorrect")
+	}
+	if got := children(changed); Len(got) != 1 || value[name](t, got) != "rifle" {
+		t.Fatal("direct changed relation was not retained")
+	}
+
+	Commit(world)
+	Set(actor, kind("changed"))
+	Set(rifle, health{7, 10})
+	changed = Changed(Delta(world))
+	if Len(changed) != 2 || Len(Unnest(changed)) != 2 {
+		t.Fatal("unchanged path node was not removed or roots were compressed")
+	}
+	if !Empty(children(changed)) {
+		t.Fatal("path through an unchanged node was compressed")
+	}
+}
+
+func TestChangedAttributesLinksNewNodesAndNoOps(t *testing.T) {
+	root := New(name("root"), health{10, 10}, marker{})
+	child := New(name("child"))
+	Link(root, child)
+	Commit(root)
+
+	if Set(root, health{10, 10}) || Link(root, child) || Unlink(root, New(name("absent"))) {
+		t.Fatal("no-op mutation reported a change")
+	}
+	if !Empty(Changed(root)) {
+		t.Fatal("no-op mutation appeared in Changed")
+	}
+
+	Unset[marker](root)
+	if got := Changed(root); Len(got) != 1 || value[name](t, got) != "root" {
+		t.Fatal("Unset was not reported")
+	}
+	Commit(root)
+
+	added := New(name("added"))
+	leaf := New(name("leaf"))
+	Link(added, leaf)
+	Link(root, added)
+	changed := Changed(root)
+	if Len(Unnest(changed)) != 3 || Len(children(changed)) != 1 {
+		t.Fatal("new reachable subgraph was not reported")
+	}
+}
+
+func TestChangedReusesDeltaView(t *testing.T) {
+	root := New(name("root"))
+	child := New(name("child"), health{10, 10})
+	Link(root, child)
+	Commit(root)
+
+	Set(child, health{9, 10})
+	delta := Delta(root)
+	Commit(root)
+	if Empty(Changed(delta)) {
+		t.Fatal("prepared delta view was recomputed")
+	}
+	if !Empty(Changed(root)) {
+		t.Fatal("ordinary graph did not compute a fresh delta")
+	}
+}
+
+func TestDetachedSnapshotsAndMultipleParents(t *testing.T) {
+	root := New(name("root"))
+	left := New(name("left"))
+	right := New(name("right"))
+	shared := New(name("shared"), health{10, 10})
+	leaf := New(name("leaf"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Link(shared, leaf)
+	Commit(root)
+
+	Unlink(left, shared)
+	if !Empty(Detached(root)) {
+		t.Fatal("node reachable through another parent was detached")
+	}
+	if got := Changed(root); Len(got) != 1 || value[name](t, got) != "left" {
+		t.Fatal("Unlink was not reported as a parent change")
+	}
+	Unlink(right, shared)
+	delta := Delta(root)
+	detached := Detached(delta)
+	if Len(detached) != 2 || Len(Unnest(detached)) != 2 {
+		t.Fatal("detached subtree was not returned once per node")
+	}
+	Set(shared, health{1, 10})
+	if got := value[health](t, Search(detached, name("shared"))); got != (health{10, 10}) {
+		t.Fatalf("detached identity was not snapshotted: %#v", got)
+	}
+	if Len(Detached(delta)) != 2 {
+		t.Fatal("prepared delta lost detached snapshots")
+	}
+	Commit(root)
+	if !Empty(Detached(root)) {
+		t.Fatal("detached nodes survived the next Commit")
+	}
+}
+
 func TestSharedDiamondFrontierDeltaAndCommit(t *testing.T) {
 	root := New(kind("root"))
 	left := New(kind("parent"), name("left"))
