@@ -164,7 +164,8 @@ removes unchanged ancestors that `Delta` retains to preserve paths. Links in
 the result are direct links whose two endpoints are both selected; paths are
 never compressed through omitted nodes. `Detached` returns attribute snapshots
 of nodes that were reachable at the previous commit but have since lost their
-last reachable parent. Those snapshots remain available until the next commit.
+last reachable parent. A node that remains reachable through another parent is
+not detached.
 
 Both functions accept either the source graph or an already prepared delta.
 Passing a source graph computes the equivalent delta internally, while passing
@@ -177,6 +178,22 @@ detached := graph.Detached(source)
 delta := graph.Delta(source)
 changed = graph.Changed(delta)
 detached = graph.Detached(delta)
+```
+
+`Changed` creates a restricted view over the existing nodes rather than copying
+them. `Materialize` also resolves a view to existing source nodes without
+cloning those nodes. `Detached` is intentionally different: it records an
+independent attribute snapshot when a baseline node becomes unreachable, so a
+later mutation of the original node cannot change the detached result.
+
+The source retains detached snapshots only until its next `Commit`:
+
+```go
+detached := graph.Detached(source)
+graph.Commit(source)
+
+graph.Empty(graph.Detached(source)) // true: the source has a new baseline
+graph.Empty(detached)               // false: the returned snapshot is valid
 ```
 
 ### Materializing a sparse view

@@ -1102,6 +1102,15 @@ func Delta(g Graph, matchBy ...any) Graph {
 // Changed returns only nodes with their own changes since the preceding
 // Commit. Nodes included in a Delta solely to preserve a path are omitted.
 // Direct links are retained only when both endpoints are selected.
+//
+// Passing an ordinary graph computes its Delta internally:
+//
+//	changed := Changed(world)
+//
+// A prepared Delta can be reused without recomputing it:
+//
+//	delta := Delta(world)
+//	changed = Changed(delta)
 func Changed(g Graph) Graph {
 	if g.view == nil || !g.view.delta {
 		return Changed(Delta(g))
@@ -1146,7 +1155,18 @@ func Changed(g Graph) Graph {
 }
 
 // Detached returns attribute snapshots of nodes that were reachable at the
-// preceding Commit and are no longer reachable from the selected roots.
+// preceding Commit and are no longer reachable from the selected roots. A node
+// reachable through another parent is not detached. Recorded snapshots remain
+// available through the source graph until its next Commit; Graph values
+// returned earlier by Detached remain valid after that commit.
+//
+// Passing an ordinary graph computes its Delta internally. Use a prepared
+// Delta when both changed and detached nodes are needed:
+//
+//	delta := Delta(world)
+//	changed := Changed(delta)
+//	detached := Detached(delta)
+//	Commit(world) // later Detached(world) calls no longer include detached
 func Detached(g Graph) Graph {
 	if g.view == nil || !g.view.delta {
 		return Detached(Delta(g))
