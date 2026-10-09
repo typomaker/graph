@@ -783,7 +783,7 @@ func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
 		return Graph{}, false
 	}
 	index := root.index
-	if index.orderDirty || len(index.dirty) != 0 || len(index.addedEdges) != 0 || len(index.removedEdges) != 0 ||
+	if index.orderDirty || !index.orderIdentity || len(index.dirty) != 0 || len(index.addedEdges) != 0 || len(index.removedEdges) != 0 ||
 		len(index.removed) != 0 || index.hasActiveAddedNodes() {
 		return Graph{}, false
 	}
@@ -819,8 +819,7 @@ func atomicMatcher(value any) (matcher, bool) {
 
 func (index *searchIndex) streamCleanOrMatches(condition *predicate) ([]*node, bool) {
 	if condition.op != predicateOr || len(condition.children) != 2 || len(index.dirty) != 0 ||
-		len(index.addedEdges) != 0 || len(index.removedEdges) != 0 || len(index.removed) != 0 ||
-		index.hasActiveAddedNodes() || !index.orderIdentity {
+		index.hasStructuralOverlay() || !index.orderIdentity {
 		return nil, false
 	}
 	operands := make([]posting, len(condition.children))
@@ -2213,7 +2212,7 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 	}
 	index.rebuildAffectedLocked()
 	index.removedOrdinals = postingFromSet(index.removedOrdinals, index.removed)
-	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
+	if !index.hasStructuralOverlay() {
 		index.resetCommittedOrderLocked()
 	} else {
 		index.orderDirty = true
@@ -2327,6 +2326,12 @@ func (index *searchIndex) rebuildAffectedLocked() {
 
 func (index *searchIndex) hasActiveAddedNodes() bool {
 	return index.activeAdded != 0
+}
+
+func (index *searchIndex) hasStructuralOverlay() bool {
+	return len(index.addedEdges) != 0 || len(index.removedEdges) != 0 ||
+		len(index.committedAdded) != 0 || len(index.committedRemoved) != 0 ||
+		len(index.removed) != 0 || index.hasActiveAddedNodes()
 }
 
 func (index *searchIndex) resetCommittedOrderLocked() {
@@ -2773,7 +2778,7 @@ func (index *searchIndex) match(condition *predicate) posting {
 
 func (index *searchIndex) matchCurrent(condition *predicate) posting {
 	base := index.match(condition)
-	structural := len(index.addedEdges) != 0 || len(index.removedEdges) != 0 || len(index.removed) != 0 || index.hasActiveAddedNodes()
+	structural := index.hasStructuralOverlay()
 	if len(index.dirty) == 0 && !structural {
 		return base
 	}
@@ -3060,9 +3065,6 @@ func (index *searchIndex) nodeAt(ordinal uint32) *node {
 }
 
 func (index *searchIndex) orderMatches(values posting) posting {
-	if len(index.addedEdges) == 0 && len(index.removedEdges) == 0 && len(index.removed) == 0 && !index.hasActiveAddedNodes() {
-		return values
-	}
 	if index.orderIdentity {
 		return values
 	}

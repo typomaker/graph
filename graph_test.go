@@ -604,6 +604,124 @@ func TestQueryUpdatesPathMatches(t *testing.T) {
 	}
 }
 
+func TestReachabilityIndexUpdatesEdgesBetweenActiveNodes(t *testing.T) {
+	root := New(kind("world"), name("root"))
+	location := New(kind("location"), name("location"))
+	contains := New(kind("contains"), name("contains"))
+	actor := New(kind("actor"), name("actor"), ident("target"))
+	event := New(kind("event"), name("event"))
+	Link(root, location, actor, event)
+	Link(location, contains)
+	Link(event, location, actor)
+	Commit(root)
+
+	pathValues := []any{kind("location"), Path(kind("contains"), ident("target"))}
+	activeQuery, closeActiveQuery := Query(root, pathValues...)
+	defer closeActiveQuery()
+	if got := collectNames(t, activeQuery); len(got) != 0 {
+		t.Fatalf("initial active query = %v", got)
+	}
+
+	if !Link(contains, actor) {
+		t.Fatal("link between active nodes was ignored")
+	}
+	assertActiveEdgeSearches(t, root, location, contains, actor)
+	if got := collectNames(t, activeQuery); !reflect.DeepEqual(got, []name{"location"}) {
+		t.Fatalf("active query before commit = %v", got)
+	}
+	newQuery, closeNewQuery := Query(root, pathValues...)
+	defer closeNewQuery()
+	if got := collectNames(t, newQuery); !reflect.DeepEqual(got, []name{"location"}) {
+		t.Fatalf("new query before commit = %v", got)
+	}
+
+	Commit(root)
+	assertActiveEdgeSearches(t, root, location, contains, actor)
+	if got := collectNames(t, activeQuery); !reflect.DeepEqual(got, []name{"location"}) {
+		t.Fatalf("active query after commit = %v", got)
+	}
+	if got := collectNames(t, newQuery); !reflect.DeepEqual(got, []name{"location"}) {
+		t.Fatalf("new query after commit = %v", got)
+	}
+
+	if !Unlink(contains, actor) {
+		t.Fatal("unlink between active nodes was ignored")
+	}
+	assertInactiveEdgeSearches(t, root, location, contains, actor)
+	if got := collectNames(t, activeQuery); len(got) != 0 {
+		t.Fatalf("active query after unlink = %v", got)
+	}
+	Commit(root)
+	assertInactiveEdgeSearches(t, root, location, contains, actor)
+	if got := collectNames(t, newQuery); len(got) != 0 {
+		t.Fatalf("new query after unlink commit = %v", got)
+	}
+}
+
+func assertActiveEdgeSearches(t *testing.T, root, location, contains, actor Graph) {
+	t.Helper()
+	if got := Intersect(Follow(contains, Path(Type[kind]())), actor); Len(got) != 1 {
+		t.Fatal("direct Follow did not see linked actor")
+	}
+	if got := Search(root, kind("location")); Len(got) != 1 || first(got) != first(location) {
+		t.Fatal("atomic Search lost the location")
+	}
+	if got := Unnest(root); Len(got) != 5 {
+		t.Fatalf("Unnest returned %d nodes, want 5", Len(got))
+	}
+	path := Path(kind("contains"), ident("target"))
+	if got := Search(root, kind("location"), path); Len(got) != 1 || first(got) != first(location) {
+		t.Fatal("indexed Search did not see the added path")
+	}
+	locations := Search(root, kind("location"))
+	if got := Select(locations, path); Len(got) != 1 || first(got) != first(location) {
+		t.Fatal("Select did not see the added path")
+	}
+	if got := Follow(locations, path); Len(got) != 1 || first(got) != first(actor) {
+		t.Fatal("Follow did not return the added path endpoint")
+	}
+}
+
+func assertInactiveEdgeSearches(t *testing.T, root, location, contains, actor Graph) {
+	t.Helper()
+	if !Empty(Intersect(Follow(contains, Path(Type[kind]())), actor)) {
+		t.Fatal("direct Follow retained the unlinked actor")
+	}
+	if got := Search(root, kind("location")); Len(got) != 1 || first(got) != first(location) {
+		t.Fatal("atomic Search lost the location after unlink")
+	}
+	if got := Unnest(root); Len(got) != 5 {
+		t.Fatalf("Unnest returned %d nodes after unlink, want 5", Len(got))
+	}
+	path := Path(kind("contains"), ident("target"))
+	if !Empty(Search(root, kind("location"), path)) {
+		t.Fatal("indexed Search retained the removed path")
+	}
+	if !Empty(Select(Search(root, kind("location")), path)) {
+		t.Fatal("Select retained the removed path")
+	}
+}
+
+func TestNoOpEdgesDoNotInvalidateSearchIndex(t *testing.T) {
+	root := New(kind("world"))
+	parent := New(kind("parent"))
+	child := New(kind("child"))
+	other := New(kind("other"))
+	Link(root, parent, child, other)
+	Link(parent, child)
+	Commit(root)
+
+	index := first(root).index
+	revision := first(root).structureRev
+	if Link(parent, child) || Unlink(parent, other) {
+		t.Fatal("no-op edge operation reported a mutation")
+	}
+	if first(root).index != index || first(root).structureRev != revision || index.orderDirty ||
+		len(index.addedEdges) != 0 || len(index.removedEdges) != 0 {
+		t.Fatal("no-op edge operation invalidated the search index")
+	}
+}
+
 func collectNames(t *testing.T, sequence func(func(Graph) bool)) []name {
 	t.Helper()
 	var names []name
