@@ -14,9 +14,10 @@ import (
 // Graph is a selection of zero or more graph nodes. Its representation is
 // deliberately private; nodes and relations are not values in the public API.
 type Graph struct {
-	nodes []*node
-	view  *subgraph
-	index *searchIndex
+	nodes    []*node
+	view     *subgraph
+	index    *searchIndex
+	ordinals posting
 }
 
 type node struct {
@@ -411,8 +412,12 @@ func Each(g Graph) iter.Seq[Graph] {
 	index := graphSearchIndex(g)
 	state.RUnlock()
 	return func(yield func(Graph) bool) {
-		for _, n := range nodes {
-			if !yield(Graph{nodes: []*node{n}, view: view, index: index}) {
+		for i, n := range nodes {
+			item := Graph{nodes: []*node{n}, view: view, index: index}
+			if len(g.ordinals) == len(nodes) {
+				item.ordinals = g.ordinals[i : i+1 : i+1]
+			}
+			if !yield(item) {
 				return
 			}
 		}
@@ -465,7 +470,7 @@ func Query(g Graph, values ...any) (iter.Seq[Graph], func()) {
 type reactiveQuery struct {
 	sync.Mutex
 	source      Graph
-	conditions  []any
+	conditions  *predicate
 	result      Graph
 	revisions   []uint64
 	searchCount uint64
@@ -473,7 +478,7 @@ type reactiveQuery struct {
 }
 
 func newReactiveQuery(g Graph, values []any) *reactiveQuery {
-	conditions := append([]any(nil), values...)
+	conditions := buildPredicate(predicateAnd, values)
 	query := &reactiveQuery{source: g, conditions: conditions}
 	query.Lock()
 	query.refreshLocked()
@@ -491,9 +496,10 @@ func (query *reactiveQuery) snapshot() Graph {
 		query.refreshLocked()
 	}
 	return Graph{
-		nodes: append([]*node(nil), query.result.nodes...),
-		view:  query.result.view,
-		index: query.result.index,
+		nodes:    append([]*node(nil), query.result.nodes...),
+		view:     query.result.view,
+		index:    query.result.index,
+		ordinals: query.result.ordinals,
 	}
 }
 
@@ -501,7 +507,7 @@ func (query *reactiveQuery) refreshLocked() {
 	for {
 		before := graphRevisions(query.source)
 		query.searchCount++
-		result := Search(query.source, query.conditions...)
+		result := searchPredicate(query.source, query.conditions)
 		after := graphRevisions(query.source)
 		if slices.Equal(before, after) {
 			query.result = result
@@ -646,8 +652,8 @@ func Select(g Graph, values ...any) Graph {
 	defer state.RUnlock()
 	index := graphSearchIndex(g)
 	if index != nil {
-		if out, ok := index.selectMatches(selected(g), condition); ok {
-			return Graph{nodes: out, view: g.view, index: index}
+		if out, ok := index.selectMatches(g, condition); ok {
+			return out
 		}
 	}
 	out := make([]*node, 0, len(selected(g)))
@@ -659,22 +665,29 @@ func Select(g Graph, values ...any) Graph {
 	return Graph{nodes: out, view: g.view, index: index}
 }
 
-func (index *searchIndex) selectMatches(nodes []*node, condition *predicate) ([]*node, bool) {
+func (index *searchIndex) selectMatches(selection Graph, condition *predicate) (Graph, bool) {
+	nodes := selected(selection)
 	matches := index.orderMatches(index.matchCurrent(condition))
 	out := make([]*node, 0, min(len(nodes), len(matches)))
 	match := 0
 	var previous uint32
 	for position, n := range nodes {
-		ordinal, exists := index.nodeOrdinal(n)
-		if !exists {
-			return nil, false
+		var ordinal uint32
+		if len(selection.ordinals) == len(nodes) {
+			ordinal = selection.ordinals[position]
+		} else {
+			var exists bool
+			ordinal, exists = index.nodeOrdinal(n)
+			if !exists {
+				return Graph{}, false
+			}
 		}
 		order := ordinal
 		if !index.orderIdentity {
 			order = index.orderByOrdinal[ordinal]
 		}
 		if position != 0 && order <= previous {
-			return nil, false
+			return Graph{}, false
 		}
 		previous = order
 		for match < len(matches) {
@@ -691,7 +704,14 @@ func (index *searchIndex) selectMatches(nodes []*node, condition *predicate) ([]
 			out = append(out, n)
 		}
 	}
-	return out, true
+	ordinals := matches
+	if len(out) != len(matches) {
+		ordinals = make(posting, len(out))
+		for i, n := range out {
+			ordinals[i], _ = index.nodeOrdinal(n)
+		}
+	}
+	return Graph{nodes: out, view: selection.view, index: index, ordinals: ordinals}, true
 }
 
 // Follow filters the currently selected nodes and returns the endpoints of
@@ -701,15 +721,15 @@ func Follow(g Graph, values ...any) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	index := graphSearchIndex(g)
-	candidates := selected(g)
+	candidates := g
 	if index != nil && containsPath(condition) {
-		if matches, ok := index.selectMatches(candidates, condition); ok {
+		if matches, ok := index.selectMatches(g, condition); ok {
 			candidates = matches
 		}
 	}
 	out := make([]*node, 0)
 	seen := make(map[*node]struct{})
-	for _, n := range candidates {
+	for _, n := range selected(candidates) {
 		result := evaluatePredicateLocked(n, condition, g.view)
 		if !result.matched {
 			continue
@@ -734,6 +754,10 @@ func Search(g Graph, values ...any) Graph {
 		}
 	}
 	condition := buildPredicate(predicateAnd, values)
+	return searchPredicate(g, condition)
+}
+
+func searchPredicate(g Graph, condition *predicate) Graph {
 	if result, rebuilt := searchWhileRebuildingOrder(g, condition); rebuilt {
 		return result
 	}
@@ -754,7 +778,7 @@ func Search(g Graph, values ...any) Graph {
 		for i, ordinal := range matches {
 			out[i] = index.nodeAt(ordinal)
 		}
-		return Graph{nodes: out, index: index}
+		return Graph{nodes: out, index: index, ordinals: matches}
 	}
 	visited, releaseVisited := acquireVisitedNodeSet()
 	defer releaseVisited()
@@ -831,7 +855,7 @@ func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
 	for i, ordinal := range matches {
 		nodes[i] = index.nodes[ordinal]
 	}
-	return Graph{nodes: nodes, index: index}, true
+	return Graph{nodes: nodes, index: index, ordinals: matches}, true
 }
 
 func atomicMatcher(value any) (matcher, bool) {
@@ -852,15 +876,48 @@ func atomicMatcher(value any) (matcher, bool) {
 }
 
 func (index *searchIndex) streamCleanOrMatches(condition *predicate) ([]*node, bool) {
-	if condition.op != predicateOr || len(condition.children) != 2 || len(index.dirty) != 0 ||
+	if condition.op != predicateOr || len(condition.children) < 2 || len(index.dirty) != 0 ||
 		index.hasStructuralOverlay() || !index.orderIdentity {
 		return nil, false
 	}
 	operands := make([]posting, len(condition.children))
 	total := 0
+	var maximum uint32
 	for i, child := range condition.children {
 		operands[i] = index.match(child)
 		total += len(operands[i])
+		if len(operands[i]) != 0 && operands[i][len(operands[i])-1] > maximum {
+			maximum = operands[i][len(operands[i])-1]
+		}
+	}
+	if len(operands) > 2 {
+		if total == 0 {
+			return []*node{}, true
+		}
+		rangeSize := int(maximum) + 1
+		if rangeSize/total > 16 {
+			matches := unionAllPostings(operands)
+			result := make([]*node, len(matches))
+			for i, ordinal := range matches {
+				result[i] = index.nodeAt(ordinal)
+			}
+			return result, true
+		}
+		words := make([]uint64, int(maximum)/64+1)
+		for _, operand := range operands {
+			for _, ordinal := range operand {
+				words[ordinal/64] |= uint64(1) << (ordinal % 64)
+			}
+		}
+		result := make([]*node, 0, min(total, rangeSize))
+		for wordIndex, word := range words {
+			for word != 0 {
+				bit := bits.TrailingZeros64(word)
+				result = append(result, index.nodeAt(uint32(wordIndex*64+bit)))
+				word &= word - 1
+			}
+		}
+		return result, true
 	}
 	result := make([]*node, 0, total)
 	left, right := operands[0], operands[1]

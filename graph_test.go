@@ -108,6 +108,13 @@ func TestIndexedSelectPreservesSelectionOrder(t *testing.T) {
 	if nodes := selected(result); len(nodes) != 2 || nodes[0] != first(secondNode) || nodes[1] != first(firstNode) {
 		t.Fatalf("indexed selection order = %v", nodes)
 	}
+
+	actors := Search(root, kind("actor"))
+	partial := Graph{nodes: actors.nodes[1:], index: actors.index, ordinals: actors.ordinals[1:]}
+	result = Select(Select(partial, kind("actor")), ident("second"))
+	if Len(result) != 1 || first(result) != first(secondNode) {
+		t.Fatal("partial indexed selection lost its ordinal")
+	}
 }
 
 func TestUnionAllPostings(t *testing.T) {

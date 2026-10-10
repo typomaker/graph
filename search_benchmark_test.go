@@ -172,3 +172,26 @@ func BenchmarkSearchIndexBuild(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkSearchPredicateCompilation(b *testing.B) {
+	root := benchmarkPathWorld(10000)
+	Commit(root)
+	expression := Path(benchmarkKind("contains"), And(benchmarkKind("actor"), benchmarkID("9999")))
+	values := []any{benchmarkKind("location"), expression}
+	condition := buildPredicate(predicateAnd, values)
+
+	b.Run("BuildEachTime", func(b *testing.B) {
+		for range b.N {
+			if result := Search(root, values...); Len(result) != 1 {
+				b.Fatal(Len(result))
+			}
+		}
+	})
+	b.Run("Compiled", func(b *testing.B) {
+		for range b.N {
+			if result := searchPredicate(root, condition); Len(result) != 1 {
+				b.Fatal(Len(result))
+			}
+		}
+	})
+}
