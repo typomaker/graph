@@ -129,6 +129,31 @@ func BenchmarkSelect10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSelectCommitted10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	Commit(root)
+	all := Search(root, Type[any]())
+	b.ResetTimer()
+	for range b.N {
+		if Len(Select(all, benchmarkKind("actor"))) != 10000 {
+			b.Fatal()
+		}
+	}
+}
+
+func BenchmarkSelectCommittedTraversal10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	Commit(root)
+	all := Search(root, Type[any]())
+	all.index = nil
+	b.ResetTimer()
+	for range b.N {
+		if Len(Select(all, benchmarkKind("actor"))) != 10000 {
+			b.Fatal()
+		}
+	}
+}
+
 func BenchmarkPathSearch10K(b *testing.B) {
 	root := benchmarkPathWorld(10000)
 	expression := Path(benchmarkKind("contains"), And(benchmarkKind("actor"), benchmarkID("9999")))

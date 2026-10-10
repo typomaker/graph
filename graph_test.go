@@ -3,6 +3,7 @@ package graph
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -91,6 +92,41 @@ func TestSelectFollowAndSearch(t *testing.T) {
 	}
 	if Len(Search(world, And(kind("actor"), Or(ident("actor-1"), ident("actor-2"))))) != 2 {
 		t.Fatal("and")
+	}
+}
+
+func TestIndexedSelectPreservesSelectionOrder(t *testing.T) {
+	root := New(kind("root"))
+	firstNode := New(kind("actor"), ident("first"))
+	secondNode := New(kind("actor"), ident("second"))
+	Link(root, firstNode, secondNode)
+	Commit(root)
+
+	index := first(root).index
+	reversed := Graph{nodes: []*node{first(secondNode), first(firstNode)}, index: index}
+	result := Select(reversed, kind("actor"))
+	if nodes := selected(result); len(nodes) != 2 || nodes[0] != first(secondNode) || nodes[1] != first(firstNode) {
+		t.Fatalf("indexed selection order = %v", nodes)
+	}
+}
+
+func TestUnionAllPostings(t *testing.T) {
+	tests := []struct {
+		name     string
+		operands []posting
+		want     posting
+	}{
+		{"empty", nil, nil},
+		{"one", []posting{{1, 3}}, posting{1, 3}},
+		{"two", []posting{{1, 3}, {2, 3}}, posting{1, 2, 3}},
+		{"many", []posting{{1, 4}, nil, {2, 4}, {3, 5}}, posting{1, 2, 3, 4, 5}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := unionAllPostings(test.operands); !slices.Equal(got, test.want) {
+				t.Fatalf("union = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 

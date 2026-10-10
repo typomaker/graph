@@ -645,20 +645,53 @@ func Select(g Graph, values ...any) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	index := graphSearchIndex(g)
-	var indexedMatches posting
-	if index != nil && containsPath(condition) {
-		indexedMatches = index.matchCurrent(condition)
+	if index != nil {
+		if out, ok := index.selectMatches(selected(g), condition); ok {
+			return Graph{nodes: out, view: g.view, index: index}
+		}
 	}
 	out := make([]*node, 0, len(selected(g)))
 	for _, n := range selected(g) {
-		if index != nil && containsPath(condition) && !index.postingContains(indexedMatches, n) {
-			continue
-		}
 		if matchesPredicateLocked(n, condition, g.view) {
 			out = append(out, n)
 		}
 	}
 	return Graph{nodes: out, view: g.view, index: index}
+}
+
+func (index *searchIndex) selectMatches(nodes []*node, condition *predicate) ([]*node, bool) {
+	matches := index.orderMatches(index.matchCurrent(condition))
+	out := make([]*node, 0, min(len(nodes), len(matches)))
+	match := 0
+	var previous uint32
+	for position, n := range nodes {
+		ordinal, exists := index.nodeOrdinal(n)
+		if !exists {
+			return nil, false
+		}
+		order := ordinal
+		if !index.orderIdentity {
+			order = index.orderByOrdinal[ordinal]
+		}
+		if position != 0 && order <= previous {
+			return nil, false
+		}
+		previous = order
+		for match < len(matches) {
+			matchOrder := matches[match]
+			if !index.orderIdentity {
+				matchOrder = index.orderByOrdinal[matches[match]]
+			}
+			if matchOrder >= order {
+				break
+			}
+			match++
+		}
+		if match < len(matches) && matches[match] == ordinal {
+			out = append(out, n)
+		}
+	}
+	return out, true
 }
 
 // Follow filters the currently selected nodes and returns the endpoints of
@@ -668,16 +701,15 @@ func Follow(g Graph, values ...any) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	index := graphSearchIndex(g)
-	var indexedMatches posting
+	candidates := selected(g)
 	if index != nil && containsPath(condition) {
-		indexedMatches = index.matchCurrent(condition)
+		if matches, ok := index.selectMatches(candidates, condition); ok {
+			candidates = matches
+		}
 	}
 	out := make([]*node, 0)
 	seen := make(map[*node]struct{})
-	for _, n := range selected(g) {
-		if index != nil && containsPath(condition) && !index.postingContains(indexedMatches, n) {
-			continue
-		}
+	for _, n := range candidates {
 		result := evaluatePredicateLocked(n, condition, g.view)
 		if !result.matched {
 			continue
@@ -733,10 +765,12 @@ func Search(g Graph, values ...any) Graph {
 	out := make([]*node, 0)
 	var visit func(*node)
 	visit = func(n *node) {
-		if _, duplicate := visited[n]; duplicate {
-			return
+		if len(roots) > 1 || len(n.parents) > 1 {
+			if _, duplicate := visited[n]; duplicate {
+				return
+			}
+			visited[n] = struct{}{}
 		}
-		visited[n] = struct{}{}
 		if matchesPredicateLocked(n, condition, g.view) {
 			if emitted == nil {
 				out = append(out, n)
@@ -1962,6 +1996,9 @@ func buildPredicate(op predicateOp, values []any) *predicate {
 	if len(values) == 0 {
 		panic("graph: logical expression requires at least one predicate")
 	}
+	if len(values) == 1 {
+		return predicateFromValue(values[0])
+	}
 	children := make([]*predicate, len(values))
 	for i, value := range values {
 		children[i] = predicateFromValue(value)
@@ -1980,8 +2017,20 @@ func predicateFromValue(value any) *predicate {
 	if expression, ok := value.(predicateExpression); ok {
 		return expression.predicate
 	}
-	request := inspectRequests([]any{value})[0]
-	return &predicate{op: predicateMatch, matcher: matcher(request)}
+	if value == nil {
+		panic("graph: nil attribute request")
+	}
+	if typed, ok := value.(typeMatcher); ok {
+		return &predicate{op: predicateMatch, matcher: matcher{typ: typed.typ, any: true}}
+	}
+	typ := reflect.TypeOf(value)
+	if typ.Kind() == reflect.Pointer {
+		panic("graph: pointer attribute request")
+	}
+	if typ.Kind() == reflect.Interface || !typ.Comparable() {
+		panic("graph: attribute request must be comparable")
+	}
+	return &predicate{op: predicateMatch, matcher: matcher{typ: typ, value: value}}
 }
 
 func attributeType[T any]() reflect.Type {
@@ -2745,7 +2794,7 @@ func (index *searchIndex) match(condition *predicate) posting {
 				return nil
 			}
 		}
-		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		sortPostingsByLength(operands)
 		result := operands[0]
 		for _, operand := range operands[1:] {
 			result = intersectPostings(result, operand)
@@ -2759,12 +2808,7 @@ func (index *searchIndex) match(condition *predicate) posting {
 		for i, child := range condition.children {
 			operands[i] = index.match(child)
 		}
-		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
-		var result posting
-		for _, operand := range operands {
-			result = unionPostings(result, operand)
-		}
-		return result
+		return unionAllPostings(operands)
 	case predicatePath:
 		current := index.match(condition.children[len(condition.children)-1])
 		for step := len(condition.children) - 2; step >= 0 && len(current) != 0; step-- {
@@ -2825,18 +2869,18 @@ func (index *searchIndex) matchOverlay(condition *predicate) posting {
 				return nil
 			}
 		}
-		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		sortPostingsByLength(operands)
 		result := operands[0]
 		for _, operand := range operands[1:] {
 			result = intersectPostings(result, operand)
 		}
 		return result
 	case predicateOr:
-		var result posting
-		for _, child := range condition.children {
-			result = unionPostings(result, index.matchOverlay(child))
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.matchOverlay(child)
 		}
-		return result
+		return unionAllPostings(operands)
 	case predicatePath:
 		current := index.matchOverlay(condition.children[len(condition.children)-1])
 		for step := len(condition.children) - 2; step >= 0 && len(current) != 0; step-- {
@@ -2885,11 +2929,11 @@ func (index *searchIndex) matchDirty(condition *predicate) posting {
 		}
 		return result
 	case predicateOr:
-		var result posting
-		for _, child := range condition.children {
-			result = unionPostings(result, index.matchDirty(child))
+		operands := make([]posting, len(condition.children))
+		for i, child := range condition.children {
+			operands[i] = index.matchDirty(child)
 		}
-		return result
+		return unionAllPostings(operands)
 	default:
 		return nil
 	}
@@ -2958,7 +3002,7 @@ func (index *searchIndex) matchAdded(condition *predicate) posting {
 				return nil
 			}
 		}
-		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
+		sortPostingsByLength(operands)
 		result := operands[0]
 		for _, operand := range operands[1:] {
 			result = intersectPostings(result, operand)
@@ -2972,12 +3016,7 @@ func (index *searchIndex) matchAdded(condition *predicate) posting {
 		for i, child := range condition.children {
 			operands[i] = index.matchAdded(child)
 		}
-		sort.Slice(operands, func(i, j int) bool { return len(operands[i]) < len(operands[j]) })
-		var result posting
-		for _, operand := range operands {
-			result = unionPostings(result, operand)
-		}
-		return result
+		return unionAllPostings(operands)
 	case predicatePath:
 		panic("graph: added path matching requires traversal")
 	default:
@@ -3038,15 +3077,6 @@ func graphSearchIndex(g Graph) *searchIndex {
 		return g.nodes[0].index
 	}
 	return nil
-}
-
-func (index *searchIndex) postingContains(values posting, n *node) bool {
-	ordinal, exists := index.nodeOrdinal(n)
-	if !exists {
-		return false
-	}
-	position := sort.Search(len(values), func(i int) bool { return values[i] >= ordinal })
-	return position < len(values) && values[position] == ordinal
 }
 
 func (index *searchIndex) nodeOrdinal(n *node) (uint32, bool) {
@@ -3189,6 +3219,18 @@ func intersectPostings(left, right posting) posting {
 	return result
 }
 
+func sortPostingsByLength(values []posting) {
+	for i := 1; i < len(values); i++ {
+		value := values[i]
+		j := i
+		for j > 0 && len(value) < len(values[j-1]) {
+			values[j] = values[j-1]
+			j--
+		}
+		values[j] = value
+	}
+}
+
 func mergePostingOverlay(base, excluded, replacements posting) posting {
 	if len(base) == 0 {
 		return replacements
@@ -3238,6 +3280,53 @@ func unionPostings(left, right posting) posting {
 			result = append(result, left[i])
 			i++
 			j++
+		}
+	}
+	return result
+}
+
+func unionAllPostings(operands []posting) posting {
+	if len(operands) == 0 {
+		return nil
+	}
+	if len(operands) == 1 {
+		return operands[0]
+	}
+	if len(operands) == 2 {
+		return unionPostings(operands[0], operands[1])
+	}
+	total := 0
+	var maximum uint32
+	for _, operand := range operands {
+		total += len(operand)
+		if len(operand) != 0 && operand[len(operand)-1] > maximum {
+			maximum = operand[len(operand)-1]
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	rangeSize := int(maximum) + 1
+	if rangeSize/total > 16 {
+		sortPostingsByLength(operands)
+		var result posting
+		for _, operand := range operands {
+			result = unionPostings(result, operand)
+		}
+		return result
+	}
+	words := make([]uint64, int(maximum)/64+1)
+	for _, operand := range operands {
+		for _, ordinal := range operand {
+			words[ordinal/64] |= uint64(1) << (ordinal % 64)
+		}
+	}
+	result := make(posting, 0, min(total, int(maximum)+1))
+	for wordIndex, word := range words {
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			result = append(result, uint32(wordIndex*64+bit))
+			word &= word - 1
 		}
 	}
 	return result
