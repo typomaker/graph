@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"weak"
 )
 
 // Graph is a selection of zero or more graph nodes. Its representation is
@@ -29,7 +30,7 @@ type node struct {
 	children        map[*node]uint64 // edge creation revision
 	childOrder      []*node
 	removedChildren map[uint64]removedChild
-	parents         map[*node]struct{}
+	parents         map[weak.Pointer[node]]struct{}
 	dirtyChildren   map[*node]struct{}
 	dirtyChildOrder []*node
 	selfRev         uint64
@@ -364,7 +365,7 @@ func Link(g Graph, graphs ...Graph) bool {
 		rev := nextRevisionLocked()
 		addChildLocked(parent, child, rev)
 		delete(parent.removedChildren, child.key)
-		child.parents[parent] = struct{}{}
+		child.parents[weak.Make(parent)] = struct{}{}
 		markDirtyChildLocked(parent, child)
 		parent.selfRev = rev
 		propagateStructureLocked(parent, rev)
@@ -392,7 +393,7 @@ func Unlink(g Graph, graphs ...Graph) bool {
 			continue
 		}
 		removeChildLocked(parent, child)
-		delete(child.parents, parent)
+		delete(child.parents, weak.Make(parent))
 		rev := nextRevisionLocked()
 		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 		parent.selfRev = rev
@@ -1562,7 +1563,7 @@ func applyLocked(g, delta Graph) Graph {
 			if _, ok := parent.children[child]; ok {
 				collectStructuralIndexesLocked(parent, structuralIndexes)
 				removeChildLocked(parent, child)
-				delete(child.parents, parent)
+				delete(child.parents, weak.Make(parent))
 				parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 				structureChanged[parent] = struct{}{}
 				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child})
@@ -1580,7 +1581,7 @@ func applyLocked(g, delta Graph) Graph {
 				collectStructuralIndexesLocked(parent, structuralIndexes)
 				addChildLocked(parent, child, rev)
 				delete(parent.removedChildren, child.key)
-				child.parents[parent] = struct{}{}
+				child.parents[weak.Make(parent)] = struct{}{}
 				markDirtyChildLocked(parent, child)
 				structureChanged[parent] = struct{}{}
 				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child, linked: true})
@@ -1702,7 +1703,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			collectStructuralIndexesLocked(pair.target, structuralIndexes)
 			addChildLocked(pair.target, targetChild, rev)
 			delete(pair.target.removedChildren, targetChild.key)
-			targetChild.parents[pair.target] = struct{}{}
+			targetChild.parents[weak.Make(pair.target)] = struct{}{}
 			markDirtyChildLocked(pair.target, targetChild)
 			structureChanged[pair.target] = struct{}{}
 			structuralChanges = append(structuralChanges, structuralChange{parent: pair.target, child: targetChild, linked: true})
@@ -1966,7 +1967,7 @@ func newNodeLocked(key uint64, attrs map[reflect.Type]any, rev uint64) *node {
 	return &node{
 		id: state.nextID, key: key, attrs: attrs, attrRev: attrRev,
 		removedAttrs: make(map[reflect.Type]uint64), children: make(map[*node]uint64),
-		removedChildren: make(map[uint64]removedChild), parents: make(map[*node]struct{}),
+		removedChildren: make(map[uint64]removedChild), parents: make(map[weak.Pointer[node]]struct{}),
 		dirtyChildren: make(map[*node]struct{}),
 		selfRev:       rev, treeRev: rev, structureRev: rev,
 	}
@@ -2168,8 +2169,10 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			}
 			x.index.dirtyOrdinals = postingFromSet(x.index.dirtyOrdinals, x.index.dirty)
 		}
-		for p := range x.parents {
-			visit(p, x)
+		for ref := range x.parents {
+			if p := ref.Value(); p != nil {
+				visit(p, x)
+			}
 		}
 	}
 	visit(n, nil)
@@ -2276,8 +2279,10 @@ func propagateStructureLocked(n *node, rev uint64) {
 		if x.structureRev < rev {
 			x.structureRev = rev
 		}
-		for parent := range x.parents {
-			visit(parent, x)
+		for ref := range x.parents {
+			if parent := ref.Value(); parent != nil {
+				visit(parent, x)
+			}
 		}
 	}
 	visit(n, nil)
@@ -2294,8 +2299,10 @@ func updateStructuralIndexesLocked(parent, child *node, linked bool) {
 		if n.index != nil {
 			n.index.updateStructureLocked(parent, child, linked)
 		}
-		for ancestor := range n.parents {
-			visit(ancestor)
+		for ref := range n.parents {
+			if ancestor := ref.Value(); ancestor != nil {
+				visit(ancestor)
+			}
 		}
 	}
 	visit(parent)
@@ -2312,8 +2319,10 @@ func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) 
 		if current.index != nil {
 			indexes[current.index] = struct{}{}
 		}
-		for parent := range current.parents {
-			visit(parent)
+		for ref := range current.parents {
+			if parent := ref.Value(); parent != nil {
+				visit(parent)
+			}
 		}
 	}
 	visit(n)
@@ -2765,8 +2774,10 @@ func (index *searchIndex) markAffectedAncestorsLocked(start *node) {
 				index.affected[ordinal] = struct{}{}
 			}
 		}
-		for parent := range n.parents {
-			visit(parent)
+		for ref := range n.parents {
+			if parent := ref.Value(); parent != nil {
+				visit(parent)
+			}
 		}
 	}
 	visit(start)
@@ -2842,7 +2853,7 @@ func snapshotNodeLocked(original *node, attrs map[reflect.Type]any) *node {
 		removedAttrs:    make(map[reflect.Type]uint64),
 		children:        make(map[*node]uint64),
 		removedChildren: make(map[uint64]removedChild),
-		parents:         make(map[*node]struct{}),
+		parents:         make(map[weak.Pointer[node]]struct{}),
 		dirtyChildren:   make(map[*node]struct{}),
 	}
 }
@@ -2956,9 +2967,11 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 	}
 	for ordinal, n := range nodes {
 		parents := make([]uint32, 0, len(n.parents))
-		for parent := range n.parents {
-			if id, exists := index.ordinal[parent]; exists {
-				parents = append(parents, id)
+		for ref := range n.parents {
+			if parent := ref.Value(); parent != nil {
+				if id, exists := index.ordinal[parent]; exists {
+					parents = append(parents, id)
+				}
 			}
 		}
 		slices.Sort(parents)
@@ -3381,7 +3394,11 @@ func (index *searchIndex) currentParentPostingMatching(children, candidates post
 	}
 	result := make(posting, 0)
 	for _, child := range children {
-		for parent := range index.nodeAt(child).parents {
+		for ref := range index.nodeAt(child).parents {
+			parent := ref.Value()
+			if parent == nil {
+				continue
+			}
 			ordinal, exists := index.nodeOrdinal(parent)
 			if !exists || !index.activeByOrdinal[ordinal] || candidates != nil && !postingHas(candidates, ordinal) {
 				continue

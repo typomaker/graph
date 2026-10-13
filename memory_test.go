@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"weak"
 )
 
 type memoryIdentity int
@@ -284,4 +285,61 @@ func TestCommitDetachedHeapBound(t *testing.T) {
 	if retained := int64(after.HeapAlloc) - int64(before.HeapAlloc); retained > 8<<20 {
 		t.Fatalf("detached payloads retained %d bytes", retained)
 	}
+}
+
+func TestCommitReleasesDetachedParentsOfLiveNode(t *testing.T) {
+	root := New(memoryIdentity(0))
+	shared := New(memoryIdentity(1))
+	Link(root, shared)
+	Commit(root)
+	detach := func(i int) weak.Pointer[node] {
+		parent := New(memoryIdentity(i+2), memoryText(strings.Repeat("detached-node-", 1<<14)+strconv.Itoa(i)))
+		Link(parent, shared)
+		Link(root, parent)
+		Commit(root)
+		Unlink(root, parent)
+		Commit(root)
+		return weak.Make(first(parent))
+	}
+	for i := range 8 {
+		detach(i)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	var last weak.Pointer[node]
+	for i := range 320 {
+		last = detach(i + 8)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if last.Value() != nil {
+		t.Fatal("shared child retained detached parent")
+	}
+	runtime.KeepAlive(root)
+	runtime.KeepAlive(shared)
+	if retained := int64(after.HeapAlloc) - int64(before.HeapAlloc); retained > 8<<20 {
+		t.Fatalf("detached parents retained %d bytes", retained)
+	}
+}
+
+func TestExternallyHeldDetachedParentReceivesChildChanges(t *testing.T) {
+	root := New(memoryIdentity(0))
+	shared := New(memoryIdentity(1), memoryText("before"))
+	parent := New(memoryIdentity(2))
+	Link(root, shared, parent)
+	Link(parent, shared)
+	Commit(root)
+	Unlink(root, parent)
+	Commit(root)
+	Set(shared, memoryText("after"))
+	if Empty(Delta(parent)) || Empty(Search(parent, memoryText("after"))) {
+		t.Fatal("externally held parent missed a child change")
+	}
+	Commit(parent)
+	Set(shared, memoryText("again"))
+	if Empty(Delta(parent)) || Empty(Search(parent, memoryText("again"))) {
+		t.Fatal("externally held parent missed a change after its own commit")
+	}
+	runtime.KeepAlive(parent)
 }

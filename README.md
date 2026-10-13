@@ -4,6 +4,8 @@
 
 ## Install
 
+Go 1.24 or newer is required.
+
 ```sh
 go get github.com/typomaker/graph
 ```
