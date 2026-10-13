@@ -31,6 +31,7 @@ type node struct {
 	childOrder      []*node
 	removedChildren map[uint64]removedChild
 	parents         map[weak.Pointer[node]]struct{}
+	parentSweepAt   int
 	dirtyChildren   map[*node]struct{}
 	dirtyChildOrder []*node
 	selfRev         uint64
@@ -365,7 +366,7 @@ func Link(g Graph, graphs ...Graph) bool {
 		rev := nextRevisionLocked()
 		addChildLocked(parent, child, rev)
 		delete(parent.removedChildren, child.key)
-		child.parents[weak.Make(parent)] = struct{}{}
+		addParentLocked(child, parent)
 		markDirtyChildLocked(parent, child)
 		parent.selfRev = rev
 		propagateStructureLocked(parent, rev)
@@ -393,7 +394,7 @@ func Unlink(g Graph, graphs ...Graph) bool {
 			continue
 		}
 		removeChildLocked(parent, child)
-		delete(child.parents, weak.Make(parent))
+		removeParentLocked(child, parent)
 		rev := nextRevisionLocked()
 		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 		parent.selfRev = rev
@@ -1563,7 +1564,7 @@ func applyLocked(g, delta Graph) Graph {
 			if _, ok := parent.children[child]; ok {
 				collectStructuralIndexesLocked(parent, structuralIndexes)
 				removeChildLocked(parent, child)
-				delete(child.parents, weak.Make(parent))
+				removeParentLocked(child, parent)
 				parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 				structureChanged[parent] = struct{}{}
 				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child})
@@ -1581,7 +1582,7 @@ func applyLocked(g, delta Graph) Graph {
 				collectStructuralIndexesLocked(parent, structuralIndexes)
 				addChildLocked(parent, child, rev)
 				delete(parent.removedChildren, child.key)
-				child.parents[weak.Make(parent)] = struct{}{}
+				addParentLocked(child, parent)
 				markDirtyChildLocked(parent, child)
 				structureChanged[parent] = struct{}{}
 				structuralChanges = append(structuralChanges, structuralChange{parent: parent, child: child, linked: true})
@@ -1703,7 +1704,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 			collectStructuralIndexesLocked(pair.target, structuralIndexes)
 			addChildLocked(pair.target, targetChild, rev)
 			delete(pair.target.removedChildren, targetChild.key)
-			targetChild.parents[weak.Make(pair.target)] = struct{}{}
+			addParentLocked(targetChild, pair.target)
 			markDirtyChildLocked(pair.target, targetChild)
 			structureChanged[pair.target] = struct{}{}
 			structuralChanges = append(structuralChanges, structuralChange{parent: pair.target, child: targetChild, linked: true})
@@ -2126,6 +2127,32 @@ func attributeType[T any]() reflect.Type {
 
 func nextRevisionLocked() uint64 { state.revision++; return state.revision }
 
+// Weak keys do not keep parents alive, but the map retains dead keys until
+// removed. Sweep when its size doubles so churn cannot grow it indefinitely.
+func addParentLocked(child, parent *node) {
+	child.parents[weak.Make(parent)] = struct{}{}
+	if len(child.parents) < child.parentSweepAt {
+		return
+	}
+	for ref := range child.parents {
+		if ref.Value() == nil {
+			delete(child.parents, ref)
+		}
+	}
+	child.parentSweepAt = max(64, len(child.parents)*2)
+}
+
+func removeParentLocked(child, parent *node) {
+	delete(child.parents, weak.Make(parent))
+	adjustParentSweepLocked(child)
+}
+
+func adjustParentSweepLocked(child *node) {
+	if len(child.parents)*4 < child.parentSweepAt {
+		child.parentSweepAt = max(64, len(child.parents)*2)
+	}
+}
+
 func markDirtyChildLocked(parent, child *node) {
 	if _, exists := parent.dirtyChildren[child]; exists {
 		return
@@ -2172,8 +2199,11 @@ func propagateAttributeLocked(n *node, rev uint64) {
 		for ref := range x.parents {
 			if p := ref.Value(); p != nil {
 				visit(p, x)
+			} else {
+				delete(x.parents, ref)
 			}
 		}
+		adjustParentSweepLocked(x)
 	}
 	visit(n, nil)
 }
@@ -2282,8 +2312,11 @@ func propagateStructureLocked(n *node, rev uint64) {
 		for ref := range x.parents {
 			if parent := ref.Value(); parent != nil {
 				visit(parent, x)
+			} else {
+				delete(x.parents, ref)
 			}
 		}
+		adjustParentSweepLocked(x)
 	}
 	visit(n, nil)
 }
@@ -2302,8 +2335,11 @@ func updateStructuralIndexesLocked(parent, child *node, linked bool) {
 		for ref := range n.parents {
 			if ancestor := ref.Value(); ancestor != nil {
 				visit(ancestor)
+			} else {
+				delete(n.parents, ref)
 			}
 		}
+		adjustParentSweepLocked(n)
 	}
 	visit(parent)
 }
@@ -2322,8 +2358,11 @@ func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) 
 		for ref := range current.parents {
 			if parent := ref.Value(); parent != nil {
 				visit(parent)
+			} else {
+				delete(current.parents, ref)
 			}
 		}
+		adjustParentSweepLocked(current)
 	}
 	visit(n)
 }
@@ -2777,8 +2816,11 @@ func (index *searchIndex) markAffectedAncestorsLocked(start *node) {
 		for ref := range n.parents {
 			if parent := ref.Value(); parent != nil {
 				visit(parent)
+			} else {
+				delete(n.parents, ref)
 			}
 		}
+		adjustParentSweepLocked(n)
 	}
 	visit(start)
 }
@@ -2972,8 +3014,11 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 				if id, exists := index.ordinal[parent]; exists {
 					parents = append(parents, id)
 				}
+			} else {
+				delete(n.parents, ref)
 			}
 		}
+		adjustParentSweepLocked(n)
 		slices.Sort(parents)
 		index.parents[ordinal] = parents
 	}

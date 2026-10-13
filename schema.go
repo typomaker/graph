@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"weak"
 )
 
 // Schema describes the stable external names of graph attribute types.
@@ -204,7 +203,7 @@ func Decode(encoded EncodedGraph) (Graph, error) {
 			}
 			revision := nextRevisionLocked()
 			addChildLocked(parent, child, revision)
-			child.parents[weak.Make(parent)] = struct{}{}
+			addParentLocked(child, parent)
 		}
 	}
 	roots := make([]*node, len(encoded.Roots))

@@ -310,9 +310,15 @@ func TestCommitReleasesDetachedParentsOfLiveNode(t *testing.T) {
 	var last weak.Pointer[node]
 	for i := range 320 {
 		last = detach(i + 8)
+		if (i+1)%64 == 0 {
+			runtime.GC()
+		}
 	}
 	runtime.GC()
 	runtime.ReadMemStats(&after)
+	if got := len(first(shared).parents); got > 128 {
+		t.Fatalf("weak parent map retained %d stale keys", got)
+	}
 	if last.Value() != nil {
 		t.Fatal("shared child retained detached parent")
 	}
@@ -342,4 +348,34 @@ func TestExternallyHeldDetachedParentReceivesChildChanges(t *testing.T) {
 		t.Fatal("externally held parent missed a change after its own commit")
 	}
 	runtime.KeepAlive(parent)
+}
+
+func TestWeakParentSweepPreservesLiveParent(t *testing.T) {
+	shared := New(memoryIdentity(0))
+	live := New(memoryIdentity(1))
+	Link(live, shared)
+	Commit(live)
+	for i := range 256 {
+		func() {
+			temporary := New(memoryIdentity(i + 2))
+			Link(temporary, shared)
+		}()
+		if (i+1)%64 == 0 {
+			runtime.GC()
+		}
+	}
+	if _, exists := first(shared).parents[weak.Make(first(live))]; !exists {
+		t.Fatal("sweep removed a live parent")
+	}
+	if got := len(first(shared).parents); got > 128 {
+		t.Fatalf("weak parent map retained %d stale keys", got)
+	}
+	Set(shared, memoryText("changed"))
+	if got := len(first(shared).parents); got != 1 {
+		t.Fatalf("child update left %d weak parent entries", got)
+	}
+	if Empty(Delta(live)) {
+		t.Fatal("live parent missed child mutation after sweep")
+	}
+	runtime.KeepAlive(live)
 }
