@@ -43,6 +43,7 @@ type searchIndex struct {
 	root              *node
 	structureRevision uint64
 	nodes             []*node
+	baseAttrs         []map[reflect.Type]any
 	ordinal           map[*node]uint32
 	parents           [][]uint32
 	all               posting
@@ -64,9 +65,11 @@ type searchIndex struct {
 	affectedOrdinals  posting
 	added             []*node
 	addedOrdinal      map[*node]uint32
+	inactiveAdded     map[*node]struct{}
 	addedAll          posting
 	addedByType       map[reflect.Type]posting
 	addedByValue      map[reflect.Type]map[any]posting
+	addedValues       map[*node]map[reflect.Type]any
 	addedIndexed      bool
 	orderByOrdinal    []uint32
 	orderIdentity     bool
@@ -1102,6 +1105,7 @@ func Commit(g Graph) {
 			for _, n := range nodes {
 				n.baseline = state.revision
 				clearDirtyChildrenLocked(n)
+				clear(n.removedChildren)
 			}
 			root.index = buildSearchIndexLocked(root, nodes)
 			continue
@@ -1111,6 +1115,8 @@ func Commit(g Graph) {
 		}
 		commitChangedLocked(root, state.revision, false, make(map[*node]struct{}))
 		root.index.commitOverlayLocked()
+		root.index.retireInactiveCommittedLocked()
+		root.index.trimInactiveAddedLocked()
 		if root.index.shouldCompact() {
 			nodes := reachableLocked([]*node{root})
 			root.index = buildSearchIndexLocked(root, nodes)
@@ -1120,6 +1126,7 @@ func Commit(g Graph) {
 
 func clearDirtyChildrenLocked(n *node) {
 	clear(n.dirtyChildren)
+	clear(n.dirtyChildOrder)
 	n.dirtyChildOrder = n.dirtyChildOrder[:0]
 }
 
@@ -1130,6 +1137,7 @@ func commitChangedLocked(n *node, revision uint64, full bool, seen map[*node]str
 	seen[n] = struct{}{}
 	base := n.baseline
 	n.baseline = revision
+	clear(n.removedChildren)
 	children := n.dirtyChildOrder
 	if full {
 		children = n.childOrder
@@ -1938,6 +1946,7 @@ func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (
 			}
 		}
 		n.dirtyChildOrder = n.dirtyChildOrder[:write]
+		clear(n.dirtyChildOrder[write:cap(n.dirtyChildOrder)])
 	}
 	if include {
 		view.changes[n] = change
@@ -2362,6 +2371,9 @@ func (index *searchIndex) normalizeEdgeLocked(parent, child *node, linked bool) 
 
 func (index *searchIndex) commitOverlayLocked() {
 	for _, parent := range index.added {
+		if parent == nil {
+			continue
+		}
 		parentOrdinal := index.addedOrdinal[parent]
 		if !index.activeByOrdinal[parentOrdinal] {
 			continue
@@ -2411,6 +2423,121 @@ func (index *searchIndex) shouldCompact() bool {
 	total := len(index.nodes) + len(index.added)
 	overlay := len(index.dirty) + len(index.removed) + len(index.added) + len(index.committedAdded) + len(index.committedRemoved)
 	return overlay > 256 && overlay*4 > total
+}
+
+// retireInactiveCommittedLocked removes unreachable nodes from the original
+// index in place. Ordinals remain stable, so active postings need no rebuild.
+func (index *searchIndex) retireInactiveCommittedLocked() {
+	for ordinal := range index.removed {
+		n := index.nodes[ordinal]
+		for typ, value := range index.baseAttrs[ordinal] {
+			index.byType[typ] = removePostingOrdinal(index.byType[typ], ordinal)
+			values := index.byValue[typ]
+			values[value] = removePostingOrdinal(values[value], ordinal)
+			if len(values[value]) == 0 {
+				delete(values, value)
+			}
+		}
+		index.all = removePostingOrdinal(index.all, ordinal)
+		if index.dirtyIndexed {
+			index.updateDirtyPostingsLocked(ordinal, nil)
+		}
+		delete(index.dirtySnapshots, ordinal)
+		delete(index.dirty, ordinal)
+		delete(index.ordinal, n)
+		delete(index.support, n)
+		delete(index.baselineNodes, n)
+		index.removeKeyNode(n)
+		for _, child := range n.childOrder {
+			if childOrdinal, known := index.nodeOrdinal(child); known && int(childOrdinal) < len(index.parents) {
+				index.parents[childOrdinal] = removePostingOrdinal(index.parents[childOrdinal], ordinal)
+			}
+		}
+		index.parents[ordinal] = nil
+		index.nodes[ordinal] = nil
+		index.baseAttrs[ordinal] = nil
+		for edge := range index.committedRemoved {
+			if edge.parent == n || edge.child == n {
+				if edge.parent == n {
+					if childOrdinal, known := index.nodeOrdinal(edge.child); known && int(childOrdinal) < len(index.parents) {
+						index.parents[childOrdinal] = removePostingOrdinal(index.parents[childOrdinal], ordinal)
+					}
+				}
+				delete(index.committedRemoved, edge)
+			}
+		}
+		for edge := range index.committedAdded {
+			if edge.parent == n || edge.child == n {
+				delete(index.committedAdded, edge)
+			}
+		}
+		delete(index.removed, ordinal)
+	}
+	index.removedOrdinals = postingFromSet(index.removedOrdinals, index.removed)
+	index.dirtyOrdinals = postingFromSet(index.dirtyOrdinals, index.dirty)
+}
+
+// trimInactiveAddedLocked releases detached added nodes without renumbering
+// live ordinals or rebuilding the committed portion of the index.
+func (index *searchIndex) trimInactiveAddedLocked() {
+	for n := range index.inactiveAdded {
+		ordinal, known := index.addedOrdinal[n]
+		if !known || index.activeByOrdinal[ordinal] {
+			delete(index.inactiveAdded, n)
+			continue
+		}
+		delete(index.addedOrdinal, n)
+		delete(index.support, n)
+		delete(index.baselineNodes, n)
+		index.removeKeyNode(n)
+		for edge := range index.committedAdded {
+			if edge.parent == n || edge.child == n {
+				delete(index.committedAdded, edge)
+			}
+		}
+		if index.addedIndexed {
+			for typ, value := range index.addedValues[n] {
+				index.addedByType[typ] = removePostingOrdinal(index.addedByType[typ], ordinal)
+				values := index.addedByValue[typ]
+				values[value] = removePostingOrdinal(values[value], ordinal)
+				if len(values[value]) == 0 {
+					delete(values, value)
+				}
+			}
+		}
+		delete(index.addedValues, n)
+		index.added[int(ordinal)-len(index.nodes)] = nil
+		index.addedAll = removePostingOrdinal(index.addedAll, ordinal)
+		delete(index.inactiveAdded, n)
+	}
+	for len(index.added) != 0 {
+		last := len(index.added) - 1
+		if index.added[last] != nil {
+			break
+		}
+		index.added = index.added[:last]
+		index.activeByOrdinal = index.activeByOrdinal[:len(index.activeByOrdinal)-1]
+		index.orderByOrdinal = index.orderByOrdinal[:len(index.orderByOrdinal)-1]
+	}
+}
+
+func (index *searchIndex) removeKeyNode(n *node) {
+	previous := index.sameKey[n]
+	if index.byKey[n.key] == n {
+		if previous != nil {
+			index.byKey[n.key] = previous
+		} else {
+			delete(index.byKey, n.key)
+		}
+	} else {
+		for current := index.byKey[n.key]; current != nil; current = index.sameKey[current] {
+			if index.sameKey[current] == n {
+				index.sameKey[current] = previous
+				break
+			}
+		}
+	}
+	delete(index.sameKey, n)
 }
 
 func (index *searchIndex) hasCommittedEdge(parent, child *node) bool {
@@ -2472,6 +2599,7 @@ func (index *searchIndex) activateLocked(n *node) {
 		return
 	}
 	delete(index.detachedSnapshots, n)
+	delete(index.inactiveAdded, n)
 	index.active[n] = struct{}{}
 	if ordinal, committed := index.ordinal[n]; committed {
 		delete(index.removed, ordinal)
@@ -2507,13 +2635,18 @@ func (index *searchIndex) activateLocked(n *node) {
 func (index *searchIndex) rebuildAddedPostingsLocked() {
 	index.addedByType = make(map[reflect.Type]posting)
 	index.addedByValue = make(map[reflect.Type]map[any]posting)
+	index.addedValues = make(map[*node]map[reflect.Type]any)
 	index.addedIndexed = true
 	for offset, n := range index.added {
+		if n == nil {
+			continue
+		}
 		index.indexAddedNodeLocked(n, uint32(len(index.nodes)+offset))
 	}
 }
 
 func (index *searchIndex) indexAddedNodeLocked(n *node, ordinal uint32) {
+	index.addedValues[n] = cloneAttrs(n.attrs)
 	for typ, value := range n.attrs {
 		index.addedByType[typ] = append(index.addedByType[typ], ordinal)
 		values := index.addedByValue[typ]
@@ -2606,6 +2739,7 @@ func (index *searchIndex) deactivateLocked(n *node) {
 	} else if ordinal, known := index.addedOrdinal[n]; known {
 		index.activeByOrdinal[ordinal] = false
 		index.activeAdded--
+		index.inactiveAdded[n] = struct{}{}
 	}
 	for _, child := range n.childOrder {
 		if index.support[child] == 0 {
@@ -2765,6 +2899,7 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		root:              root,
 		structureRevision: root.structureRev,
 		nodes:             append([]*node(nil), nodes...),
+		baseAttrs:         make([]map[reflect.Type]any, len(nodes)),
 		ordinal:           make(map[*node]uint32, len(nodes)),
 		parents:           make([][]uint32, len(nodes)),
 		all:               make(posting, len(nodes)),
@@ -2780,6 +2915,7 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		removed:           make(map[uint32]struct{}),
 		affected:          make(map[uint32]struct{}),
 		addedOrdinal:      make(map[*node]uint32),
+		inactiveAdded:     make(map[*node]struct{}),
 		orderByOrdinal:    make([]uint32, len(nodes)),
 		orderIdentity:     true,
 		support:           make(map[*node]uint32, len(nodes)),
@@ -2798,6 +2934,7 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		}
 		id := uint32(ordinal)
 		index.ordinal[n] = id
+		index.baseAttrs[ordinal] = cloneAttrs(n.attrs)
 		index.all[ordinal] = id
 		index.orderByOrdinal[ordinal] = id
 		index.active[n] = struct{}{}
