@@ -218,6 +218,41 @@ func BenchmarkPathFollowCommitted10K(b *testing.B) {
 	}
 }
 
+func BenchmarkLocalPathCommitted10K(b *testing.B) {
+	root := New(benchmarkKind("root"))
+	for i := 0; i < 10000; i++ {
+		parent := New(benchmarkKind("parent"), benchmarkID(fmt.Sprint(i)))
+		Link(root, parent)
+		Link(parent, New(benchmarkKind("child")))
+	}
+	Commit(root)
+	parent := Search(root, benchmarkID("9999"))
+	path := Path(benchmarkKind("child"))
+	b.Run("FollowOne", func(b *testing.B) {
+		for range b.N {
+			if Len(Follow(parent, path)) != 1 {
+				b.Fatal()
+			}
+		}
+	})
+	b.Run("SelectOne", func(b *testing.B) {
+		for range b.N {
+			if Len(Select(parent, path)) != 1 {
+				b.Fatal()
+			}
+		}
+	})
+	b.Run("FollowWide", func(b *testing.B) {
+		parents := Search(root, benchmarkKind("parent"))
+		b.ResetTimer()
+		for range b.N {
+			if Len(Follow(parents, path)) != 10000 {
+				b.Fatal()
+			}
+		}
+	})
+}
+
 func BenchmarkCommit10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	b.ResetTimer()

@@ -86,6 +86,8 @@ type searchIndex struct {
 
 const addedPostingThreshold = 32
 const dirtyPostingThreshold = 32
+const localPathSelectionLimit = 16
+const localPathEdgeLimit = 64
 
 type posting []uint32
 
@@ -651,7 +653,7 @@ func Select(g Graph, values ...any) Graph {
 	state.RLock()
 	defer state.RUnlock()
 	index := graphSearchIndex(g)
-	if index != nil {
+	if index != nil && !useLocalPath(g, condition) {
 		if out, ok := index.selectMatches(g, condition); ok {
 			return out
 		}
@@ -722,7 +724,7 @@ func Follow(g Graph, values ...any) Graph {
 	defer state.RUnlock()
 	index := graphSearchIndex(g)
 	candidates := g
-	if index != nil && containsPath(condition) {
+	if index != nil && containsPath(condition) && !useLocalPath(g, condition) {
 		if matches, ok := index.selectMatches(g, condition); ok {
 			candidates = matches
 		}
@@ -743,6 +745,20 @@ func Follow(g Graph, values ...any) Graph {
 		}
 	}
 	return Graph{nodes: out, view: g.view, index: index}
+}
+
+func useLocalPath(g Graph, condition *predicate) bool {
+	if !containsPath(condition) || len(g.nodes) > localPathSelectionLimit {
+		return false
+	}
+	edges := 0
+	for _, n := range g.nodes {
+		edges += len(n.children)
+		if edges > localPathEdgeLimit {
+			return false
+		}
+	}
+	return true
 }
 
 // Search recursively filters every node reachable from the current selection

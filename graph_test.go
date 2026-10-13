@@ -1224,6 +1224,69 @@ func TestCommittedPathSearchAndFollow(t *testing.T) {
 	}
 }
 
+func TestLocalPathSelectionAndFollow(t *testing.T) {
+	root := New(kind("root"))
+	a, b := New(kind("parent"), name("a")), New(kind("parent"), name("b"))
+	left, right := New(kind("edge")), New(kind("edge"))
+	shared := New(kind("target"), ident("shared"))
+	other := New(kind("target"), ident("other"))
+	Link(root, a, b)
+	Link(a, left, right)
+	Link(b, right)
+	Link(left, shared)
+	Link(right, shared, other)
+	Commit(root)
+	path := Path(kind("edge"), And(Type[kind](), Or(ident("shared"), ident("other"))))
+	check := func(want []Graph) {
+		t.Helper()
+		got := Follow(Union(a, b), path)
+		if len(got.nodes) != len(want) {
+			t.Fatalf("endpoints = %d, want %d", len(got.nodes), len(want))
+		}
+		for i, node := range want {
+			if got.nodes[i] != first(node) {
+				t.Fatalf("endpoint %d has wrong order", i)
+			}
+		}
+	}
+	check([]Graph{shared, other})
+	if Len(Select(a, path)) != 1 || !Empty(Select(b, Path(kind("missing")))) || !Empty(Select(Graph{}, path)) || !Empty(Follow(Graph{}, path)) {
+		t.Fatal("local path selection")
+	}
+	if Len(Follow(a, Path(kind("edge")))) != 2 || Len(Follow(a, Or(Path(kind("edge")), kind("parent")))) != 3 {
+		t.Fatal("direct path or expression")
+	}
+	view := &subgraph{edges: map[*node][]*node{first(a): {first(left)}, first(left): {first(shared)}}}
+	if got := Follow(Graph{nodes: a.nodes, view: view}, path); Len(got) != 1 || first(got) != first(shared) {
+		t.Fatal("subgraph path")
+	}
+	query, closeQuery := Query(root, kind("parent"), path)
+	defer closeQuery()
+	if len(collectNames(t, query)) != 2 {
+		t.Fatal("reactive path before mutation")
+	}
+	Unlink(right, other)
+	Unset[ident](shared)
+	check(nil)
+	if !Empty(Select(a, path)) || len(collectNames(t, query)) != 0 {
+		t.Fatal("dirty path overlay")
+	}
+	Set(shared, ident("shared"))
+	Link(right, other)
+	check([]Graph{shared, other})
+	Commit(root)
+	check([]Graph{shared, other})
+	wide := New(kind("wide"))
+	for i := 0; i <= localPathEdgeLimit; i++ {
+		Link(wide, New(kind("edge")))
+	}
+	Link(root, wide)
+	Commit(root)
+	if useLocalPath(wide, Path(kind("edge")).(predicateExpression).predicate) || Len(Follow(wide, Path(kind("edge")))) != localPathEdgeLimit+1 {
+		t.Fatal("wide direct path")
+	}
+}
+
 func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	root := New(kind("root"))
 	branch := New(kind("branch"))
