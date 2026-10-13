@@ -682,10 +682,13 @@ func (index *searchIndex) selectMatches(selection Graph, condition *predicate) (
 		var ordinal uint32
 		if len(selection.ordinals) == len(nodes) {
 			ordinal = selection.ordinals[position]
+			if int(ordinal) >= len(index.activeByOrdinal) || !index.activeByOrdinal[ordinal] || index.nodeAt(ordinal) != n {
+				return Graph{}, false
+			}
 		} else {
 			var exists bool
 			ordinal, exists = index.nodeOrdinal(n)
-			if !exists {
+			if !exists || !index.activeByOrdinal[ordinal] {
 				return Graph{}, false
 			}
 		}
@@ -2283,8 +2286,12 @@ func removePostingOrdinal(values posting, ordinal uint32) posting {
 	if !found {
 		return values
 	}
-	copy(values[position:], values[position+1:])
-	return values[:len(values)-1]
+	// Singleton postings can share index.all, and selections can retain other
+	// postings. Preserve their backing arrays when removing an ordinal.
+	result := make(posting, len(values)-1)
+	copy(result, values[:position])
+	copy(result[position:], values[position+1:])
+	return result
 }
 
 func postingHas(values posting, ordinal uint32) bool {
