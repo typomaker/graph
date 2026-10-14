@@ -482,6 +482,23 @@ func BenchmarkStructuralUnlinkBranch100Of10K(b *testing.B) {
 	}
 }
 
+func BenchmarkStructuralUnlinkPosition10K(b *testing.B) {
+	for _, position := range []int{0, 5000, 9999} {
+		b.Run(fmt.Sprintf("Position%d", position), func(b *testing.B) {
+			root := benchmarkWorld(10000)
+			child := Graph{nodes: []*node{first(root).childOrder[position]}}
+			Commit(root)
+			b.StopTimer()
+			for range b.N {
+				b.StartTimer()
+				Unlink(root, child)
+				b.StopTimer()
+				Link(root, child)
+			}
+		})
+	}
+}
+
 func BenchmarkSearchAddedBranch100Of10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	branch := New(benchmarkKind("branch"))

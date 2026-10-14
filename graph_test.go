@@ -512,6 +512,18 @@ func TestCycleCheckWithLongUnrelatedBranch(t *testing.T) {
 	}
 }
 
+func TestUnlinkWithEqualNodeIDs(t *testing.T) {
+	root := New(name("root"))
+	firstChild := New(name("first"))
+	secondChild := New(name("second"))
+	first(secondChild).id = first(firstChild).id
+	Link(root, firstChild, secondChild)
+	if !Unlink(root, firstChild) || Len(Follow(root, Path(Type[any]()))) != 1 ||
+		first(Follow(root, Path(Type[any]()))) != first(secondChild) {
+		t.Fatal("unlink removed the wrong child with an equal ID")
+	}
+}
+
 func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	root := New(name("root"))
 	child := New(name("old"))

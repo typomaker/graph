@@ -2967,14 +2967,31 @@ func addChildLocked(parent, child *node, revision uint64) {
 
 func removeChildLocked(parent, child *node) {
 	delete(parent.children, child)
-	for index, current := range parent.childOrder {
-		if current != child {
-			continue
-		}
-		copy(parent.childOrder[index:], parent.childOrder[index+1:])
-		parent.childOrder[len(parent.childOrder)-1] = nil
-		parent.childOrder = parent.childOrder[:len(parent.childOrder)-1]
+	order := parent.childOrder
+	if len(order) == 0 {
 		return
+	}
+	index := -1
+	switch {
+	case order[0] == child:
+		index = 0
+	case order[len(order)-1] == child:
+		index = len(order) - 1
+	default:
+		start := sort.Search(len(order), func(i int) bool {
+			return order[i].id >= child.id
+		})
+		for i := start; i < len(order) && order[i].id == child.id; i++ {
+			if order[i] == child {
+				index = i
+				break
+			}
+		}
+	}
+	if index >= 0 {
+		copy(order[index:], order[index+1:])
+		order[len(order)-1] = nil
+		parent.childOrder = order[:len(order)-1]
 	}
 }
 
