@@ -95,8 +95,10 @@ const cachedAtomicMinMatches = 1024
 const cachedAtomicSlots = 4
 
 type cachedAtomicResult struct {
-	matcher matcher
-	nodes   []*node
+	matcher  matcher
+	nodes    []*node
+	ordinals posting
+	treeRev  uint64
 }
 
 const addedPostingThreshold = 32
@@ -674,6 +676,29 @@ func Select(g Graph, values ...any) Graph {
 func (index *searchIndex) selectMatches(selection Graph, condition *predicate) (Graph, bool) {
 	nodes := selected(selection)
 	matches := index.orderMatches(index.matchCurrent(condition))
+	if selection.index == index && index.orderIdentity &&
+		len(selection.ordinals) == len(nodes) && len(matches)*8 < len(nodes) &&
+		index.cachedAtomicSelection(selection) {
+		out := make([]*node, 0, len(matches))
+		for _, ordinal := range matches {
+			position, found := slices.BinarySearch(selection.ordinals, ordinal)
+			if !found {
+				continue
+			}
+			if !index.activeByOrdinal[ordinal] || index.nodeAt(ordinal) != nodes[position] {
+				return Graph{}, false
+			}
+			out = append(out, nodes[position])
+		}
+		ordinals := matches
+		if len(out) != len(matches) {
+			ordinals = make(posting, len(out))
+			for i, n := range out {
+				ordinals[i], _ = index.nodeOrdinal(n)
+			}
+		}
+		return Graph{nodes: out, view: selection.view, index: index, ordinals: ordinals}, true
+	}
 	out := make([]*node, 0, min(len(nodes), len(matches)))
 	match := 0
 	var previous uint32
@@ -721,6 +746,21 @@ func (index *searchIndex) selectMatches(selection Graph, condition *predicate) (
 		}
 	}
 	return Graph{nodes: out, view: selection.view, index: index, ordinals: ordinals}, true
+}
+
+func (index *searchIndex) cachedAtomicSelection(selection Graph) bool {
+	if len(selection.nodes) == 0 {
+		return false
+	}
+	for slot := range &index.cachedAtomic {
+		cached := index.cachedAtomic[slot].Load()
+		if cached != nil && cached.treeRev == index.root.treeRev &&
+			len(cached.nodes) == len(selection.nodes) && &cached.nodes[0] == &selection.nodes[0] &&
+			len(cached.ordinals) == len(selection.ordinals) && &cached.ordinals[0] == &selection.ordinals[0] {
+			return true
+		}
+	}
+	return false
 }
 
 // Follow filters the currently selected nodes and returns the endpoints of
@@ -923,7 +963,9 @@ func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
 	}
 	if len(matches) >= cachedAtomicMinMatches {
 		slot := (index.cachedAtomicNext.Add(1) - 1) % cachedAtomicSlots
-		index.cachedAtomic[slot].Store(&cachedAtomicResult{matcher: m, nodes: nodes})
+		index.cachedAtomic[slot].Store(&cachedAtomicResult{
+			matcher: m, nodes: nodes, ordinals: matches, treeRev: root.treeRev,
+		})
 	}
 	return Graph{nodes: nodes, index: index, ordinals: matches}, true
 }

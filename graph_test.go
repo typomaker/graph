@@ -1638,6 +1638,35 @@ func TestFollowSingleStepPreservesOrderAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestSparseIndexedSelectionFallsBackAfterGraphChange(t *testing.T) {
+	root := New(kind("root"), ident("target"))
+	var target Graph
+	for i := range 1100 {
+		parent := New(kind("parent"))
+		if i == 93 {
+			Set(parent, ident("target"))
+			target = parent
+		}
+		Link(root, parent)
+	}
+	child := New(kind("child"))
+	Link(target, child)
+	Commit(root)
+	parents := Search(root, kind("parent"))
+	index := first(root).index
+	if index.cachedAtomicSelection(Graph{}) || !index.cachedAtomicSelection(parents) ||
+		Len(Select(parents, ident("missing"))) != 0 ||
+		first(Select(parents, ident("target"))) != first(target) ||
+		first(Follow(parents, Path(kind("child")))) != first(child) {
+		t.Fatal("sparse indexed selection returned incorrect matches")
+	}
+	Unlink(root, target)
+	if index.cachedAtomicSelection(parents) || first(Select(parents, ident("target"))) != first(target) ||
+		first(Follow(parents, Path(kind("child")))) != first(child) {
+		t.Fatal("stale selection lost its detached node")
+	}
+}
+
 func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	root := New(kind("root"))
 	branch := New(kind("branch"))
