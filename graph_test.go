@@ -927,9 +927,35 @@ func TestApplyAndPatchValidation(t *testing.T) {
 }
 
 func TestValidationPanics(t *testing.T) {
-	tests := []func(){func() { New(nil) }, func() { New(name("x"), nil) }, func() { v := name("x"); New(&v) }, func() { New([]int{1}) }, func() { New(name("x"), name("y")) }, func() { Select(New(name("x"))) }, func() { Path() }, func() { Path(Path(name("x"))) }, func() { Get[any](New(name("x"))) }, func() { Unset[*name](New(name("x"))) }}
+	tests := []func(){
+		func() { storedAttributes(nil) },
+		func() { New(nil) },
+		func() { New(name("x"), nil) },
+		func() { v := name("x"); New(&v) },
+		func() { New([]int{1}) },
+		func() { New(name("x"), name("y")) },
+		func() { Set[any](Graph{}, nil) },
+		func() { v := name("x"); Set(Graph{}, &v) },
+		func() { Set(Graph{}, []int{1}) },
+		func() { Select(New(name("x"))) },
+		func() { Path() },
+		func() { Path(Path(name("x"))) },
+		func() { Get[any](New(name("x"))) },
+		func() { Unset[*name](New(name("x"))) },
+	}
 	for _, fn := range tests {
 		func() { defer expectPanic(t); fn() }()
+	}
+}
+
+func TestSetUsesDynamicAttributeType(t *testing.T) {
+	n := New(name("old"))
+	var attribute any = name("new")
+	if !Set(n, attribute) || value[name](t, n) != "new" {
+		t.Fatal("Set did not use the concrete attribute type")
+	}
+	if Set(n, attribute) {
+		t.Fatal("equal dynamic attribute changed")
 	}
 }
 func expectPanic(t *testing.T) {

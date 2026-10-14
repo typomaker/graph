@@ -283,31 +283,22 @@ func Get[T any](g Graph) (T, bool) {
 // Set adds or replaces an attribute on the first selected node. It reports
 // whether the attribute was inserted or changed.
 func Set[T any](g Graph, value T) bool {
-	attrs := storedAttributes([]any{value})
+	stored := any(value)
+	typ := storedAttributeType(stored)
 	state.Lock()
 	defer state.Unlock()
 	n := first(g)
 	if n == nil {
 		return false
 	}
-	changedTypes := make(map[reflect.Type]struct{})
-	for t, v := range attrs {
-		old, ok := n.attrs[t]
-		if !ok || old != v {
-			n.attrs[t] = v
-			n.attrRev[t] = 0
-			delete(n.removedAttrs, t)
-			changedTypes[t] = struct{}{}
-		}
-	}
-	if len(changedTypes) == 0 {
+	if old, exists := n.attrs[typ]; exists && old == stored {
 		return false
 	}
+	n.attrs[typ] = stored
+	delete(n.removedAttrs, typ)
 	rev := nextRevisionLocked()
 	n.selfRev = rev
-	for t := range changedTypes {
-		n.attrRev[t] = rev
-	}
+	n.attrRev[typ] = rev
 	propagateAttributeLocked(n, rev)
 	return true
 }
@@ -2029,23 +2020,27 @@ func storedAttributes(values []any) map[reflect.Type]any {
 	}
 	out := make(map[reflect.Type]any, len(values))
 	for _, v := range values {
-		if v == nil {
-			panic("graph: nil attribute")
-		}
-		t := reflect.TypeOf(v)
-		if t.Kind() == reflect.Pointer {
-			panic("graph: pointer attribute")
-		}
-		if t.Kind() == reflect.Interface || !t.Comparable() {
-			panic(fmt.Sprintf("graph: attribute %v is not a comparable value", t))
-		}
-		t = normalizeType(t)
+		t := storedAttributeType(v)
 		if _, ok := out[t]; ok {
 			panic("graph: duplicate attribute type " + t.String())
 		}
 		out[t] = v
 	}
 	return out
+}
+
+func storedAttributeType(value any) reflect.Type {
+	if value == nil {
+		panic("graph: nil attribute")
+	}
+	typ := reflect.TypeOf(value)
+	if typ.Kind() == reflect.Pointer {
+		panic("graph: pointer attribute")
+	}
+	if typ.Kind() == reflect.Interface || !typ.Comparable() {
+		panic(fmt.Sprintf("graph: attribute %v is not a comparable value", typ))
+	}
+	return normalizeType(typ)
 }
 
 func inspectRequests(values []any) []request {
