@@ -699,6 +699,9 @@ func (index *searchIndex) selectMatches(selection Graph, condition *predicate) (
 		}
 		return Graph{nodes: out, view: selection.view, index: index, ordinals: ordinals}, true
 	}
+	if result, ok := index.contiguousSelectionMatches(selection, matches); ok {
+		return result, true
+	}
 	out := make([]*node, 0, min(len(nodes), len(matches)))
 	match := 0
 	var previous uint32
@@ -746,6 +749,36 @@ func (index *searchIndex) selectMatches(selection Graph, condition *predicate) (
 		}
 	}
 	return Graph{nodes: out, view: selection.view, index: index, ordinals: ordinals}, true
+}
+
+func (index *searchIndex) contiguousSelectionMatches(selection Graph, matches posting) (Graph, bool) {
+	nodes := selected(selection)
+	if !index.orderIdentity || len(matches) <= len(nodes)/2 || len(matches) == 0 ||
+		len(selection.ordinals) != len(nodes) ||
+		matches[len(matches)-1]-matches[0] != uint32(len(matches)-1) {
+		return Graph{}, false
+	}
+	first, last, count := -1, -1, 0
+	var previous uint32
+	for position, ordinal := range selection.ordinals {
+		if int(ordinal) >= len(index.activeByOrdinal) || !index.activeByOrdinal[ordinal] ||
+			index.nodeAt(ordinal) != nodes[position] || position != 0 && ordinal <= previous {
+			return Graph{}, false
+		}
+		previous = ordinal
+		if ordinal < matches[0] || ordinal > matches[len(matches)-1] {
+			continue
+		}
+		if first < 0 {
+			first = position
+		}
+		last = position
+		count++
+	}
+	if count != len(matches) || last-first+1 != count {
+		return Graph{}, false
+	}
+	return Graph{nodes: nodes[first : last+1], view: selection.view, index: index, ordinals: matches}, true
 }
 
 func (index *searchIndex) cachedAtomicSelection(selection Graph) bool {
@@ -810,11 +843,34 @@ func followSingleStepLocked(candidates Graph, step *predicate, view *subgraph, i
 		return Graph{nodes: out, view: view, index: index}
 	}
 	out := make([]*node, 0, len(sources))
-	seen := make(map[*node]struct{})
+	useOrdinals := index != nil && view == nil && len(sources) >= 64 && len(index.activeByOrdinal) <= len(sources)*16
+	var seenOrdinals []uint64
+	if useOrdinals {
+		seenOrdinals = make([]uint64, (len(index.activeByOrdinal)+63)/64)
+	}
+	var seen map[*node]struct{}
+	if !useOrdinals {
+		seen = make(map[*node]struct{})
+	}
 	for _, source := range sources {
 		for _, child := range selectedChildrenLocked(source, view) {
 			if !matchesPredicateLocked(child, step, view) {
 				continue
+			}
+			if useOrdinals {
+				if ordinal, known := index.nodeOrdinal(child); known {
+					word := &seenOrdinals[ordinal/64]
+					mask := uint64(1) << (ordinal % 64)
+					if *word&mask != 0 {
+						continue
+					}
+					*word |= mask
+					out = append(out, child)
+					continue
+				}
+				if seen == nil {
+					seen = make(map[*node]struct{})
+				}
 			}
 			if _, duplicate := seen[child]; duplicate {
 				continue
@@ -2477,17 +2533,18 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 	}
 	index.normalizeEdgeLocked(parent, child, linked)
 	if linked {
-		wasInactive := index.support[child] == 0
-		index.support[child]++
-		if wasInactive {
+		support := index.support[child]
+		index.support[child] = support + 1
+		if support == 0 {
 			index.activateLocked(child)
 		}
 	} else {
-		if index.support[child] == 0 {
+		support := index.support[child]
+		if support == 0 {
 			panic("graph: invalid structural index support")
 		}
-		index.support[child]--
-		if index.support[child] == 0 {
+		index.support[child] = support - 1
+		if support == 1 {
 			index.deactivateLocked(child)
 		}
 	}
@@ -2768,9 +2825,9 @@ func (index *searchIndex) activateLocked(n *node) {
 		index.activeAdded++
 	}
 	for _, child := range n.childOrder {
-		wasInactive := index.support[child] == 0
-		index.support[child]++
-		if wasInactive {
+		support := index.support[child]
+		index.support[child] = support + 1
+		if support == 0 {
 			index.activateLocked(child)
 		}
 	}
@@ -2884,11 +2941,12 @@ func (index *searchIndex) deactivateLocked(n *node) {
 		index.inactiveAdded[n] = struct{}{}
 	}
 	for _, child := range n.childOrder {
-		if index.support[child] == 0 {
+		support := index.support[child]
+		if support == 0 {
 			continue
 		}
-		index.support[child]--
-		if index.support[child] == 0 {
+		index.support[child] = support - 1
+		if support == 1 {
 			index.deactivateLocked(child)
 		}
 	}

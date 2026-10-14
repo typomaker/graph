@@ -1667,6 +1667,82 @@ func TestSparseIndexedSelectionFallsBackAfterGraphChange(t *testing.T) {
 	}
 }
 
+func TestWideFollowDeduplicatesIndexedAndDetachedChildren(t *testing.T) {
+	root := New(kind("root"))
+	parents := make([]Graph, 1100)
+	for i := range parents {
+		parents[i] = New(kind("parent"))
+		Link(root, parents[i])
+	}
+	shared := New(kind("child"), name("shared"))
+	for _, parent := range parents {
+		Link(parent, shared)
+	}
+	Commit(root)
+	selection := Search(root, kind("parent"))
+	path := Path(kind("child"))
+	if got := Follow(selection, path); !slices.Equal(got.nodes, []*node{first(shared)}) {
+		t.Fatal("wide follow repeated a shared indexed child")
+	}
+	Unlink(root, parents[0], parents[1])
+	detached := New(kind("child"), name("detached"))
+	Link(parents[0], detached)
+	Link(parents[1], detached)
+	if got := Follow(selection, path); !slices.Equal(got.nodes, []*node{first(shared), first(detached)}) {
+		t.Fatal("wide follow repeated or lost a detached child")
+	}
+}
+
+func TestSelectContiguousIndexedRangeAndStaleSelection(t *testing.T) {
+	root := New(kind("root"))
+	firstActor := New(kind("actor"))
+	secondActor := New(kind("actor"))
+	Link(root, firstActor, secondActor)
+	Commit(root)
+	all := Search(root, Type[any]())
+	actors := Select(all, kind("actor"))
+	if !slices.Equal(actors.nodes, []*node{first(firstActor), first(secondActor)}) ||
+		&actors.nodes[0] != &all.nodes[1] {
+		t.Fatal("contiguous selection did not reuse the selected range")
+	}
+	Unlink(root, firstActor)
+	if got := Select(all, kind("actor")); !slices.Equal(got.nodes, actors.nodes) {
+		t.Fatal("stale selection lost a detached node")
+	}
+
+	separate := New(kind("root"))
+	left := New(kind("actor"))
+	middle := New(kind("other"))
+	right := New(kind("actor"))
+	Link(separate, left, middle, right)
+	Commit(separate)
+	if got := Select(Search(separate, Type[any]()), kind("actor")); !slices.Equal(got.nodes, []*node{first(left), first(right)}) {
+		t.Fatal("noncontiguous selection returned incorrect nodes")
+	}
+}
+
+func TestSharedBranchSupportTransitions(t *testing.T) {
+	root := New(kind("root"))
+	left := New(kind("parent"))
+	right := New(kind("parent"))
+	shared := New(kind("shared"))
+	leaf := New(kind("leaf"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Link(shared, leaf)
+	Commit(root)
+	if !Unlink(left, shared) || Len(Search(root, kind("leaf"))) != 1 {
+		t.Fatal("shared branch disappeared while one parent remained")
+	}
+	if !Unlink(right, shared) || !Empty(Search(root, kind("leaf"))) {
+		t.Fatal("detached shared branch remained indexed")
+	}
+	if !Link(left, shared) || Len(Search(root, kind("leaf"))) != 1 {
+		t.Fatal("relinked shared branch was not indexed")
+	}
+}
+
 func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	root := New(kind("root"))
 	branch := New(kind("branch"))
