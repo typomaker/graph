@@ -495,6 +495,40 @@ func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	}
 }
 
+func TestLargeAtomicSearchCacheInvalidatesOnChanges(t *testing.T) {
+	root := New(kind("root"))
+	children := make([]Graph, cachedAtomicMinMatches)
+	for i := range children {
+		children[i] = New(kind("actor"))
+		Link(root, children[i])
+	}
+	Commit(root)
+	index := first(root).index
+	initial := Search(root, kind("actor"))
+	repeated := Search(root, kind("actor"))
+	if Len(initial) != len(children) || &initial.nodes[0] != &repeated.nodes[0] {
+		t.Fatal("large atomic search did not reuse its selection")
+	}
+
+	Set(children[0], kind("other"))
+	if Len(Search(root, kind("actor"))) != len(children)-1 || Len(initial) != len(children) {
+		t.Fatal("attribute change corrupted a cached selection")
+	}
+	Set(children[0], kind("actor"))
+	if Len(Search(root, kind("actor"))) != len(children) {
+		t.Fatal("restored attribute was not searchable")
+	}
+	Unlink(root, children[0])
+	if index.cachedAtomic.Load() != nil || Len(Search(root, kind("actor"))) != len(children)-1 ||
+		Len(initial) != len(children) {
+		t.Fatal("structural change retained or reused a stale selection")
+	}
+	Commit(root)
+	if Len(Search(root, kind("actor"))) != len(children)-1 {
+		t.Fatal("retired node remained searchable")
+	}
+}
+
 func TestQueryBootstrapAndAttributeChanges(t *testing.T) {
 	root := New(name("root"))
 	firstChild := New(kind("actor"), name("first"))
