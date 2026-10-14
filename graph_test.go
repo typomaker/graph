@@ -24,6 +24,26 @@ func value[T any](t *testing.T, g Graph) T {
 }
 func children(g Graph) Graph { return Follow(g, Path(Type[any]())) }
 
+func TestGraphFirsts(t *testing.T) {
+	a, b := New(name("a")), New(name("b"))
+	for _, tc := range []struct {
+		name   string
+		graphs []Graph
+		want   []*node
+	}{
+		{"none", nil, nil},
+		{"empty", []Graph{{}}, nil},
+		{"single", []Graph{a}, []*node{first(a)}},
+		{"duplicates", []Graph{a, Graph{}, b, a}, []*node{first(a), first(b)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := graphFirsts(tc.graphs); !slices.Equal(got, tc.want) {
+				t.Fatalf("graphFirsts() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAttributesAndMutations(t *testing.T) {
 	n := New(name("one"), health{10, 10})
 	if got := value[name](t, n); got != "one" {

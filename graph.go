@@ -3104,8 +3104,17 @@ func reachesLocked(from, target *node) bool {
 	return found
 }
 func graphFirsts(gs []Graph) []*node {
-	out := []*node{}
-	seen := map[*node]struct{}{}
+	if len(gs) == 0 {
+		return nil
+	}
+	if len(gs) == 1 {
+		if n := first(gs[0]); n != nil {
+			return []*node{n}
+		}
+		return nil
+	}
+	out := make([]*node, 0, len(gs))
+	seen := make(map[*node]struct{}, len(gs))
 	for _, g := range gs {
 		if n := first(g); n != nil {
 			if _, ok := seen[n]; !ok {
