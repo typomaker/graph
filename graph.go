@@ -2896,15 +2896,23 @@ func (index *searchIndex) rebuildOrderLocked() {
 	index.orderOverlayBuilt = true
 }
 func reachesLocked(from, target *node) bool {
-	seen := map[*node]struct{}{}
+	if from == target {
+		return true
+	}
+	if len(target.parents) == 0 || len(from.children) == 0 {
+		return false
+	}
+	seen, releaseSeen := acquireVisitedNodeSet()
 	stack := []*node{from}
+	found := false
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		if n == target {
-			return true
+			found = true
+			break
 		}
-		if _, ok := seen[n]; ok {
+		if _, duplicate := seen[n]; duplicate {
 			continue
 		}
 		seen[n] = struct{}{}
@@ -2912,7 +2920,8 @@ func reachesLocked(from, target *node) bool {
 			stack = append(stack, c)
 		}
 	}
-	return false
+	releaseSeen()
+	return found
 }
 func graphFirsts(gs []Graph) []*node {
 	out := []*node{}

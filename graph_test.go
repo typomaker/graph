@@ -484,6 +484,34 @@ func TestCyclePanics(t *testing.T) {
 	Link(b, a)
 }
 
+func TestCycleCheckWithLongUnrelatedBranch(t *testing.T) {
+	root := New(name("root"))
+	branch := New(name("branch"))
+	last := branch
+	for i := range 32 {
+		next := New(ident(fmt.Sprint(i)))
+		Link(last, next)
+		last = next
+	}
+	if !Link(root, branch) {
+		t.Fatal("isolated branch was not linked")
+	}
+	parent := New(name("parent"))
+	Link(parent, root)
+	unrelated := New(name("unrelated"))
+	Link(unrelated, New(name("leaf")))
+	if !Link(root, unrelated) {
+		t.Fatal("unrelated leaf was not linked")
+	}
+	func() {
+		defer expectPanic(t)
+		Link(last, root)
+	}()
+	if Len(Search(root, name("root"))) != 1 || !Empty(Follow(last, Path(name("root")))) {
+		t.Fatal("cycle check changed the graph")
+	}
+}
+
 func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	root := New(name("root"))
 	child := New(name("old"))
