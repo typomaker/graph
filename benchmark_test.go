@@ -39,6 +39,20 @@ func BenchmarkSearchCommitted10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSearchAlternatingLargeCommitted10K(b *testing.B) {
+	root := New(benchmarkKind("world"))
+	for i := range 10000 {
+		Link(root, New(benchmarkGroup(i%2)))
+	}
+	Commit(root)
+	b.ResetTimer()
+	for i := range b.N {
+		if got := Len(Search(root, benchmarkGroup(i&1))); got != 5000 {
+			b.Fatal(got)
+		}
+	}
+}
+
 func BenchmarkSearchAttributeOverlay10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	Commit(root)

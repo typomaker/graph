@@ -519,13 +519,42 @@ func TestLargeAtomicSearchCacheInvalidatesOnChanges(t *testing.T) {
 		t.Fatal("restored attribute was not searchable")
 	}
 	Unlink(root, children[0])
-	if index.cachedAtomic.Load() != nil || Len(Search(root, kind("actor"))) != len(children)-1 ||
-		Len(initial) != len(children) {
+	for slot := range &index.cachedAtomic {
+		if index.cachedAtomic[slot].Load() != nil {
+			t.Fatal("structural change retained a cached selection")
+		}
+	}
+	if Len(Search(root, kind("actor"))) != len(children)-1 || Len(initial) != len(children) {
 		t.Fatal("structural change retained or reused a stale selection")
 	}
 	Commit(root)
 	if Len(Search(root, kind("actor"))) != len(children)-1 {
 		t.Fatal("retired node remained searchable")
+	}
+}
+
+func TestLargeAtomicSearchCachesSeveralQueries(t *testing.T) {
+	root := New(kind("root"))
+	for group := range cachedAtomicSlots + 1 {
+		for range cachedAtomicMinMatches {
+			Link(root, New(benchmarkGroup(group)))
+		}
+	}
+	Commit(root)
+	results := make([]Graph, cachedAtomicSlots)
+	for group := range results {
+		results[group] = Search(root, benchmarkGroup(group))
+	}
+	for group := range results {
+		repeated := Search(root, benchmarkGroup(group))
+		if Len(repeated) != cachedAtomicMinMatches || &results[group].nodes[0] != &repeated.nodes[0] {
+			t.Fatalf("query %d was not cached", group)
+		}
+	}
+	Search(root, benchmarkGroup(cachedAtomicSlots))
+	repeated := Search(root, benchmarkGroup(0))
+	if Len(repeated) != cachedAtomicMinMatches || &results[0].nodes[0] == &repeated.nodes[0] {
+		t.Fatal("the oldest query was not evicted")
 	}
 }
 

@@ -88,10 +88,12 @@ type searchIndex struct {
 	removedEdges      map[graphEdge]struct{}
 	committedAdded    map[graphEdge]struct{}
 	committedRemoved  map[graphEdge]struct{}
-	cachedAtomic      atomic.Pointer[cachedAtomicResult]
+	cachedAtomic      [cachedAtomicSlots]atomic.Pointer[cachedAtomicResult]
+	cachedAtomicNext  atomic.Uint32
 }
 
 const cachedAtomicMinMatches = 1024
+const cachedAtomicSlots = 4
 
 type cachedAtomicResult struct {
 	matcher matcher
@@ -876,8 +878,10 @@ func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
 		matches = index.byValue[m.typ][m.value]
 	}
 	if len(matches) >= cachedAtomicMinMatches {
-		if cached := index.cachedAtomic.Load(); cached != nil && cached.matcher == m {
-			return Graph{nodes: cached.nodes, index: index, ordinals: matches}, true
+		for slot := range &index.cachedAtomic {
+			if cached := index.cachedAtomic[slot].Load(); cached != nil && cached.matcher == m {
+				return Graph{nodes: cached.nodes, index: index, ordinals: matches}, true
+			}
 		}
 	}
 	nodes := make([]*node, len(matches))
@@ -889,7 +893,8 @@ func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
 		}
 	}
 	if len(matches) >= cachedAtomicMinMatches {
-		index.cachedAtomic.Store(&cachedAtomicResult{matcher: m, nodes: nodes})
+		slot := (index.cachedAtomicNext.Add(1) - 1) % cachedAtomicSlots
+		index.cachedAtomic[slot].Store(&cachedAtomicResult{matcher: m, nodes: nodes})
 	}
 	return Graph{nodes: nodes, index: index, ordinals: matches}, true
 }
@@ -2403,7 +2408,9 @@ func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) 
 }
 
 func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool) {
-	index.cachedAtomic.Store(nil)
+	for slot := range &index.cachedAtomic {
+		index.cachedAtomic[slot].Store(nil)
+	}
 	index.compositeIndexes = nil
 	if _, parentActive := index.active[parent]; !parentActive {
 		index.overlayRevision = index.root.structureRev
