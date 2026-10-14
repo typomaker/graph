@@ -2384,6 +2384,14 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 		index.overlayRevision = index.root.structureRev
 		return
 	}
+	// Removing an unreachable leaf preserves the relative order of survivors.
+	preserveOrder := !index.orderDirty && !linked && len(child.childOrder) == 0 && index.support[child] == 1
+	if !index.orderDirty && index.orderIdentity && linked && parent == index.root &&
+		len(child.childOrder) == 0 && parent.childOrder[len(parent.childOrder)-1] == child {
+		// A final root leaf can also be appended to the ordinal order directly.
+		ordinal, known := index.nodeOrdinal(child)
+		preserveOrder = !known || int(ordinal) == len(index.activeByOrdinal)-1
+	}
 	index.normalizeEdgeLocked(parent, child, linked)
 	if linked {
 		wasInactive := index.support[child] == 0
@@ -2405,7 +2413,7 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 	if !index.hasStructuralOverlay() {
 		index.resetCommittedOrderLocked()
 	} else {
-		index.orderDirty = true
+		index.orderDirty = !preserveOrder
 	}
 	index.overlayRevision = index.root.structureRev
 }

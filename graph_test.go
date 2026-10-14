@@ -1610,6 +1610,89 @@ func TestStructuralOverlayMatchesTraversalAcrossMutations(t *testing.T) {
 	}
 }
 
+func TestStructuralLeafMutationsPreserveOrder(t *testing.T) {
+	root := New(kind("root"))
+	branch := New(kind("branch"))
+	leaf := New(kind("leaf"))
+	last := New(kind("leaf"))
+	Link(root, branch, last)
+	Link(branch, leaf)
+	Commit(root)
+	index := first(root).index
+	check := func() {
+		t.Helper()
+		if index.orderDirty {
+			t.Fatal("leaf mutation invalidated the relative order")
+		}
+		assertIndexedSearchEqualsTraversal(t, root, Type[any]())
+		assertIndexedSearchEqualsTraversal(t, root, kind("leaf"))
+		assertIndexedSearchEqualsTraversal(t, root, Path(kind("leaf")))
+	}
+	Unlink(branch, leaf)
+	check()
+	appended := New(kind("leaf"))
+	Link(root, appended)
+	check()
+	Unlink(root, appended)
+	check()
+	Link(root, appended)
+	check()
+	Commit(root)
+	check()
+	Unlink(root, appended)
+	check()
+	Commit(root)
+	check()
+}
+
+func TestStructuralLeafOrderFallbacks(t *testing.T) {
+	for _, scenario := range []string{"nested", "earlier", "shared", "dirty", "nonidentity"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := New(kind("root"))
+			left := New(kind("branch"))
+			leaf := New(kind("leaf"))
+			right := New(kind("branch"))
+			Link(root, left, right)
+			Link(left, leaf)
+			if scenario == "shared" {
+				Link(right, leaf)
+			}
+			Commit(root)
+			index := first(root).index
+			wantDirty := true
+			switch scenario {
+			case "nested":
+				Link(left, New(kind("leaf")))
+			case "earlier":
+				Link(root, leaf)
+			case "shared":
+				Unlink(left, leaf)
+			case "dirty":
+				Link(left, New(kind("leaf")))
+				Unlink(left, leaf)
+			case "nonidentity":
+				Link(right, leaf)
+				Unlink(left, leaf)
+				assertIndexedSearchEqualsTraversal(t, root, Type[any]())
+				if index.orderIdentity {
+					t.Fatal("expected reordered ordinals")
+				}
+				tail := New(kind("leaf"))
+				Link(root, tail)
+				assertIndexedSearchEqualsTraversal(t, root, Type[any]())
+				Unlink(root, tail)
+				wantDirty = false
+			}
+			if index.orderDirty != wantDirty {
+				t.Fatalf("orderDirty = %v, want %v", index.orderDirty, wantDirty)
+			}
+			assertIndexedSearchEqualsTraversal(t, root, Type[any]())
+			assertIndexedSearchEqualsTraversal(t, root, kind("leaf"))
+			assertIndexedSearchEqualsTraversal(t, root, Path(kind("leaf")))
+		})
+	}
+}
+
 func TestAddedPathOverlayMatchesTraversalAcrossMutations(t *testing.T) {
 	root := New(kind("root"))
 	Commit(root)
