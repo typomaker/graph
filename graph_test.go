@@ -1215,6 +1215,33 @@ func TestDetachedSnapshotsAndMultipleParents(t *testing.T) {
 	}
 }
 
+func TestStructuralSupportTracksSharedNode(t *testing.T) {
+	root := New(name("root"))
+	left := New(name("left"))
+	right := New(name("right"))
+	shared := New(name("shared"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Commit(root)
+	index := first(root).index
+	if index.support[first(shared)] != 2 {
+		t.Fatal("shared node has the wrong parent count")
+	}
+	Unlink(left, shared)
+	if index.support[first(shared)] != 1 || Len(Search(root, name("shared"))) != 1 {
+		t.Fatal("shared node was deactivated too early")
+	}
+	Unlink(right, shared)
+	if index.support[first(shared)] != 0 || !Empty(Search(root, name("shared"))) {
+		t.Fatal("detached shared node remained active")
+	}
+	Link(left, shared)
+	if index.support[first(shared)] != 1 || Len(Search(root, name("shared"))) != 1 {
+		t.Fatal("relinked shared node was not reactivated")
+	}
+}
+
 func TestSharedDiamondFrontierDeltaAndCommit(t *testing.T) {
 	root := New(kind("root"))
 	left := New(kind("parent"), name("left"))

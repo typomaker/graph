@@ -439,6 +439,15 @@ func BenchmarkStructuralToggleShared10K(b *testing.B) {
 }
 
 func BenchmarkStructuralToggleBranch100Of10K(b *testing.B) {
+	root, branch := benchmarkStructuralBranch100Of10K()
+	b.ResetTimer()
+	for range b.N {
+		Link(root, branch)
+		Unlink(root, branch)
+	}
+}
+
+func benchmarkStructuralBranch100Of10K() (Graph, Graph) {
 	root := benchmarkWorld(10000)
 	branch := New(benchmarkKind("branch"))
 	current := branch
@@ -448,10 +457,28 @@ func BenchmarkStructuralToggleBranch100Of10K(b *testing.B) {
 		current = next
 	}
 	Commit(root)
-	b.ResetTimer()
+	return root, branch
+}
+
+func BenchmarkStructuralLinkBranch100Of10K(b *testing.B) {
+	root, branch := benchmarkStructuralBranch100Of10K()
+	b.StopTimer()
+	for range b.N {
+		b.StartTimer()
+		Link(root, branch)
+		b.StopTimer()
+		Unlink(root, branch)
+	}
+}
+
+func BenchmarkStructuralUnlinkBranch100Of10K(b *testing.B) {
+	root, branch := benchmarkStructuralBranch100Of10K()
+	b.StopTimer()
 	for range b.N {
 		Link(root, branch)
+		b.StartTimer()
 		Unlink(root, branch)
+		b.StopTimer()
 	}
 }
 

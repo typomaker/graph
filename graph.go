@@ -78,7 +78,6 @@ type searchIndex struct {
 	orderIdentity     bool
 	orderOverlayBuilt bool
 	support           map[*node]uint32
-	active            map[*node]struct{}
 	activeByOrdinal   []bool
 	activeAdded       int
 	baselineNodes     map[*node]struct{}
@@ -1059,7 +1058,7 @@ func searchWhileRebuildingOrder(g Graph, condition *predicate) (Graph, bool) {
 	index := roots[0].index
 	index.orderByOrdinal = make([]uint32, len(index.activeByOrdinal))
 	index.orderIdentity = true
-	seen := make(map[*node]struct{}, len(index.active))
+	seen := make(map[*node]struct{}, len(index.support))
 	out := make([]*node, 0)
 	var previousOrdinal uint32
 	havePreviousOrdinal := false
@@ -1405,7 +1404,7 @@ func Materialize(source, view Graph, matchBy ...any) Graph {
 		if allIndexed {
 			for _, index := range indexed {
 				if len(keyTypes) == 0 {
-					if _, active := index.active[n]; active {
+					if index.support[n] != 0 {
 						accept(n)
 					} else {
 						accept(index.activeNodeByKey(n.key))
@@ -2412,7 +2411,7 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 		index.cachedAtomic[slot].Store(nil)
 	}
 	index.compositeIndexes = nil
-	if _, parentActive := index.active[parent]; !parentActive {
+	if index.support[parent] == 0 {
 		index.overlayRevision = index.root.structureRev
 		return
 	}
@@ -2692,12 +2691,8 @@ func (index *searchIndex) resetCommittedOrderLocked() {
 }
 
 func (index *searchIndex) activateLocked(n *node) {
-	if _, active := index.active[n]; active {
-		return
-	}
 	delete(index.detachedSnapshots, n)
 	delete(index.inactiveAdded, n)
-	index.active[n] = struct{}{}
 	if ordinal, committed := index.ordinal[n]; committed {
 		delete(index.removed, ordinal)
 		index.activeByOrdinal[ordinal] = true
@@ -2784,8 +2779,10 @@ func (index *searchIndex) compositeIndexLocked(types []reflect.Type) *compositeI
 		}
 	}
 	result := &compositeIndex{types: append([]reflect.Type(nil), types...)}
-	for n := range index.active {
-		result.add(n)
+	for n, count := range index.support {
+		if count != 0 {
+			result.add(n)
+		}
 	}
 	index.compositeIndexes = append(index.compositeIndexes, cachedCompositeIndex{types: result.types, index: result})
 	return result
@@ -2821,10 +2818,6 @@ func (index *searchIndex) invalidateCompositeIndexesLocked(n *node, rev uint64) 
 }
 
 func (index *searchIndex) deactivateLocked(n *node) {
-	if _, active := index.active[n]; !active {
-		return
-	}
-	delete(index.active, n)
 	if _, committed := index.baselineNodes[n]; committed {
 		if _, recorded := index.detachedSnapshots[n]; !recorded {
 			index.detachedSnapshots[n] = cloneAttrs(n.attrs)
@@ -2858,7 +2851,7 @@ func (index *searchIndex) markAffectedAncestorsLocked(start *node) {
 		}
 		seen[n] = struct{}{}
 		if ordinal, committed := index.ordinal[n]; committed {
-			if _, active := index.active[n]; active {
+			if index.support[n] != 0 {
 				index.affected[ordinal] = struct{}{}
 			}
 		}
@@ -3030,7 +3023,6 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		orderByOrdinal:    make([]uint32, len(nodes)),
 		orderIdentity:     true,
 		support:           make(map[*node]uint32, len(nodes)),
-		active:            make(map[*node]struct{}, len(nodes)),
 		activeByOrdinal:   make([]bool, len(nodes)),
 		baselineNodes:     make(map[*node]struct{}, len(nodes)),
 		detachedSnapshots: make(map[*node]map[reflect.Type]any),
@@ -3048,7 +3040,6 @@ func buildSearchIndexLocked(root *node, nodes []*node) *searchIndex {
 		index.baseAttrs[ordinal] = cloneAttrs(n.attrs)
 		index.all[ordinal] = id
 		index.orderByOrdinal[ordinal] = id
-		index.active[n] = struct{}{}
 		index.baselineNodes[n] = struct{}{}
 		index.activeByOrdinal[ordinal] = true
 		index.addKeyNode(n)
