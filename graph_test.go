@@ -1244,6 +1244,26 @@ func TestChangedReusesDeltaView(t *testing.T) {
 	}
 }
 
+func TestDeltaDeepPathSnapshots(t *testing.T) {
+	root := New(name("root"))
+	current := root
+	for range 63 {
+		child := New(name("path"))
+		Link(current, child)
+		current = child
+	}
+	Commit(root)
+	Set(current, health{9, 10})
+	delta := Delta(root)
+	if Len(Unnest(delta)) != 64 || Len(Changed(delta)) != 1 {
+		t.Fatal("delta lost the path to the changed leaf")
+	}
+	Set(root, name("later"))
+	if got := delta.view.changes[first(root)].snapshot[attributeType[name]()]; got != name("root") {
+		t.Fatalf("delta snapshot changed after mutation: %v", got)
+	}
+}
+
 func TestDetachedSnapshotsAndMultipleParents(t *testing.T) {
 	root := New(name("root"))
 	left := New(name("left"))

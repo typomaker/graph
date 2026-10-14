@@ -611,18 +611,11 @@ func (w Wire) readWireAttributes(r *bytes.Reader) (map[reflect.Type]any, error) 
 			_, _ = r.Seek(int64(length), io.SeekCurrent)
 			continue
 		}
+		payload := make([]byte, length)
+		_, _ = io.ReadFull(r, payload)
 		pointer := reflect.New(definition.typ)
-		limited := &io.LimitedReader{R: r, N: int64(length)}
-		decoder := json.NewDecoder(limited)
-		if err := decoder.Decode(pointer.Interface()); err != nil {
+		if err := json.Unmarshal(payload, pointer.Interface()); err != nil {
 			return nil, fmt.Errorf("graph: decode wire attribute %q: %w", label, err)
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); err != io.EOF {
-			return nil, fmt.Errorf("graph: trailing data in wire attribute %q", label)
-		}
-		if limited.N != 0 {
-			_, _ = io.Copy(io.Discard, limited)
 		}
 		attrs[definition.typ] = pointer.Elem().Interface()
 	}

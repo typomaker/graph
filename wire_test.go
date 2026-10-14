@@ -233,6 +233,51 @@ func TestWireErrorsAndSchemaValidation(t *testing.T) {
 	}
 }
 
+func TestReadWireAttributesRejectsInvalidJSON(t *testing.T) {
+	wire := testWire()
+	for _, payload := range []string{`"unterminated`, `"valid" true`} {
+		var encoded bytes.Buffer
+		if err := binary.Write(&encoded, binary.BigEndian, uint32(1)); err != nil {
+			t.Fatal(err)
+		}
+		writeWireBytes(&encoded, []byte("name"))
+		writeWireBytes(&encoded, []byte(payload))
+		if _, err := wire.readWireAttributes(bytes.NewReader(encoded.Bytes())); err == nil {
+			t.Fatalf("accepted invalid JSON %q", payload)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		build func(*bytes.Buffer)
+	}{
+		{"invalid count", func(b *bytes.Buffer) { _ = binary.Write(b, binary.BigEndian, uint32(2)) }},
+		{"truncated label", func(b *bytes.Buffer) {
+			_ = binary.Write(b, binary.BigEndian, uint32(1))
+			_ = binary.Write(b, binary.BigEndian, uint32(20))
+		}},
+		{"truncated value", func(b *bytes.Buffer) {
+			_ = binary.Write(b, binary.BigEndian, uint32(1))
+			writeWireBytes(b, []byte("name"))
+			_ = binary.Write(b, binary.BigEndian, uint32(20))
+		}},
+		{"duplicate label", func(b *bytes.Buffer) {
+			_ = binary.Write(b, binary.BigEndian, uint32(2))
+			for range 2 {
+				writeWireBytes(b, []byte("name"))
+				writeWireBytes(b, []byte(`"value"`))
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var encoded bytes.Buffer
+			tc.build(&encoded)
+			if _, err := wire.readWireAttributes(bytes.NewReader(encoded.Bytes())); err == nil {
+				t.Fatal("accepted malformed attributes")
+			}
+		})
+	}
+}
+
 func TestWireExportsPrecomputedDelta(t *testing.T) {
 	wire := testWire()
 	source := New(kind("root"), ident("root"), name("before"))

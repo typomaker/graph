@@ -2056,24 +2056,25 @@ func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (
 		base = 0
 	}
 	include = n.selfRev > base
-	change := nodeChange{
-		attrs:         make(map[reflect.Type]any),
-		addedChildren: make(map[uint64]struct{}),
-		snapshot:      cloneAttrs(n.attrs),
-	}
-	for typ, rev := range n.attrRev {
-		if rev > base {
-			change.attrs[typ] = n.attrs[typ]
+	var change nodeChange
+	if include {
+		for typ, rev := range n.attrRev {
+			if rev > base {
+				if change.attrs == nil {
+					change.attrs = make(map[reflect.Type]any)
+				}
+				change.attrs[typ] = n.attrs[typ]
+			}
 		}
-	}
-	for typ, rev := range n.removedAttrs {
-		if rev > base {
-			change.removedAttrs = append(change.removedAttrs, typ)
+		for typ, rev := range n.removedAttrs {
+			if rev > base {
+				change.removedAttrs = append(change.removedAttrs, typ)
+			}
 		}
-	}
-	for key, removed := range n.removedChildren {
-		if removed.revision > base {
-			change.removedChildren = append(change.removedChildren, removedChildChange{key: key, attrs: cloneAttrs(removed.attrs)})
+		for key, removed := range n.removedChildren {
+			if removed.revision > base {
+				change.removedChildren = append(change.removedChildren, removedChildChange{key: key, attrs: cloneAttrs(removed.attrs)})
+			}
 		}
 	}
 	children := n.dirtyChildOrder
@@ -2092,6 +2093,9 @@ func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (
 		edgeRev := n.children[c]
 		if edgeRev > base {
 			view.edges[n] = append(view.edges[n], c)
+			if change.addedChildren == nil {
+				change.addedChildren = make(map[uint64]struct{})
+			}
 			change.addedChildren[c.key] = struct{}{}
 			if c.baseline == 0 {
 				buildDeltaLocked(c, view, memo, true)
@@ -2099,9 +2103,7 @@ func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (
 				buildDeltaLocked(c, view, memo, false)
 				if _, exists := view.changes[c]; !exists {
 					view.changes[c] = nodeChange{
-						attrs:         make(map[reflect.Type]any),
-						addedChildren: make(map[uint64]struct{}),
-						snapshot:      cloneAttrs(c.attrs),
+						snapshot: cloneAttrs(c.attrs),
 					}
 				}
 			}
@@ -2131,6 +2133,7 @@ func buildDeltaLocked(n *node, view *subgraph, memo map[*node]bool, full bool) (
 		clear(n.dirtyChildOrder[write:cap(n.dirtyChildOrder)])
 	}
 	if include {
+		change.snapshot = cloneAttrs(n.attrs)
 		view.changes[n] = change
 	}
 	return include
