@@ -117,6 +117,44 @@ func TestIndexedSelectPreservesSelectionOrder(t *testing.T) {
 	}
 }
 
+func TestAtomicIndexedSearchCopiesSelections(t *testing.T) {
+	root := New(kind("root"))
+	a := New(ident("a"), marker{})
+	b := New(ident("b"), name("selected"))
+	c := New(ident("c"), marker{})
+	Link(root, a, b, c)
+	Commit(root)
+
+	cases := []struct {
+		name  string
+		match any
+		want  []*node
+	}{
+		{"dense", Type[ident](), []*node{first(a), first(b), first(c)}},
+		{"singleton", Type[name](), []*node{first(b)}},
+		{"sparse", Type[marker](), []*node{first(a), first(c)}},
+		{"missing", ident("missing"), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, ok := searchAtomicIndexed(root, tc.match)
+			if !ok || !slices.Equal(selected(result), tc.want) {
+				t.Fatalf("selection = %v, indexed = %v", selected(result), ok)
+			}
+		})
+	}
+	dense := Search(root, Type[ident]())
+	Unlink(root, b)
+	Commit(root)
+	if !slices.Equal(selected(dense), []*node{first(a), first(b), first(c)}) {
+		t.Fatal("index retirement changed an existing selection")
+	}
+	sparse := Search(root, Type[ident]())
+	if !slices.Equal(selected(sparse), []*node{first(a), first(c)}) {
+		t.Fatal("sparse indexed selection did not skip the retired ordinal")
+	}
+}
+
 func TestUnionAllPostings(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -876,8 +876,12 @@ func searchAtomicIndexed(g Graph, value any) (Graph, bool) {
 		matches = index.byValue[m.typ][m.value]
 	}
 	nodes := make([]*node, len(matches))
-	for i, ordinal := range matches {
-		nodes[i] = index.nodes[ordinal]
+	if len(matches) != 0 && matches[len(matches)-1]-matches[0] == uint32(len(matches)-1) {
+		copy(nodes, index.nodes[matches[0]:matches[len(matches)-1]+1])
+	} else {
+		for i, ordinal := range matches {
+			nodes[i] = index.nodes[ordinal]
+		}
 	}
 	return Graph{nodes: nodes, index: index, ordinals: matches}, true
 }
