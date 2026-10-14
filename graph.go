@@ -1122,7 +1122,7 @@ func Commit(g Graph) {
 		if root.treeRev <= root.baseline {
 			continue
 		}
-		commitChangedLocked(root, state.revision, false, make(map[*node]struct{}))
+		commitChangedLocked(root, root.index, state.revision, false, make(map[*node]struct{}))
 		root.index.commitOverlayLocked()
 		root.index.retireInactiveCommittedLocked()
 		root.index.trimInactiveAddedLocked()
@@ -1139,11 +1139,12 @@ func clearDirtyChildrenLocked(n *node) {
 	n.dirtyChildOrder = n.dirtyChildOrder[:0]
 }
 
-func commitChangedLocked(n *node, revision uint64, full bool, seen map[*node]struct{}) {
+func commitChangedLocked(n *node, index *searchIndex, revision uint64, full bool, seen map[*node]struct{}) {
 	if _, duplicate := seen[n]; duplicate {
 		return
 	}
 	seen[n] = struct{}{}
+	index.baselineNodes[n] = struct{}{}
 	base := n.baseline
 	n.baseline = revision
 	clear(n.removedChildren)
@@ -1157,9 +1158,9 @@ func commitChangedLocked(n *node, revision uint64, full bool, seen map[*node]str
 		}
 		edgeAdded := n.children[child] > base
 		if full || edgeAdded {
-			commitChangedLocked(child, revision, true, seen)
+			commitChangedLocked(child, index, revision, true, seen)
 		} else if child.treeRev > child.baseline {
-			commitChangedLocked(child, revision, false, seen)
+			commitChangedLocked(child, index, revision, false, seen)
 		}
 	}
 	clearDirtyChildrenLocked(n)
@@ -2478,10 +2479,6 @@ func (index *searchIndex) commitOverlayLocked() {
 	clear(index.affected)
 	index.affectedOrdinals = index.affectedOrdinals[:0]
 	clear(index.detachedSnapshots)
-	clear(index.baselineNodes)
-	for n := range index.active {
-		index.baselineNodes[n] = struct{}{}
-	}
 	index.structureRevision = index.root.structureRev
 	index.overlayRevision = index.root.structureRev
 }

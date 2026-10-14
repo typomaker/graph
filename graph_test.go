@@ -1126,6 +1126,33 @@ func TestSharedDiamondFrontierDeltaAndCommit(t *testing.T) {
 	}
 }
 
+func TestIncrementalCommitTracksNewBaselineNodes(t *testing.T) {
+	root := New(name("root"))
+	Commit(root)
+	index := first(root).index
+	child := New(name("child"))
+	grandchild := New(name("grandchild"))
+	Link(child, grandchild)
+	Link(root, child)
+	if _, ok := index.baselineNodes[first(child)]; ok {
+		t.Fatal("uncommitted node was marked as baseline")
+	}
+	Commit(root)
+	for _, graph := range []Graph{root, child, grandchild} {
+		if _, ok := index.baselineNodes[first(graph)]; !ok {
+			t.Fatal("committed node is missing from baseline")
+		}
+	}
+	Unlink(root, child)
+	if _, ok := index.detachedSnapshots[first(child)]; !ok {
+		t.Fatal("committed child has no detached snapshot")
+	}
+	Commit(root)
+	if _, ok := index.baselineNodes[first(child)]; ok {
+		t.Fatal("retired child remained in baseline")
+	}
+}
+
 func TestIncrementalStructuralCommitAndCompaction(t *testing.T) {
 	root := New(kind("root"))
 	Commit(root)

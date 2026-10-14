@@ -261,6 +261,16 @@ func BenchmarkCommit10K(b *testing.B) {
 	}
 }
 
+func BenchmarkSetCommitted10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	child := Graph{nodes: []*node{first(root).childOrder[5000]}}
+	Commit(root)
+	b.ResetTimer()
+	for i := range b.N {
+		Set(child, benchmarkVersion(i&1))
+	}
+}
+
 func BenchmarkDeltaOneOf10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	child := Graph{nodes: []*node{first(root).childOrder[5000]}}
