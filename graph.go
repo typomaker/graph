@@ -370,8 +370,7 @@ func Link(g Graph, graphs ...Graph) bool {
 		addParentLocked(child, parent)
 		markDirtyChildLocked(parent, child)
 		parent.selfRev = rev
-		propagateStructureLocked(parent, rev)
-		updateStructuralIndexesLocked(parent, child, true)
+		propagateStructureLocked(parent, rev, child, true)
 		changed = true
 	}
 	return changed
@@ -399,8 +398,7 @@ func Unlink(g Graph, graphs ...Graph) bool {
 		rev := nextRevisionLocked()
 		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 		parent.selfRev = rev
-		propagateStructureLocked(parent, rev)
-		updateStructuralIndexesLocked(parent, child, false)
+		propagateStructureLocked(parent, rev, child, false)
 		changed = true
 	}
 	return changed
@@ -1615,7 +1613,7 @@ func applyLocked(g, delta Graph) Graph {
 	}
 	for target := range structureChanged {
 		target.selfRev = rev
-		propagateStructureLocked(target, rev)
+		propagateStructureLocked(target, rev, nil, false)
 	}
 	for target := range created {
 		target.selfRev = rev
@@ -1736,7 +1734,7 @@ func mergeGraphLocked(g, patch Graph, keyTypes []reflect.Type) Graph {
 	}
 	for target := range structureChanged {
 		target.selfRev = rev
-		propagateStructureLocked(target, rev)
+		propagateStructureLocked(target, rev, nil, false)
 	}
 	for target := range created {
 		target.selfRev = rev
@@ -2331,7 +2329,7 @@ func postingHas(values posting, ordinal uint32) bool {
 	return position < len(values) && values[position] == ordinal
 }
 
-func propagateStructureLocked(n *node, rev uint64) {
+func propagateStructureLocked(n *node, rev uint64, child *node, linked bool) {
 	seen := map[*node]struct{}{}
 	var visit func(*node, *node)
 	visit = func(x, changedChild *node) {
@@ -2348,6 +2346,9 @@ func propagateStructureLocked(n *node, rev uint64) {
 		if x.structureRev < rev {
 			x.structureRev = rev
 		}
+		if child != nil && x.index != nil {
+			x.index.updateStructureLocked(n, child, linked)
+		}
 		for ref := range x.parents {
 			if parent := ref.Value(); parent != nil {
 				visit(parent, x)
@@ -2358,29 +2359,6 @@ func propagateStructureLocked(n *node, rev uint64) {
 		adjustParentSweepLocked(x)
 	}
 	visit(n, nil)
-}
-
-func updateStructuralIndexesLocked(parent, child *node, linked bool) {
-	seen := make(map[*node]struct{})
-	var visit func(*node)
-	visit = func(n *node) {
-		if _, duplicate := seen[n]; duplicate {
-			return
-		}
-		seen[n] = struct{}{}
-		if n.index != nil {
-			n.index.updateStructureLocked(parent, child, linked)
-		}
-		for ref := range n.parents {
-			if ancestor := ref.Value(); ancestor != nil {
-				visit(ancestor)
-			} else {
-				delete(n.parents, ref)
-			}
-		}
-		adjustParentSweepLocked(n)
-	}
-	visit(parent)
 }
 
 func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) {

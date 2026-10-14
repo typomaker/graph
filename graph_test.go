@@ -524,6 +524,41 @@ func TestUnlinkWithEqualNodeIDs(t *testing.T) {
 	}
 }
 
+func TestStructuralChangeUpdatesIndexesThroughSharedAncestors(t *testing.T) {
+	root := New(kind("root"))
+	otherRoot := New(kind("other-root"))
+	left := New(kind("left"))
+	right := New(kind("right"))
+	shared := New(kind("shared"))
+	child := New(kind("child"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Link(otherRoot, shared)
+	Commit(root)
+	Commit(otherRoot)
+	Commit(shared)
+
+	for _, linked := range []bool{true, false, true} {
+		if linked {
+			if !Link(shared, child) || Link(shared, child) {
+				t.Fatal("link changed the shared edge more than once")
+			}
+		} else if !Unlink(shared, child) || Unlink(shared, child) {
+			t.Fatal("unlink changed the shared edge more than once")
+		}
+		want := 0
+		if linked {
+			want = 1
+		}
+		for _, graph := range []Graph{root, otherRoot, shared} {
+			if got := Len(Search(graph, kind("child"))); got != want {
+				t.Fatalf("indexed ancestor returned %d children, want %d", got, want)
+			}
+		}
+	}
+}
+
 func TestSnapshotSelectionsDoNotChange(t *testing.T) {
 	root := New(name("root"))
 	child := New(name("old"))
