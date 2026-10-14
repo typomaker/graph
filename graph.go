@@ -2237,20 +2237,25 @@ func (index *searchIndex) attributesCommitted(n *node, ordinal uint32) bool {
 
 func (index *searchIndex) updateDirtyPostingsLocked(ordinal uint32, attrs map[reflect.Type]any) {
 	previous := index.dirtySnapshots[ordinal]
-	if previous != nil {
-		for typ, value := range previous {
+	for typ, old := range previous {
+		value, exists := attrs[typ]
+		if exists && value == old {
+			continue
+		}
+		if !exists {
 			index.dirtyByType[typ] = removePostingOrdinal(index.dirtyByType[typ], ordinal)
-			values := index.dirtyByValue[typ]
-			if values != nil {
-				values[value] = removePostingOrdinal(values[value], ordinal)
-				if len(values[value]) == 0 {
-					delete(values, value)
-				}
+		}
+		values := index.dirtyByValue[typ]
+		if values != nil {
+			values[old] = removePostingOrdinal(values[old], ordinal)
+			if len(values[old]) == 0 {
+				delete(values, old)
 			}
 		}
-		clear(previous)
+		delete(previous, typ)
 	}
 	if attrs == nil {
+		delete(index.dirtySnapshots, ordinal)
 		return
 	}
 	if previous == nil {
@@ -2258,17 +2263,18 @@ func (index *searchIndex) updateDirtyPostingsLocked(ordinal uint32, attrs map[re
 		index.dirtySnapshots[ordinal] = previous
 	}
 	for typ, value := range attrs {
+		if _, unchanged := previous[typ]; unchanged {
+			continue
+		}
 		index.dirtyByType[typ] = insertPostingOrdinal(index.dirtyByType[typ], ordinal)
+		previous[typ] = value
 		if index.byValue[typ] != nil {
-			previous[typ] = value
 			values := index.dirtyByValue[typ]
 			if values == nil {
 				values = make(map[any]posting)
 				index.dirtyByValue[typ] = values
 			}
 			values[value] = insertPostingOrdinal(values[value], ordinal)
-		} else {
-			previous[typ] = nil
 		}
 	}
 }

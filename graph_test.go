@@ -1181,6 +1181,43 @@ func TestDirtyOrdinalsStaySortedThroughRestoreAndRetirement(t *testing.T) {
 	}
 }
 
+func TestDirtyPostingsKeepUnchangedAttributes(t *testing.T) {
+	root := New(name("root"))
+	children := make([]Graph, 33)
+	for i := range children {
+		children[i] = New(name(fmt.Sprint(i)), kind("child"), health{1, 10})
+		Link(root, children[i])
+	}
+	Commit(root)
+	for _, child := range children {
+		Set(child, health{2, 10})
+	}
+	index := first(root).index
+	if !index.dirtyIndexed || Len(Search(root, kind("child"))) != len(children) {
+		t.Fatal("dirty attribute index was not built correctly")
+	}
+
+	target := children[0]
+	Set(target, health{3, 10})
+	if Len(Search(root, name("0"))) != 1 || Len(Search(root, health{3, 10})) != 1 ||
+		Len(Search(root, health{2, 10})) != len(children)-1 {
+		t.Fatal("changing one attribute corrupted dirty postings")
+	}
+	Set(target, name("renamed"))
+	Unset[kind](target)
+	if !Empty(Search(root, name("0"))) || Len(Search(root, name("renamed"))) != 1 ||
+		Len(Search(root, kind("child"))) != len(children)-1 {
+		t.Fatal("replacing and removing attributes corrupted dirty postings")
+	}
+	Set(target, name("0"))
+	Set(target, kind("child"))
+	Unset[health](target)
+	if !Empty(Search(root, health{3, 10})) || Len(Search(root, name("0"))) != 1 ||
+		Len(Search(root, kind("child"))) != len(children) {
+		t.Fatal("restoring attributes corrupted dirty postings")
+	}
+}
+
 func TestIncrementalStructuralCommitAndCompaction(t *testing.T) {
 	root := New(kind("root"))
 	Commit(root)
