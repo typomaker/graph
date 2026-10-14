@@ -447,6 +447,20 @@ func BenchmarkStructuralToggleBranch100Of10K(b *testing.B) {
 	}
 }
 
+func BenchmarkBatchStructuralToggle100Of10K(b *testing.B) {
+	root := benchmarkWorld(10000)
+	children := make([]Graph, 100)
+	for i := range children {
+		children[i] = New(benchmarkKind("batch-child"))
+	}
+	Commit(root)
+	b.ResetTimer()
+	for range b.N {
+		Link(root, children...)
+		Unlink(root, children...)
+	}
+}
+
 func benchmarkStructuralBranch100Of10K() (Graph, Graph) {
 	root := benchmarkWorld(10000)
 	branch := New(benchmarkKind("branch"))

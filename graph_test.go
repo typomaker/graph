@@ -1721,6 +1721,52 @@ func TestSelectContiguousIndexedRangeAndStaleSelection(t *testing.T) {
 	}
 }
 
+func TestSelectWithoutIndexReusesContiguousMatches(t *testing.T) {
+	root := New(kind("root"))
+	firstActor := New(kind("actor"))
+	secondActor := New(kind("actor"))
+	Link(root, firstActor, secondActor)
+	Commit(root)
+	selection := Search(root, Type[any]())
+	selection.index = nil
+	if got := Select(selection, Type[any]()); !slices.Equal(got.nodes, selection.nodes) {
+		t.Fatal("wildcard selection changed the selected nodes")
+	}
+	actors := Select(selection, kind("actor"))
+	if !slices.Equal(actors.nodes, []*node{first(firstActor), first(secondActor)}) ||
+		&actors.nodes[0] != &selection.nodes[1] {
+		t.Fatal("contiguous traversal selection did not reuse the input range")
+	}
+	interleaved := New(kind("other"))
+	Link(root, interleaved)
+	selection = Graph{nodes: []*node{first(firstActor), first(interleaved), first(secondActor)}}
+	if got := Select(selection, kind("actor")); !slices.Equal(got.nodes, actors.nodes) {
+		t.Fatal("noncontiguous traversal selection returned incorrect nodes")
+	}
+}
+
+func TestFollowMultiStepAndPreservesUniqueEndpoints(t *testing.T) {
+	root := New(kind("root"))
+	left := New(kind("branch"))
+	right := New(kind("branch"))
+	shared := New(kind("shared"))
+	target := New(kind("target"))
+	Link(root, left, right)
+	Link(left, shared)
+	Link(right, shared)
+	Link(shared, target)
+	path := Path(kind("branch"), kind("shared"), kind("target"))
+	if got := Follow(root, kind("root"), path); !slices.Equal(got.nodes, []*node{first(target)}) {
+		t.Fatal("multi-step path repeated a shared endpoint")
+	}
+	if got := Follow(root, And(Path(kind("branch")), Path(kind("branch"), kind("shared")))); !slices.Equal(got.nodes, []*node{first(left), first(right), first(shared)}) {
+		t.Fatal("combined paths returned incorrect endpoints")
+	}
+	if !Empty(Follow(root, kind("other"), path)) {
+		t.Fatal("local predicate did not reject the path")
+	}
+}
+
 func TestSharedBranchSupportTransitions(t *testing.T) {
 	root := New(kind("root"))
 	left := New(kind("parent"))
@@ -1740,6 +1786,47 @@ func TestSharedBranchSupportTransitions(t *testing.T) {
 	}
 	if !Link(left, shared) || Len(Search(root, kind("leaf"))) != 1 {
 		t.Fatal("relinked shared branch was not indexed")
+	}
+}
+
+func TestBatchStructuralChangesUpdateNestedIndexes(t *testing.T) {
+	outer := New(kind("outer"))
+	root := New(kind("root"))
+	Link(outer, root)
+	Commit(outer)
+	Commit(root)
+	firstChild := New(kind("child"), name("first"))
+	secondChild := New(kind("child"), name("second"))
+	shared := New(kind("shared"))
+	Link(firstChild, shared)
+	Link(secondChild, shared)
+	if !Link(root, firstChild, secondChild) || Link(root, firstChild, secondChild) {
+		t.Fatal("batch link changed existing edges")
+	}
+	if got := Follow(root, Path(kind("child"))); !slices.Equal(got.nodes, []*node{first(firstChild), first(secondChild)}) {
+		t.Fatal("batch link changed child order")
+	}
+	for _, graph := range []Graph{root, outer} {
+		if Len(Search(graph, kind("shared"))) != 1 {
+			t.Fatal("batch link did not index the shared descendant")
+		}
+	}
+	if !Unlink(root, firstChild, secondChild) || Unlink(root, firstChild, secondChild) {
+		t.Fatal("batch unlink changed absent edges")
+	}
+	for _, graph := range []Graph{root, outer} {
+		if !Empty(Search(graph, kind("child"))) || !Empty(Search(graph, kind("shared"))) {
+			t.Fatal("batch unlink retained detached nodes")
+		}
+	}
+	if !Link(root, secondChild, firstChild) || Len(Search(outer, kind("shared"))) != 1 {
+		t.Fatal("batch relink failed")
+	}
+	leafRoot := New(kind("leaf-root"))
+	Commit(leafRoot)
+	leaves := []Graph{New(kind("leaf")), New(kind("leaf")), New(kind("leaf"))}
+	if !Link(leafRoot, leaves...) || first(leafRoot).index.orderDirty || Len(Search(leafRoot, kind("leaf"))) != len(leaves) {
+		t.Fatal("appended leaf batch dirtied or lost indexed order")
 	}
 }
 

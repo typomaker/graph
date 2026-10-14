@@ -361,7 +361,8 @@ func Link(g Graph, graphs ...Graph) bool {
 			panic("graph: link would create a cycle")
 		}
 	}
-	changed := false
+	changedChildren := candidates[:0]
+	var lastRevision uint64
 	for _, child := range candidates {
 		if _, exists := parent.children[child]; exists {
 			continue
@@ -372,10 +373,11 @@ func Link(g Graph, graphs ...Graph) bool {
 		addParentLocked(child, parent)
 		markDirtyChildLocked(parent, child)
 		parent.selfRev = rev
-		propagateStructureLocked(parent, rev, child, true)
-		changed = true
+		lastRevision = rev
+		changedChildren = append(changedChildren, child)
 	}
-	return changed
+	propagateStructuralChangesLocked(parent, changedChildren, lastRevision, true)
+	return len(changedChildren) != 0
 }
 
 // Unlink removes existing outgoing relations.
@@ -390,8 +392,10 @@ func Unlink(g Graph, graphs ...Graph) bool {
 	if parent == nil {
 		return false
 	}
-	changed := false
-	for _, child := range graphFirsts(graphs) {
+	candidates := graphFirsts(graphs)
+	changedChildren := candidates[:0]
+	var lastRevision uint64
+	for _, child := range candidates {
 		if _, exists := parent.children[child]; !exists {
 			continue
 		}
@@ -400,10 +404,11 @@ func Unlink(g Graph, graphs ...Graph) bool {
 		rev := nextRevisionLocked()
 		parent.removedChildren[child.key] = removedChild{revision: rev, attrs: cloneAttrs(child.attrs)}
 		parent.selfRev = rev
-		propagateStructureLocked(parent, rev, child, false)
-		changed = true
+		lastRevision = rev
+		changedChildren = append(changedChildren, child)
 	}
-	return changed
+	propagateStructuralChangesLocked(parent, changedChildren, lastRevision, false)
+	return len(changedChildren) != 0
 }
 
 // Each iterates over singleton Graph values in selection order.
@@ -663,6 +668,33 @@ func Select(g Graph, values ...any) Graph {
 		if out, ok := index.selectMatches(g, condition); ok {
 			return out
 		}
+	}
+	if condition.op == predicateAny {
+		return Graph{nodes: g.nodes, view: g.view, index: index, ordinals: g.ordinals}
+	}
+	if condition.op == predicateMatch {
+		var out []*node
+		firstMatch, lastMatch := -1, -1
+		matcher := condition.matcher
+		for position, n := range g.nodes {
+			value, exists := n.attrs[matcher.typ]
+			if exists && (matcher.any || value == matcher.value) {
+				if out != nil {
+					out = append(out, n)
+				} else if firstMatch < 0 {
+					firstMatch = position
+				} else if position != lastMatch+1 {
+					out = make([]*node, 0, len(g.nodes))
+					out = append(out, g.nodes[firstMatch:lastMatch+1]...)
+					out = append(out, n)
+				}
+				lastMatch = position
+			}
+		}
+		if out == nil && firstMatch >= 0 {
+			out = g.nodes[firstMatch : lastMatch+1]
+		}
+		return Graph{nodes: out, view: g.view, index: index}
 	}
 	out := make([]*node, 0, len(selected(g)))
 	for _, n := range selected(g) {
@@ -2459,6 +2491,31 @@ func postingHas(values posting, ordinal uint32) bool {
 	return position < len(values) && values[position] == ordinal
 }
 
+func propagateStructuralChangesLocked(parent *node, children []*node, revision uint64, linked bool) {
+	if len(children) == 0 {
+		return
+	}
+	if len(children) == 1 {
+		propagateStructureLocked(parent, revision, children[0], linked)
+		return
+	}
+	propagateStructureLocked(parent, revision, nil, false)
+	indexes := make(map[*searchIndex]struct{})
+	collectStructuralIndexesLocked(parent, indexes)
+	appendOnly := linked && len(parent.childOrder) >= len(children)
+	if appendOnly {
+		for i, child := range children {
+			if parent.childOrder[len(parent.childOrder)-len(children)+i] != child {
+				appendOnly = false
+				break
+			}
+		}
+	}
+	for index := range indexes {
+		index.updateStructuresLocked(parent, children, linked, appendOnly)
+	}
+}
+
 func propagateStructureLocked(n *node, rev uint64, child *node, linked bool) {
 	seen := map[*node]struct{}{}
 	var visit func(*node, *node)
@@ -2515,18 +2572,35 @@ func collectStructuralIndexesLocked(n *node, indexes map[*searchIndex]struct{}) 
 }
 
 func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool) {
-	for slot := range &index.cachedAtomic {
-		index.cachedAtomic[slot].Store(nil)
-	}
-	index.compositeIndexes = nil
+	index.invalidateStructuralCachesLocked()
 	if index.support[parent] == 0 {
 		index.overlayRevision = index.root.structureRev
 		return
 	}
+	index.updateStructureEdgeLocked(parent, child, linked, linked && parent.childOrder[len(parent.childOrder)-1] == child)
+	index.finishStructureUpdateLocked()
+}
+
+func (index *searchIndex) updateStructuresLocked(parent *node, children []*node, linked, appendOnly bool) {
+	index.invalidateStructuralCachesLocked()
+	for _, child := range children {
+		index.updateStructureEdgeLocked(parent, child, linked, appendOnly)
+	}
+	index.finishStructureUpdateLocked()
+}
+
+func (index *searchIndex) invalidateStructuralCachesLocked() {
+	for slot := range &index.cachedAtomic {
+		index.cachedAtomic[slot].Store(nil)
+	}
+	index.compositeIndexes = nil
+}
+
+func (index *searchIndex) updateStructureEdgeLocked(parent, child *node, linked, appended bool) {
 	// Removing an unreachable leaf preserves the relative order of survivors.
 	preserveOrder := !index.orderDirty && !linked && len(child.childOrder) == 0 && index.support[child] == 1
 	if !index.orderDirty && index.orderIdentity && linked && parent == index.root &&
-		len(child.childOrder) == 0 && parent.childOrder[len(parent.childOrder)-1] == child {
+		len(child.childOrder) == 0 && appended {
 		// A final root leaf can also be appended to the ordinal order directly.
 		ordinal, known := index.nodeOrdinal(child)
 		preserveOrder = !known || int(ordinal) == len(index.activeByOrdinal)-1
@@ -2548,13 +2622,16 @@ func (index *searchIndex) updateStructureLocked(parent, child *node, linked bool
 			index.deactivateLocked(child)
 		}
 	}
-	index.rebuildAffectedLocked()
-	index.removedOrdinals = postingFromSet(index.removedOrdinals, index.removed)
 	if !index.hasStructuralOverlay() {
 		index.resetCommittedOrderLocked()
 	} else {
 		index.orderDirty = !preserveOrder
 	}
+}
+
+func (index *searchIndex) finishStructureUpdateLocked() {
+	index.rebuildAffectedLocked()
+	index.removedOrdinals = postingFromSet(index.removedOrdinals, index.removed)
 	index.overlayRevision = index.root.structureRev
 }
 
@@ -3844,26 +3921,32 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 	case predicateAny:
 		return predicateResult{matched: true, endpoints: []*node{n}}
 	case predicateAnd:
-		results := make([]predicateResult, 0, len(condition.children))
+		var endpoints []*node
 		traversed := false
 		for _, child := range condition.children {
+			if !containsPath(child) {
+				if !matchesPredicateLocked(n, child, view) {
+					return predicateResult{}
+				}
+				continue
+			}
 			result := evaluatePredicateLocked(n, child, view)
 			if !result.matched {
 				return predicateResult{}
 			}
-			results = append(results, result)
-			traversed = traversed || result.traversed
+			if result.traversed {
+				if traversed {
+					endpoints = appendUniqueNodes(endpoints, result.endpoints)
+				} else {
+					endpoints = result.endpoints
+					traversed = true
+				}
+			}
 		}
 		if !traversed {
 			return predicateResult{matched: true, endpoints: []*node{n}}
 		}
-		out := make([]*node, 0)
-		for _, result := range results {
-			if result.traversed {
-				out = appendUniqueNodes(out, result.endpoints)
-			}
-		}
-		return predicateResult{matched: true, traversed: true, endpoints: out}
+		return predicateResult{matched: true, traversed: true, endpoints: endpoints}
 	case predicateOr:
 		out := make([]*node, 0)
 		matched := false
@@ -3880,6 +3963,17 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 	case predicatePath:
 		frontier := selectedChildrenLocked(n, view)
 		for index, step := range condition.children {
+			if len(frontier) == 1 {
+				candidate := frontier[0]
+				if !matchesPredicateLocked(candidate, step, view) {
+					return predicateResult{traversed: true}
+				}
+				if index == len(condition.children)-1 {
+					return predicateResult{matched: true, traversed: true, endpoints: []*node{candidate}}
+				}
+				frontier = selectedChildrenLocked(candidate, view)
+				continue
+			}
 			next := make([]*node, 0, len(frontier))
 			seen := make(map[*node]struct{}, len(frontier))
 			for _, candidate := range frontier {
@@ -3890,12 +3984,12 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 					}
 				}
 			}
+			if index == len(condition.children)-1 {
+				return predicateResult{matched: len(next) != 0, traversed: true, endpoints: next}
+			}
 			frontier = nil
 			for _, candidate := range next {
 				frontier = append(frontier, selectedChildrenLocked(candidate, view)...)
-			}
-			if index == len(condition.children)-1 {
-				frontier = next
 			}
 		}
 		return predicateResult{matched: len(frontier) != 0, traversed: true, endpoints: frontier}
