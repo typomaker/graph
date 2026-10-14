@@ -1608,6 +1608,36 @@ func TestLocalPathSelectionAndFollow(t *testing.T) {
 	}
 }
 
+func TestFollowSingleStepPreservesOrderAndDeduplicates(t *testing.T) {
+	root := New(kind("root"))
+	left := New(kind("parent"))
+	right := New(kind("parent"))
+	firstChild := New(kind("child"), name("first"))
+	shared := New(kind("child"), name("shared"))
+	lastChild := New(kind("child"), name("last"))
+	Link(root, left, right)
+	Link(left, firstChild, shared)
+	Link(right, shared, lastChild)
+	Commit(root)
+
+	path := Path(kind("child"))
+	for _, selection := range []Graph{left, Union(left, right)} {
+		got := Follow(selection, path)
+		want := []*node{first(firstChild), first(shared)}
+		if Len(selection) == 2 {
+			want = append(want, first(lastChild))
+		}
+		if !slices.Equal(got.nodes, want) {
+			t.Fatalf("single-step endpoints = %v, want %v", got.nodes, want)
+		}
+	}
+	view := &subgraph{edges: map[*node][]*node{first(left): {first(shared), first(shared)}}}
+	got := Follow(Graph{nodes: left.nodes, view: view}, path)
+	if !slices.Equal(got.nodes, []*node{first(shared)}) {
+		t.Fatal("single-step subgraph repeated an endpoint")
+	}
+}
+
 func TestStructuralOverlayAddsAndRemovesReachableNodes(t *testing.T) {
 	root := New(kind("root"))
 	branch := New(kind("branch"))

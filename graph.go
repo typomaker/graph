@@ -736,6 +736,9 @@ func Follow(g Graph, values ...any) Graph {
 			candidates = matches
 		}
 	}
+	if condition.op == predicatePath && len(condition.children) == 1 {
+		return followSingleStepLocked(candidates, condition.children[0], g.view, index)
+	}
 	out := make([]*node, 0)
 	seen := make(map[*node]struct{})
 	for _, n := range selected(candidates) {
@@ -752,6 +755,35 @@ func Follow(g Graph, values ...any) Graph {
 		}
 	}
 	return Graph{nodes: out, view: g.view, index: index}
+}
+
+func followSingleStepLocked(candidates Graph, step *predicate, view *subgraph, index *searchIndex) Graph {
+	sources := selected(candidates)
+	if len(sources) == 1 && view == nil {
+		children := selectedChildrenLocked(sources[0], view)
+		out := make([]*node, 0, len(children))
+		for _, child := range children {
+			if matchesPredicateLocked(child, step, view) {
+				out = append(out, child)
+			}
+		}
+		return Graph{nodes: out, view: view, index: index}
+	}
+	out := make([]*node, 0, len(sources))
+	seen := make(map[*node]struct{})
+	for _, source := range sources {
+		for _, child := range selectedChildrenLocked(source, view) {
+			if !matchesPredicateLocked(child, step, view) {
+				continue
+			}
+			if _, duplicate := seen[child]; duplicate {
+				continue
+			}
+			seen[child] = struct{}{}
+			out = append(out, child)
+		}
+	}
+	return Graph{nodes: out, view: view, index: index}
 }
 
 func useLocalPath(g Graph, condition *predicate) bool {
