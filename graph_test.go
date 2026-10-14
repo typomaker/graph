@@ -1153,6 +1153,34 @@ func TestIncrementalCommitTracksNewBaselineNodes(t *testing.T) {
 	}
 }
 
+func TestDirtyOrdinalsStaySortedThroughRestoreAndRetirement(t *testing.T) {
+	root := New(name("root"))
+	children := []Graph{New(name("first")), New(name("second")), New(name("third"))}
+	Link(root, children...)
+	Commit(root)
+	index := first(root).index
+
+	for _, position := range []int{2, 0, 1} {
+		Set(children[position], health{position + 1, 10})
+	}
+	if !slices.Equal(index.dirtyOrdinals, posting{1, 2, 3}) {
+		t.Fatalf("dirty ordinals are not sorted: %v", index.dirtyOrdinals)
+	}
+	Set(children[0], health{9, 10})
+	if !slices.Equal(index.dirtyOrdinals, posting{1, 2, 3}) {
+		t.Fatal("updating a dirty node changed its ordinal set")
+	}
+	Unset[health](children[1])
+	if !slices.Equal(index.dirtyOrdinals, posting{1, 3}) {
+		t.Fatalf("restoring an attribute left a dirty ordinal: %v", index.dirtyOrdinals)
+	}
+	Unlink(root, children[2])
+	Commit(root)
+	if !slices.Equal(index.dirtyOrdinals, posting{1}) {
+		t.Fatalf("retirement left a dirty ordinal: %v", index.dirtyOrdinals)
+	}
+}
+
 func TestIncrementalStructuralCommitAndCompaction(t *testing.T) {
 	root := New(kind("root"))
 	Commit(root)

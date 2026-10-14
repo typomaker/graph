@@ -271,6 +271,29 @@ func BenchmarkSetCommitted10K(b *testing.B) {
 	}
 }
 
+func BenchmarkBatchSetSearch10K(b *testing.B) {
+	for _, changed := range []int{1, 10, 100} {
+		b.Run(fmt.Sprintf("Changed%d", changed), func(b *testing.B) {
+			root := benchmarkWorld(10000)
+			children := make([]Graph, changed)
+			for i, child := range first(root).childOrder[:changed] {
+				children[i] = Graph{nodes: []*node{child}}
+			}
+			Commit(root)
+			b.ResetTimer()
+			for i := range b.N {
+				value := benchmarkVersion(i & 1)
+				for _, child := range children {
+					Set(child, value)
+				}
+				if got := Len(Search(root, value)); got != changed {
+					b.Fatalf("got %d, want %d", got, changed)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkDeltaOneOf10K(b *testing.B) {
 	root := benchmarkWorld(10000)
 	child := Graph{nodes: []*node{first(root).childOrder[5000]}}

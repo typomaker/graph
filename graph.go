@@ -2187,12 +2187,18 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			x.index.invalidateCompositeIndexesLocked(n, rev)
 			if ordinal, exists := x.index.ordinal[n]; exists {
 				if x.index.attributesCommitted(n, ordinal) {
-					delete(x.index.dirty, ordinal)
+					if _, dirty := x.index.dirty[ordinal]; dirty {
+						delete(x.index.dirty, ordinal)
+						x.index.dirtyOrdinals = removePostingOrdinal(x.index.dirtyOrdinals, ordinal)
+					}
 					if x.index.dirtyIndexed {
 						x.index.updateDirtyPostingsLocked(ordinal, nil)
 					}
 				} else {
-					x.index.dirty[ordinal] = struct{}{}
+					if _, dirty := x.index.dirty[ordinal]; !dirty {
+						x.index.dirty[ordinal] = struct{}{}
+						x.index.dirtyOrdinals = insertPostingOrdinal(x.index.dirtyOrdinals, ordinal)
+					}
 					if x.index.dirtyIndexed {
 						x.index.updateDirtyPostingsLocked(ordinal, n.attrs)
 					} else if len(x.index.dirty) >= dirtyPostingThreshold {
@@ -2202,7 +2208,6 @@ func propagateAttributeLocked(n *node, rev uint64) {
 			} else if _, exists := x.index.addedOrdinal[n]; exists && x.index.addedIndexed {
 				x.index.rebuildAddedPostingsLocked()
 			}
-			x.index.dirtyOrdinals = postingFromSet(x.index.dirtyOrdinals, x.index.dirty)
 		}
 		for ref := range x.parents {
 			if p := ref.Value(); p != nil {
@@ -2507,7 +2512,10 @@ func (index *searchIndex) retireInactiveCommittedLocked() {
 			index.updateDirtyPostingsLocked(ordinal, nil)
 		}
 		delete(index.dirtySnapshots, ordinal)
-		delete(index.dirty, ordinal)
+		if _, dirty := index.dirty[ordinal]; dirty {
+			delete(index.dirty, ordinal)
+			index.dirtyOrdinals = removePostingOrdinal(index.dirtyOrdinals, ordinal)
+		}
 		delete(index.ordinal, n)
 		delete(index.support, n)
 		delete(index.baselineNodes, n)
@@ -2538,7 +2546,6 @@ func (index *searchIndex) retireInactiveCommittedLocked() {
 		delete(index.removed, ordinal)
 	}
 	index.removedOrdinals = postingFromSet(index.removedOrdinals, index.removed)
-	index.dirtyOrdinals = postingFromSet(index.dirtyOrdinals, index.dirty)
 }
 
 // trimInactiveAddedLocked releases detached added nodes without renumbering
