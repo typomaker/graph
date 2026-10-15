@@ -89,6 +89,7 @@ type searchIndex struct {
 	committedRemoved  map[graphEdge]struct{}
 	cachedAtomic      [cachedAtomicSlots]atomic.Pointer[cachedAtomicResult]
 	cachedAtomicNext  atomic.Uint32
+	cachedDirty       atomic.Pointer[cachedDirtyPosting]
 }
 
 const cachedAtomicMinMatches = 1024
@@ -99,6 +100,11 @@ type cachedAtomicResult struct {
 	nodes    []*node
 	ordinals posting
 	treeRev  uint64
+}
+
+type cachedDirtyPosting struct {
+	treeRev uint64
+	values  posting
 }
 
 const addedPostingThreshold = 32
@@ -155,6 +161,9 @@ type typeMatcher struct{ typ reflect.Type }
 const pooledVisitedLimit = 65536
 
 var visitedNodeSets sync.Pool
+var typePredicates sync.Map
+
+var anyPredicate = &predicate{op: predicateAny}
 
 var state struct {
 	sync.RWMutex
@@ -186,6 +195,11 @@ type predicate struct {
 
 type predicateExpression struct{ predicate *predicate }
 
+// Condition is an immutable reusable predicate accepted by Select, Follow,
+// Search, Path, And, and Or. Use Compile when the same predicate description
+// is evaluated repeatedly.
+type Condition struct{ predicate *predicate }
+
 // Type returns a matcher meaning "an attribute of type T, with any value".
 //
 // For example, this searches every reachable node with a Position attribute:
@@ -194,9 +208,22 @@ type predicateExpression struct{ predicate *predicate }
 func Type[T any]() any {
 	t := reflect.TypeOf((*T)(nil)).Elem()
 	if t == reflect.TypeOf((*any)(nil)).Elem() {
-		return predicateExpression{predicate: &predicate{op: predicateAny}}
+		return predicateExpression{predicate: anyPredicate}
 	}
-	return typeMatcher{typ: normalizeType(t)}
+	t = normalizeType(t)
+	if cached, ok := typePredicates.Load(t); ok {
+		return predicateExpression{predicate: cached.(*predicate)}
+	}
+	condition := &predicate{op: predicateMatch, matcher: matcher{typ: t, any: true}}
+	cached, _ := typePredicates.LoadOrStore(t, condition)
+	return predicateExpression{predicate: cached.(*predicate)}
+}
+
+// Compile builds an immutable condition for repeated evaluation. Compiling
+// once avoids rebuilding equivalent predicate trees on every Select, Follow,
+// or Search call.
+func Compile(values ...any) Condition {
+	return Condition{predicate: buildPredicate(predicateAnd, values)}
 }
 
 // And groups predicates that must all match the same node.
@@ -420,13 +447,13 @@ func Unlink(g Graph, graphs ...Graph) bool {
 //	}
 func Each(g Graph) iter.Seq[Graph] {
 	state.RLock()
-	nodes := append([]*node(nil), selected(g)...)
+	nodes := selected(g)
 	view := g.view
 	index := graphSearchIndex(g)
 	state.RUnlock()
 	return func(yield func(Graph) bool) {
-		for i, n := range nodes {
-			item := Graph{nodes: []*node{n}, view: view, index: index}
+		for i := range nodes {
+			item := Graph{nodes: nodes[i : i+1 : i+1], view: view, index: index}
 			if len(g.ordinals) == len(nodes) {
 				item.ordinals = g.ordinals[i : i+1 : i+1]
 			}
@@ -844,11 +871,19 @@ func Follow(g Graph, values ...any) Graph {
 	if condition.op == predicatePath && len(condition.children) == 1 {
 		return followSingleStepLocked(candidates, condition.children[0], g.view, index)
 	}
-	out := make([]*node, 0)
-	seen := make(map[*node]struct{})
-	for _, n := range selected(candidates) {
+	sources := selected(candidates)
+	out := make([]*node, 0, len(sources))
+	seen := make(map[*node]struct{}, len(sources))
+	for _, n := range sources {
 		result := evaluatePredicateLocked(n, condition, g.view)
 		if !result.matched {
+			continue
+		}
+		if result.endpoint != nil {
+			if _, duplicate := seen[result.endpoint]; !duplicate {
+				seen[result.endpoint] = struct{}{}
+				out = append(out, result.endpoint)
+			}
 			continue
 		}
 		for _, match := range result.endpoints {
@@ -881,9 +916,6 @@ func followSingleStepLocked(candidates Graph, step *predicate, view *subgraph, i
 		seenOrdinals = make([]uint64, (len(index.activeByOrdinal)+63)/64)
 	}
 	var seen map[*node]struct{}
-	if !useOrdinals {
-		seen = make(map[*node]struct{})
-	}
 	for _, source := range sources {
 		for _, child := range selectedChildrenLocked(source, view) {
 			if !matchesPredicateLocked(child, step, view) {
@@ -904,14 +936,24 @@ func followSingleStepLocked(candidates Graph, step *predicate, view *subgraph, i
 					seen = make(map[*node]struct{})
 				}
 			}
-			if _, duplicate := seen[child]; duplicate {
-				continue
-			}
-			seen[child] = struct{}{}
-			out = append(out, child)
+			out = appendFollowNode(out, &seen, child, view)
 		}
 	}
 	return Graph{nodes: out, view: view, index: index}
+}
+
+func appendFollowNode(out []*node, seen *map[*node]struct{}, n *node, view *subgraph) []*node {
+	if view == nil && len(n.parents) <= 1 {
+		return append(out, n)
+	}
+	if *seen == nil {
+		*seen = make(map[*node]struct{})
+	}
+	if _, duplicate := (*seen)[n]; duplicate {
+		return out
+	}
+	(*seen)[n] = struct{}{}
+	return append(out, n)
 }
 
 func useLocalPath(g Graph, condition *predicate) bool {
@@ -1062,10 +1104,19 @@ func atomicMatcher(value any) (matcher, bool) {
 	if typed, ok := value.(typeMatcher); ok {
 		return matcher{typ: typed.typ, any: true}, true
 	}
-	if value == nil {
+	if expression, ok := value.(predicateExpression); ok {
+		if expression.predicate.op == predicateMatch {
+			return expression.predicate.matcher, true
+		}
 		return matcher{}, false
 	}
-	if _, expression := value.(predicateExpression); expression {
+	if condition, ok := value.(Condition); ok {
+		if condition.predicate != nil && condition.predicate.op == predicateMatch {
+			return condition.predicate.matcher, true
+		}
+		return matcher{}, false
+	}
+	if value == nil {
 		return matcher{}, false
 	}
 	typ := reflect.TypeOf(value)
@@ -2242,6 +2293,18 @@ func inspectRequests(values []any) []request {
 		case typeMatcher:
 			r.typ = x.typ
 			r.any = true
+		case predicateExpression:
+			if x.predicate.op != predicateMatch || !x.predicate.matcher.any {
+				panic("graph: attribute request must be a type matcher")
+			}
+			r.typ = x.predicate.matcher.typ
+			r.any = true
+		case Condition:
+			if x.predicate == nil || x.predicate.op != predicateMatch || !x.predicate.matcher.any {
+				panic("graph: attribute request must be a type matcher")
+			}
+			r.typ = x.predicate.matcher.typ
+			r.any = true
 		default:
 			rv := reflect.ValueOf(v)
 			t := rv.Type()
@@ -2287,6 +2350,12 @@ func combinePredicates(op predicateOp, children []*predicate) *predicate {
 func predicateFromValue(value any) *predicate {
 	if expression, ok := value.(predicateExpression); ok {
 		return expression.predicate
+	}
+	if condition, ok := value.(Condition); ok {
+		if condition.predicate == nil {
+			panic("graph: nil condition")
+		}
+		return condition.predicate
 	}
 	if value == nil {
 		panic("graph: nil attribute request")
@@ -3570,6 +3639,9 @@ func (index *searchIndex) dirtyPosting(includeAncestors bool) posting {
 	if !includeAncestors {
 		return index.dirtyOrdinals
 	}
+	if cached := index.cachedDirty.Load(); cached != nil && cached.treeRev == index.root.treeRev {
+		return cached.values
+	}
 	words := make([]uint64, (len(index.nodes)+63)/64)
 	queue := make([]uint32, 0, len(index.dirty))
 	for ordinal := range index.dirty {
@@ -3596,6 +3668,7 @@ func (index *searchIndex) dirtyPosting(includeAncestors bool) posting {
 			word &= word - 1
 		}
 	}
+	index.cachedDirty.Store(&cachedDirtyPosting{treeRev: index.root.treeRev, values: result})
 	return result
 }
 
@@ -3922,18 +3995,99 @@ func matchesPathLocked(parent *node, steps []*predicate, index int, view *subgra
 type predicateResult struct {
 	matched   bool
 	traversed bool
+	endpoint  *node
 	endpoints []*node
+}
+
+type endpointCollector struct {
+	endpoint  *node
+	endpoints []*node
+	seen      map[*node]struct{}
+}
+
+func (collector *endpointCollector) add(result predicateResult) {
+	if result.endpoint != nil {
+		collector.addNode(result.endpoint)
+		return
+	}
+	if len(result.endpoints) == 0 {
+		return
+	}
+	if collector.endpoint == nil && collector.endpoints == nil {
+		collector.endpoints = result.endpoints
+		collector.initSeen()
+		return
+	}
+	if collector.endpoint != nil {
+		collector.endpoints = []*node{collector.endpoint}
+		collector.endpoint = nil
+	}
+	if collector.seen != nil {
+		for _, n := range result.endpoints {
+			collector.addNode(n)
+		}
+		return
+	}
+	collector.endpoints = appendUniqueNodes(collector.endpoints, result.endpoints)
+	collector.initSeen()
+}
+
+func (collector *endpointCollector) addNode(n *node) {
+	if collector.endpoint == nil && collector.endpoints == nil {
+		collector.endpoint = n
+		return
+	}
+	if collector.endpoint != nil {
+		if collector.endpoint == n {
+			return
+		}
+		collector.endpoints = []*node{collector.endpoint, n}
+		collector.endpoint = nil
+		return
+	}
+	if collector.seen != nil {
+		if _, duplicate := collector.seen[n]; duplicate {
+			return
+		}
+		collector.seen[n] = struct{}{}
+		collector.endpoints = append(collector.endpoints, n)
+		return
+	}
+	for _, existing := range collector.endpoints {
+		if existing == n {
+			return
+		}
+	}
+	collector.endpoints = append(collector.endpoints, n)
+	collector.initSeen()
+}
+
+func (collector *endpointCollector) initSeen() {
+	if collector.seen != nil || len(collector.endpoints) < 16 {
+		return
+	}
+	collector.seen = make(map[*node]struct{}, len(collector.endpoints))
+	for _, existing := range collector.endpoints {
+		collector.seen[existing] = struct{}{}
+	}
+}
+
+func (collector endpointCollector) result(matched, traversed bool) predicateResult {
+	return predicateResult{
+		matched: matched, traversed: traversed,
+		endpoint: collector.endpoint, endpoints: collector.endpoints,
+	}
 }
 
 func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) predicateResult {
 	switch condition.op {
 	case predicateMatch:
 		matched := matchesMatcherLocked(n, condition.matcher)
-		return predicateResult{matched: matched, endpoints: nodeIf(n, matched)}
+		return predicateResult{matched: matched, endpoint: nodeIf(n, matched)}
 	case predicateAny:
-		return predicateResult{matched: true, endpoints: []*node{n}}
+		return predicateResult{matched: true, endpoint: n}
 	case predicateAnd:
-		var endpoints []*node
+		var endpoints endpointCollector
 		traversed := false
 		for _, child := range condition.children {
 			if !containsPath(child) {
@@ -3947,20 +4101,16 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 				return predicateResult{}
 			}
 			if result.traversed {
-				if traversed {
-					endpoints = appendUniqueNodes(endpoints, result.endpoints)
-				} else {
-					endpoints = result.endpoints
-					traversed = true
-				}
+				endpoints.add(result)
+				traversed = true
 			}
 		}
 		if !traversed {
-			return predicateResult{matched: true, endpoints: []*node{n}}
+			return predicateResult{matched: true, endpoint: n}
 		}
-		return predicateResult{matched: true, traversed: true, endpoints: endpoints}
+		return endpoints.result(true, true)
 	case predicateOr:
-		out := make([]*node, 0)
+		var out endpointCollector
 		matched := false
 		traversed := false
 		for _, child := range condition.children {
@@ -3968,10 +4118,10 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 			if result.matched {
 				matched = true
 				traversed = traversed || result.traversed
-				out = appendUniqueNodes(out, result.endpoints)
+				out.add(result)
 			}
 		}
-		return predicateResult{matched: matched, traversed: traversed, endpoints: out}
+		return out.result(matched, traversed)
 	case predicatePath:
 		frontier := selectedChildrenLocked(n, view)
 		for index, step := range condition.children {
@@ -3981,28 +4131,34 @@ func evaluatePredicateLocked(n *node, condition *predicate, view *subgraph) pred
 					return predicateResult{traversed: true}
 				}
 				if index == len(condition.children)-1 {
-					return predicateResult{matched: true, traversed: true, endpoints: []*node{candidate}}
+					return predicateResult{matched: true, traversed: true, endpoint: candidate}
 				}
 				frontier = selectedChildrenLocked(candidate, view)
 				continue
 			}
-			next := make([]*node, 0, len(frontier))
-			seen := make(map[*node]struct{}, len(frontier))
+			var next endpointCollector
 			for _, candidate := range frontier {
 				if matchesPredicateLocked(candidate, step, view) {
-					if _, duplicate := seen[candidate]; !duplicate {
-						seen[candidate] = struct{}{}
-						next = append(next, candidate)
-					}
+					next.addNode(candidate)
 				}
 			}
 			if index == len(condition.children)-1 {
-				return predicateResult{matched: len(next) != 0, traversed: true, endpoints: next}
+				if next.endpoint != nil {
+					return predicateResult{matched: true, traversed: true, endpoint: next.endpoint}
+				}
+				return predicateResult{matched: len(next.endpoints) != 0, traversed: true, endpoints: next.endpoints}
+			}
+			if next.endpoint != nil {
+				frontier = selectedChildrenLocked(next.endpoint, view)
+				continue
 			}
 			frontier = nil
-			for _, candidate := range next {
+			for _, candidate := range next.endpoints {
 				frontier = append(frontier, selectedChildrenLocked(candidate, view)...)
 			}
+		}
+		if len(frontier) == 1 {
+			return predicateResult{matched: true, traversed: true, endpoint: frontier[0]}
 		}
 		return predicateResult{matched: len(frontier) != 0, traversed: true, endpoints: frontier}
 	default:
@@ -4017,9 +4173,9 @@ func selectedChildrenLocked(n *node, view *subgraph) []*node {
 	return orderedChildren(n)
 }
 
-func nodeIf(n *node, include bool) []*node {
+func nodeIf(n *node, include bool) *node {
 	if include {
-		return []*node{n}
+		return n
 	}
 	return nil
 }

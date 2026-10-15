@@ -304,6 +304,77 @@ func TestUnnest(t *testing.T) {
 	}
 }
 
+func TestEachKeepsSelectionStableDuringNestedMutation(t *testing.T) {
+	root := New(kind("root"))
+	firstChild := New(kind("child"), name("first"))
+	secondChild := New(kind("child"), name("second"))
+	Link(root, firstChild, secondChild)
+	selection := Search(root, kind("child"))
+	var visited []name
+	for node := range Each(selection) {
+		visited = append(visited, value[name](t, node))
+		if len(visited) == 1 {
+			Set(secondChild, name("changed"))
+			Unlink(root, secondChild)
+			if got := Len(Search(root, kind("child"))); got != 1 {
+				t.Fatalf("nested search length = %d", got)
+			}
+			for nested := range Each(selection) {
+				_ = value[kind](t, nested)
+			}
+		}
+	}
+	if !slices.Equal(visited, []name{"first", "changed"}) || Len(selection) != 2 {
+		t.Fatalf("stable iteration = %v", visited)
+	}
+}
+
+func TestCompiledConditionIsReusableAndReactive(t *testing.T) {
+	root := New(kind("root"))
+	actor := New(kind("actor"))
+	inventory := New(kind("inventory"))
+	contains := New(kind("contains"), ident("target"))
+	Link(root, actor)
+	Link(actor, inventory)
+	Link(inventory, contains)
+	condition := Compile(
+		Type[kind](),
+		Path(kind("inventory"), And(kind("contains"), ident("target"))),
+	)
+	firstResult := Search(root, condition)
+	secondResult := Search(root, condition)
+	if Len(firstResult) != 1 || Len(secondResult) != 1 || first(firstResult) != first(actor) {
+		t.Fatal("compiled condition did not match")
+	}
+	Set(contains, ident("changed"))
+	if Len(firstResult) != 1 || !Empty(Search(root, condition)) {
+		t.Fatal("compiled condition changed a prior result or ignored a mutation")
+	}
+}
+
+func TestDirtyPathCacheInvalidatesAfterMutation(t *testing.T) {
+	root := New(kind("root"))
+	actor := New(kind("actor"))
+	inventory := New(kind("inventory"))
+	contains := New(kind("contains"), ident("target"))
+	Link(root, actor)
+	Link(actor, inventory)
+	Link(inventory, contains)
+	Commit(root)
+	condition := Compile(
+		kind("actor"),
+		Path(kind("inventory"), And(kind("contains"), ident("target"))),
+	)
+	Set(actor, name("dirty"))
+	if Len(Search(root, condition)) != 1 || first(root).index.cachedDirty.Load() == nil {
+		t.Fatal("dirty path cache was not populated")
+	}
+	Set(contains, ident("changed"))
+	if !Empty(Search(root, condition)) {
+		t.Fatal("dirty path cache survived a newer mutation")
+	}
+}
+
 func TestMaterializePreservesDeltaView(t *testing.T) {
 	root := New(name("root"), health{100, 100})
 	left := New(name("left"), health{80, 100})
